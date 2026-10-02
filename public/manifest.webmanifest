@@ -1,0 +1,26 @@
+{
+  "name": "OMP",
+  "short_name": "OMP",
+  "description": "Secure mobile remote for Oh My Pi sessions",
+  "id": "/",
+  "start_url": "/",
+  "scope": "/",
+  "display": "standalone",
+  "theme_color": "#000000",
+  "background_color": "#000000",
+  "orientation": "any",
+  "icons": [
+    {
+      "src": "/icon-192.svg?v=mono-pi-compact",
+      "sizes": "192x192",
+      "type": "image/svg+xml",
+      "purpose": "any maskable"
+    },
+    {
+      "src": "/icon-512.svg?v=mono-pi-compact",
+      "sizes": "512x512",
+      "type": "image/svg+xml",
+      "purpose": "any maskable"
+    }
+  ]
+}

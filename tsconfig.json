@@ -1,0 +1,19 @@
+{
+  "compilerOptions": {
+    "target": "ES2022",
+    "module": "ESNext",
+    "moduleResolution": "Bundler",
+    "strict": true,
+    "noEmit": true,
+    "skipLibCheck": true,
+    "allowImportingTsExtensions": false,
+    "types": ["bun", "node"]
+  },
+  "include": [
+    "server.ts",
+    "shared.ts",
+    "client.ts",
+    "extension.ts",
+    "notifications.ts"
+  ]
+}
