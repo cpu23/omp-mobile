@@ -1,18 +1,24 @@
-import type {
-  CapabilityMap,
-  CommandResponse,
-  CompletionMarker,
-  DirectoryEntry,
-  DirectoryListing,
-  MoveResponse,
-  OmpMessage,
-  PinsResponse,
-  SlotAction,
-  SlotId,
-  SlotState,
-  SlashCommand,
-  SlotSummary,
-  TerminalSnapshot,
+import {
+  isSlotId,
+  type CapabilityMap,
+  type CommandResponse,
+  type CompletionMarker,
+  type CreateSlotRequest,
+  type DirectoryEntry,
+  type DirectoryListing,
+  type MoveResponse,
+  type OmpMessage,
+  type PinsResponse,
+  type SessionSummary,
+  type SessionsResponse,
+  type SlotAction,
+  type SlotId,
+  type SlotResponse,
+  type SlotsResponse,
+  type SlotState,
+  type SlashCommand,
+  type SlotSummary,
+  type TerminalSnapshot,
 } from "./shared";
 
 type ClientModel = { provider?: string; id?: string; name?: string };
@@ -74,7 +80,6 @@ type NotificationItem = { slot: SlotId; unread: CompletionMarker[] };
 type NotificationsResponse = { slots: NotificationItem[] };
 type NotificationConfig = { enabled: boolean; publicKey?: string };
 type DirectoryResponse = DirectoryListing;
-type SlotsResponse = { slots: SlotSummary[] };
 type ApiResult = unknown;
 type ApiError = Error & { auth?: boolean; status?: number };
 type ApiAction =
@@ -218,22 +223,33 @@ type PushSubscriptionJson = {
   keys?: { p256dh?: string; auth?: string };
 };
 
-const SLOT_IDS: readonly SlotId[] = [
-  "left",
-  "right",
-  "w2-left",
-  "w2-right",
-  "w3-left",
-  "w3-right",
-];
 const app = requiredElement<HTMLElement>("#app");
 const drafts = new Map<SlotId, string>();
 const cache = new Map<SlotId, ClientState>();
+/**
+ * Requested transcript per runtime, held until the daemon reports the file omp
+ * sniffed: until then a resumed session's history row must still dedupe against
+ * its live card, and a second tap must adopt that runtime instead of spawning a
+ * sibling. Entries die as soon as the daemon reports a session file or the
+ * runtime itself disappears.
+ */
+const resumeAdoptedFiles = new Map<SlotId, string>();
 let slots: SlotSummary[] = [];
-let activeId: SlotId = "left";
-let activeState: ClientState | null = null;
+let sessions: SessionSummary[] = [];
+let sessionsError: string | null = null;
+let sessionsLoading = false;
+let sessionsRequest = 0;
+let sessionsQuery = "";
+let sessionsQueryLoaded = "";
+let slotsError: string | null = null;
+let stateError: string | null = null;
+let slotsRequest = 0;
 let stateRequest = 0;
+let creatingSession = false;
+let activeId: SlotId = "";
+let activeState: ClientState | null = null;
 let modal: HTMLDivElement | null = null;
+let modalDismiss: (() => void) | null = null;
 let toastTimer = 0;
 let pins: string[] = [];
 let transcriptNearBottom = true;
@@ -247,8 +263,11 @@ let notificationSubscribed = false;
 let notificationBusy = false;
 const acknowledging = new Set<SlotId>();
 const requestedSlot = new URLSearchParams(window.location.search).get("slot");
-if (requestedSlot && SLOT_IDS.includes(requestedSlot as SlotId))
-  activeId = requestedSlot as SlotId;
+if (isSlotId(requestedSlot)) activeId = requestedSlot;
+else {
+  const storedActive = localStorage.getItem("omp-mobile-active-slot");
+  if (isSlotId(storedActive)) activeId = storedActive;
+}
 
 function requiredElement<T extends Element>(
   selector: string,
@@ -341,6 +360,7 @@ const ICONS = {
   bellEnabled: `<svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M18 8A6 6 0 0 0 6 8c0 7-3 9-3 9h18s-3-2-3-9"></path><path d="M13.73 21a2 2 0 0 1-3.46 0"></path><circle cx="18" cy="4" r="3" fill="currentColor" stroke="currentColor" stroke-width="1"></circle></svg>`,
   bellDenied: `<svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M13.73 21a2 2 0 0 1-3.46 0"></path><path d="M18.63 13A17.89 17.89 0 0 1 18 8"></path><path d="M6.26 6.26A5.86 5.86 0 0 0 6 8c0 7-3 9-3 9h14"></path><path d="M18 8a6 6 0 0 0-9.33-5"></path><line x1="1" y1="1" x2="23" y2="23"></line></svg>`,
   terminal: `<svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><polyline points="4 17 10 11 4 5"></polyline><line x1="12" y1="19" x2="20" y2="19"></line></svg>`,
+  plus: `<svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><line x1="12" y1="5" x2="12" y2="19"></line><line x1="5" y1="12" x2="19" y2="12"></line></svg>`,
   chat: `<svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M21 11.5a8.38 8.38 0 0 1-.9 3.8 8.5 8.5 0 0 1-7.6 4.7 8.38 8.38 0 0 1-3.8-.9L3 21l1.9-5.7a8.38 8.38 0 0 1-.9-3.8 8.5 8.5 0 0 1 4.7-7.6 8.38 8.38 0 0 1 3.8-.9h.5a8.48 8.48 0 0 1 8 8z"></path></svg>`,
   sparkles: `<svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M12 3l1.912 5.813a2 2 0 0 0 1.275 1.275L21 12l-5.813 1.912a2 2 0 0 0-1.275 1.275L12 21l-1.912-5.813a2 2 0 0 0-1.275-1.275L3 12l5.813-1.912a2 2 0 0 0 1.275-1.275L12 3z"></path></svg>`,
 };
@@ -531,7 +551,10 @@ function normalizedUnread(
 ): Map<SlotId, CompletionMarker[]> {
   const next = new Map<SlotId, CompletionMarker[]>();
   for (const item of result?.slots ?? []) {
-    if (!SLOT_IDS.includes(item.slot)) continue;
+    if (!isSlotId(item.slot)) continue;
+    // Only runtimes the sidebar can open are actionable; the gateway keeps
+    // unread markers for deleted runtimes until they are acknowledged.
+    if (!slots.some((slot) => slot.id === item.slot)) continue;
     const unread = Array.isArray(item.unread)
       ? item.unread.filter((entry) => typeof entry?.identity === "string")
       : [];
@@ -766,19 +789,16 @@ function slotTitle(slot: SlotSummary, state?: ClientState | null): string {
       : slot.id === activeId
         ? activeState
         : cache.get(slot.id);
-  if (liveState?.title && !isSlotId(liveState.title)) return liveState.title;
-  const index = SLOT_IDS.indexOf(slot.id);
-  const fallback = `Session ${index >= 0 ? index + 1 : 1}`;
-  if (!slot.title || isSlotId(slot.title)) return fallback;
-  return slot.title;
+  if (liveState?.title?.trim()) return liveState.title.trim();
+  if (slot.title?.trim()) return slot.title.trim();
+  return slot.id;
 }
 function slotById(id: SlotId): SlotSummary {
   const found = slots.find((s) => s.id === id);
   if (found) return found;
-  const index = SLOT_IDS.indexOf(id);
   return {
     id,
-    title: `Session ${index >= 0 ? index + 1 : 1}`,
+    title: id,
     cwd: "",
     status: "disconnected",
     connected: false,
@@ -794,9 +814,17 @@ function isAgentActive(
   return /(busy|running|streaming|thinking)/i.test(slot.status || "");
 }
 function syncTopBar(): void {
-  const slot = slotById(activeId);
   const topTitle = document.querySelector<HTMLElement>("#top-title");
-  if (topTitle) topTitle.textContent = slotTitle(slot, activeState);
+  if (!topTitle) return;
+  if (!activeId) {
+    topTitle.textContent = slotsError
+      ? "Live sessions unavailable"
+      : slots.length
+        ? "Select a session"
+        : "No live session";
+    return;
+  }
+  topTitle.textContent = slotTitle(slotById(activeId), activeState);
 }
 function capability(name: string): boolean {
   return activeState?.capabilities?.[name] === true;
@@ -972,7 +1000,7 @@ function applyTheme(theme: ClientTheme | null): void {
 function renderShell(): void {
   app.innerHTML = `<div class="app-shell">
     <header class="topbar"><button class="icon-btn menu-btn" id="menu-open" type="button" aria-label="Open sessions" aria-controls="sidebar" aria-expanded="false">${ICONS.menu}</button><div class="top-title-wrap"><span class="top-title" id="top-title">Connecting…</span></div><button class="icon-btn hidden" id="token-open" aria-label="Set access token" title="Set access token">${ICONS.key}</button></header>
-    <main class="main"><aside class="sidebar" id="sidebar" aria-label="Sessions"><div class="sidebar-head"><span>Sessions</span></div><button class="sidebar-action" id="pin-open">Folders & pins</button><div class="slot-list" id="slot-list"></div><div class="sidebar-foot"><button class="sidebar-action" id="raw-toggle" type="button" aria-label="Show raw terminal" aria-pressed="false">${ICONS.terminal}<span>Terminal view</span></button><button class="sidebar-action" id="reasoning-toggle" type="button" aria-label="Toggle reasoning" aria-pressed="true">${ICONS.sparkles}<span>Reasoning</span><span id="reasoning-state">On</span></button><button class="sidebar-action" id="notifications-enable" type="button" aria-label="Enable notifications" title="Enable notifications">${ICONS.bellDefault}<span>Notifications</span></button></div></aside><button class="sidebar-backdrop" id="sidebar-close" type="button" aria-label="Close sessions"></button>
+    <main class="main"><aside class="sidebar" id="sidebar" aria-label="Sessions"><div class="sidebar-head"><span>Sessions</span></div><button class="sidebar-action" id="new-session" type="button" aria-label="Start a new session">${ICONS.plus}<span>New session</span></button><button class="sidebar-action" id="pin-open">Folders & pins</button><div class="sidebar-search"><input id="session-search" type="search" placeholder="Search sessions…" aria-label="Search sessions" autocomplete="off" spellcheck="false"></div><div class="slot-list" id="slot-list"></div><div class="sidebar-foot"><button class="sidebar-action" id="raw-toggle" type="button" aria-label="Show raw terminal" aria-pressed="false">${ICONS.terminal}<span>Terminal view</span></button><button class="sidebar-action" id="reasoning-toggle" type="button" aria-label="Toggle reasoning" aria-pressed="true">${ICONS.sparkles}<span>Reasoning</span><span id="reasoning-state">On</span></button><button class="sidebar-action" id="notifications-enable" type="button" aria-label="Enable notifications" title="Enable notifications">${ICONS.bellDefault}<span>Notifications</span></button></div></aside><button class="sidebar-backdrop" id="sidebar-close" type="button" aria-label="Close sessions"></button>
     <section class="workspace"><div class="capabilities hidden" id="capabilities"></div><div class="transcript" id="transcript" tabindex="0" aria-label="Session transcript"></div><pre class="raw-view hidden" id="raw-view" tabindex="0" aria-label="Raw terminal output"></pre><button class="scroll-fab hidden" id="scroll-bottom" type="button" aria-label="Scroll to bottom">${ICONS.arrowDown}</button></section></main>
     <div class="composer-dock"><form class="composer" id="composer"><div class="command-menu hidden" id="command-menu" role="listbox" aria-label="Slash commands"></div><div class="composer-ctx"></div><div class="composer-working hidden" id="composer-working"><span class="working-spinner">${SPINNER_FRAMES[0]}</span><span class="shimmer shimmer-accent">${shimmerMarkup("Working…")}</span></div><div class="composer-input"><textarea id="prompt" rows="1" placeholder="Message this session…" aria-label="Message this session" aria-autocomplete="list" aria-controls="command-menu" aria-expanded="false"></textarea></div><div class="composer-tools"><div class="composer-meta" id="composer-meta"><button type="button" class="ghost-btn" id="model-open">Model</button><button type="button" class="ghost-btn" id="effort-open">Effort</button><span id="ctx-label"></span><span id="cost-label"></span></div><button type="button" class="abort-btn hidden" id="abort">Stop</button><button type="submit" class="send-btn" id="send">Send</button></div></form>
   </div>`;
@@ -1002,6 +1030,24 @@ function renderShell(): void {
       void openDirectoryModal();
     },
   );
+  requiredElement<HTMLButtonElement>("#new-session").addEventListener(
+    "click",
+    () => {
+      closeSidebarDrawer();
+      startNewSession();
+    },
+  );
+  const sessionSearch = requiredElement<HTMLInputElement>("#session-search");
+  let searchTimer = 0;
+  sessionSearch.addEventListener("input", () => {
+    sessionsQuery = sessionSearch.value;
+    // Re-render immediately so the rows narrow with the typed text; the
+    // debounced request then re-runs the daemon-side search, which is how
+    // transcripts beyond the recent window stay reachable.
+    updateSlots();
+    window.clearTimeout(searchTimer);
+    searchTimer = window.setTimeout(() => void loadSessions(), 200);
+  });
   requiredElement<HTMLButtonElement>("#token-open").addEventListener(
     "click",
     openTokenModal,
@@ -1030,10 +1076,13 @@ function renderShell(): void {
     "click",
     openModelModal,
   );
-  requiredElement<HTMLButtonElement>("#effort-open").addEventListener(
-    "click",
-    toggleEffortPopover,
-  );
+  const effortOpen = requiredElement<HTMLButtonElement>("#effort-open");
+  // Tapping the button must not pull focus out of the composer: losing it
+  // dismisses the software keyboard before the popover even opens.
+  effortOpen.addEventListener("pointerdown", (event) => {
+    if (composerFocused()) event.preventDefault();
+  });
+  effortOpen.addEventListener("click", toggleEffortPopover);
   requiredElement<HTMLButtonElement>("#scroll-bottom").addEventListener(
     "click",
     scrollToBottom,
@@ -1154,27 +1203,148 @@ function sidebarSlotAccent(slot: SlotSummary): string {
     : "#808080";
 }
 
+/** Last one or two path segments, so phone-width cards stay readable. */
+function compactPath(path: string): string {
+  if (!path) return "";
+  const parts = path.split("/").filter(Boolean);
+  return parts.length <= 2 ? path : `…/${parts.slice(-2).join("/")}`;
+}
+
+/**
+ * Runtimes are daemon-owned, so "daemon unavailable" must never read as an
+ * empty list: the sidebar says which of the two states it is in, and retry
+ * re-runs the same gateway call.
+ */
+function slotsNoticeMarkup(error: string): string {
+  const daemonDown = /daemon unavailable/i.test(error);
+  const message = daemonDown
+    ? "Desktop daemon unavailable. Start omp-desktop, then retry."
+    : `Live sessions unavailable: ${error}`;
+  return `<div class="slot-empty error${daemonDown ? " daemon-down" : ""}" role="status" title="${esc(error)}">${esc(message)}<button type="button" class="ghost-btn" id="slots-retry">Retry</button></div>`;
+}
+
+/**
+ * Session history shares the live list's failure contract: it is daemon-owned,
+ * so an outage must read as unavailable rather than as an empty list, and retry
+ * re-runs the same gateway call.
+ */
+function sessionsNoticeMarkup(error: string): string {
+  return `<div class="slot-empty error" role="status" title="${esc(error)}">Session history unavailable: ${esc(error)}<button type="button" class="ghost-btn" id="sessions-retry">Retry</button></div>`;
+}
+
+/** Live runtime card: the only rows carrying connection state, unread and stop. */
+function slotCardMarkup(slot: SlotSummary): string {
+  const connected = slot.connected === true;
+  const slotState = slot.id === activeId ? activeState : cache.get(slot.id);
+  const isBusy =
+    connected && isAgentActive(slot.id === activeId ? activeState : null, slot);
+  const unread = unreadBySlot.get(slot.id)?.length || 0;
+  const title = slotTitle(slot, slotState);
+  const status = connected ? slot.status || "connected" : "offline";
+  return `<div class="slot-card${slot.id === activeId ? " active" : ""}${!connected ? " offline" : ""}${isBusy ? " busy" : ""}" data-slot="${esc(slot.id)}" role="button" tabindex="0" aria-label="Open ${esc(title)}"><div class="slot-title"><span>${esc(title)}</span><span class="slot-badges">${!connected ? `<span class="slot-offline">offline</span>` : isBusy ? "" : `<span class="slot-state">${esc(status)}</span>`}${isBusy ? `<span class="slot-working"><span class="working-spinner">${SPINNER_FRAMES[0]}</span><span class="shimmer shimmer-accent">${shimmerMarkup("Working…")}</span></span>` : ""}${unread > 0 ? `<span class="slot-unread" aria-label="${unread} unread completion${unread === 1 ? "" : "s"}">${unread > 99 ? "99+" : unread}</span>` : ""}</span></div>${slot.summary && slot.summary.trim() ? `<div class="slot-summary">${esc(slot.summary)}</div>` : ""}<div class="slot-meta"><span class="slot-cwd" title="${esc(slot.cwd)}">${esc(compactPath(slot.cwd) || "Working directory unavailable")}</span><button type="button" class="slot-stop" data-stop="${esc(slot.id)}" aria-label="Stop ${esc(title)}" title="Stop this session">Stop</button></div></div>`;
+}
+
+/**
+ * The sidebar shows the daemon's sessions exactly once, in the desktop's order:
+ * live runtimes first, then transcripts no runtime owns, most recently used
+ * first (the daemon sorts them). A running transcript is only ever its live
+ * card — its history row is dropped by transcript path.
+ */
 function updateSlots(): void {
   const list = document.querySelector<HTMLDivElement>("#slot-list");
   if (!list) return;
-  const ordered = SLOT_IDS.map((id) => slotById(id));
-  list.innerHTML = ordered
-    .map((slot) => {
-      const connected = slot.connected === true;
-      const slotState = slot.id === activeId ? activeState : cache.get(slot.id);
-      const isBusy =
-        connected &&
-        isAgentActive(slot.id === activeId ? activeState : null, slot);
-      const unread = unreadBySlot.get(slot.id)?.length || 0;
-      return `<button class="slot-card${slot.id === activeId ? " active" : ""}${!connected ? " offline" : ""}${isBusy ? " busy" : ""}" data-slot="${esc(slot.id)}"><div class="slot-title"><span>${esc(slotTitle(slot, slotState))}</span><span class="slot-badges">${!connected ? `<span class="slot-offline">offline</span>` : ""}${isBusy ? `<span class="slot-working"><span class="working-spinner">${SPINNER_FRAMES[0]}</span><span class="shimmer shimmer-accent">${shimmerMarkup("Working…")}</span></span>` : ""}${unread > 0 ? `<span class="slot-unread" aria-label="${unread} unread completion${unread === 1 ? "" : "s"}">${unread > 99 ? "99+" : unread}</span>` : ""}</span></div>${slot.summary && slot.summary.trim() ? `<div class="slot-summary">${esc(slot.summary)}</div>` : ""}<div class="slot-meta"><span class="slot-cwd">${esc(slot.cwd || "Working directory unavailable")}</span></div></button>`;
-    })
-    .join("");
-  list.querySelectorAll<HTMLButtonElement>("[data-slot]").forEach((node) => {
+  const query = sessionsQuery.trim().toLowerCase();
+  const matches = (haystack: string): boolean =>
+    !query || haystack.toLowerCase().includes(query);
+  const liveSlots = query
+    ? slots.filter((slot) =>
+        matches(
+          `${slotTitle(slot, slot.id === activeId ? activeState : cache.get(slot.id))} ${slot.cwd} ${slot.sessionFile ?? ""}`,
+        ),
+      )
+    : slots;
+  const liveFiles = new Set<string>();
+  for (const slot of slots)
+    if (slot.sessionFile) liveFiles.add(slot.sessionFile);
+  // The gateway's search also matches a session's first prompt and id, which
+  // this summary does not carry; trust its filtering once the response for the
+  // current query has landed, and filter locally only while it is in flight so
+  // the rows narrow with the typed text.
+  const serverFiltered = query === sessionsQueryLoaded;
+  const seen = new Set<string>();
+  const historyRows: string[] = [];
+  for (const session of sessions) {
+    if (liveFiles.has(session.path) || seen.has(session.path)) continue;
+    seen.add(session.path);
+    if (
+      query &&
+      !serverFiltered &&
+      !matches(`${session.title} ${session.cwd} ${session.path} ${session.id}`)
+    )
+      continue;
+    const cost = session.costUsd > 0 ? `$${session.costUsd.toFixed(2)}` : "";
+    historyRows.push(
+      `<div class="slot-card recent" data-session="${esc(session.path)}" role="button" tabindex="0" aria-label="Resume ${esc(session.title || session.path)}"><div class="slot-title"><span>${esc(session.title || session.path)}</span><span class="slot-badges"><span class="slot-state">${esc(relativeTime(session.updatedAt))}</span>${cost ? `<span class="slot-cost">${cost}</span>` : ""}</span></div><div class="slot-meta"><span class="slot-cwd" title="${esc(session.cwd)}">${esc(compactPath(session.cwd) || "Working directory unavailable")}</span></div></div>`,
+    );
+  }
+  const notices: string[] = [];
+  if (slotsError) notices.push(slotsNoticeMarkup(slotsError));
+  else if (sessionsError) notices.push(sessionsNoticeMarkup(sessionsError));
+  else if (sessionsLoading && !sessions.length)
+    notices.push(`<div class="slot-empty" role="status">Loading sessions…</div>`);
+  const liveRows = liveSlots.map(slotCardMarkup).join("");
+  // Separates the live runtimes from the historical rows below them, so the
+  // two row kinds stay distinguishable without a second list.
+  const divider =
+    liveRows && historyRows.length
+      ? `<div class="slot-sep">Recent</div>`
+      : "";
+  const rows = liveRows + divider + historyRows.join("");
+  list.innerHTML =
+    notices.join("") +
+    (rows ||
+      (notices.length
+        ? ""
+        : `<div class="slot-empty" role="status">${query ? "No sessions match this search." : "No sessions yet. Start a new one."}</div>`));
+  list.querySelectorAll<HTMLElement>("[data-slot]").forEach((node) => {
     const id = node.dataset.slot;
     if (!isSlotId(id)) return;
     node.style.setProperty("--slot-accent", sidebarSlotAccent(slotById(id)));
     node.addEventListener("click", () => selectSlot(id));
+    node.addEventListener("keydown", (event: KeyboardEvent) => {
+      if (event.key !== "Enter" && event.key !== " ") return;
+      event.preventDefault();
+      selectSlot(id);
+    });
   });
+  list.querySelectorAll<HTMLElement>("[data-session]").forEach((node) => {
+    const path = node.dataset.session;
+    if (!path) return;
+    const open = (): void => void openHistorySession(path);
+    node.addEventListener("click", open);
+    node.addEventListener("keydown", (event: KeyboardEvent) => {
+      if (event.key !== "Enter" && event.key !== " ") return;
+      event.preventDefault();
+      open();
+    });
+  });
+  list.querySelectorAll<HTMLButtonElement>("[data-stop]").forEach((button) => {
+    button.addEventListener("click", (event) => {
+      event.stopPropagation();
+      const id = button.dataset.stop;
+      if (isSlotId(id)) void stopSlot(id);
+    });
+  });
+  list
+    .querySelectorAll<HTMLButtonElement>("#slots-retry")
+    .forEach((button) =>
+      button.addEventListener("click", () => void loadSlots()),
+    );
+  list
+    .querySelectorAll<HTMLButtonElement>("#sessions-retry")
+    .forEach((button) =>
+      button.addEventListener("click", () => void loadSessions()),
+    );
   syncTopBar();
   syncAnimation();
 }
@@ -1299,10 +1469,12 @@ function handleViewport(): void {
     }
   }
 }
-function isSlotId(value: string | undefined): value is SlotId {
-  return value !== undefined && SLOT_IDS.includes(value as SlotId);
-}
 function selectSlot(id: SlotId): void {
+  if (!slots.some((slot) => slot.id === id)) {
+    showToast("That session is no longer live", true);
+    void loadSlots();
+    return;
+  }
   closeEffortPopover();
   closeSidebarDrawer();
   dismissedCommandDraft = null;
@@ -1316,6 +1488,7 @@ function selectSlot(id: SlotId): void {
   const oldPrompt = document.querySelector<HTMLTextAreaElement>("#prompt");
   if (oldPrompt) drafts.set(activeId, oldPrompt.value);
   activeId = id;
+  localStorage.setItem("omp-mobile-active-slot", id);
   activeState = cache.get(id) || null;
   if (oldPrompt) {
     oldPrompt.value = draftFor(id);
@@ -2422,10 +2595,17 @@ function applyRawMode(): void {
 
 async function loadRawTerminal(): Promise<void> {
   if (!rawMode) return;
-  const targetId = activeId;
-  const request = ++rawRequest;
   const view = document.querySelector<HTMLElement>("#raw-view");
   if (!view) return;
+  if (!activeId) {
+    rawRequest += 1;
+    view.textContent = slotsError
+      ? `Live sessions unavailable: ${slotsError}`
+      : "No live session selected.";
+    return;
+  }
+  const targetId = activeId;
+  const request = ++rawRequest;
   const pinned = view.scrollHeight - view.scrollTop - view.clientHeight < 40;
   try {
     const snapshot = await api<TerminalSnapshot>(
@@ -2449,6 +2629,9 @@ function renderActive(): void {
   const active = isAgentActive(state, slot);
   syncTopBar();
   const prompt = requiredElement<HTMLTextAreaElement>("#prompt");
+  prompt.placeholder = activeId
+    ? "Message this session…"
+    : "Start or select a session…";
   if (document.activeElement !== prompt) {
     prompt.value = draftFor();
     resizePrompt();
@@ -2459,7 +2642,18 @@ function renderActive(): void {
     applyTheme(state.theme);
     renderMessages(state.messages, active);
   } else {
-    transcript.innerHTML = "";
+    applyTheme(null);
+    transcript.innerHTML = `<div class="transcript-empty">${esc(
+      activeId
+        ? stateError
+          ? `Live state unavailable: ${stateError}`
+          : "Waiting for live state…"
+        : slotsError
+          ? `Live sessions unavailable: ${slotsError}`
+          : slots.length
+            ? "Select a session from the sidebar."
+            : "No live session. Start a new one or resume a saved session.",
+    )}</div>`;
   }
   requiredElement<HTMLElement>("#composer-working").classList.toggle(
     "hidden",
@@ -2602,7 +2796,7 @@ function renderActive(): void {
     const values = state.efforts || [];
     const range = popover.querySelector<HTMLInputElement>("#effort-range");
     const currentLabel = popover.querySelector<HTMLElement>("#effort-current");
-    if (range && currentLabel && values.length) {
+    if (range && currentLabel && values.length && !effortSliderDragging) {
       const currentIdx = state.effort ? values.indexOf(state.effort) : -1;
       const idx = currentIdx >= 0 ? currentIdx : 0;
       const fraction = values.length > 1 ? idx / (values.length - 1) : 0;
@@ -2621,59 +2815,288 @@ function renderActive(): void {
   syncAnimation();
 }
 
+/**
+ * Keep the selected runtime honest: drop cached state for runtimes that no
+ * longer exist, and fall back to the first live one (or the empty state) when
+ * the selection disappears. Never leave a stale id driving actions.
+ */
+function reconcileActiveSlot(): void {
+  for (const id of [...cache.keys()]) {
+    if (id !== activeId && !slots.some((slot) => slot.id === id))
+      cache.delete(id);
+  }
+  for (const id of [...drafts.keys()]) {
+    if (id !== activeId && !slots.some((slot) => slot.id === id))
+      drafts.delete(id);
+  }
+  for (const id of [...unreadBySlot.keys()]) {
+    if (!slots.some((slot) => slot.id === id)) unreadBySlot.delete(id);
+  }
+  if (activeId && slots.some((slot) => slot.id === activeId)) return;
+  const prompt = document.querySelector<HTMLTextAreaElement>("#prompt");
+  if (prompt && activeId) drafts.set(activeId, prompt.value);
+  activeId = slots[0]?.id ?? "";
+  activeState = activeId ? cache.get(activeId) ?? null : null;
+  stateError = null;
+  if (prompt) {
+    prompt.value = activeId ? draftFor(activeId) : "";
+    resizePrompt();
+  }
+  transcriptNearBottom = true;
+  lastRenderedMessageCount = 0;
+  if (activeId) localStorage.setItem("omp-mobile-active-slot", activeId);
+  else localStorage.removeItem("omp-mobile-active-slot");
+  updateSlots();
+  renderActive();
+  if (activeId) void loadState();
+  void loadRawTerminal();
+}
+
 async function loadSlots(): Promise<void> {
+  const request = ++slotsRequest;
   try {
     const result = await api<SlotsResponse>("/api/slots");
-    slots = result.slots;
-    if (!slots.length)
-      slots = SLOT_IDS.map((id, index) => ({
-        id,
-        title: `Session ${index + 1}`,
-        cwd: "",
-        status: "disconnected",
-        connected: false,
-      }));
+    if (request !== slotsRequest) return;
+    slotsError = null;
+    slots = (Array.isArray(result?.slots) ? result.slots : [])
+      .filter((slot) => slot && isSlotId(slot.id))
+      .map((slot) => {
+        const adopted = resumeAdoptedFiles.get(slot.id);
+        if (!adopted) return slot;
+        if (slot.sessionFile) {
+          resumeAdoptedFiles.delete(slot.id);
+          return slot;
+        }
+        return { ...slot, sessionFile: adopted };
+      });
+    for (const id of [...resumeAdoptedFiles.keys()])
+      if (!slots.some((slot) => slot.id === id)) resumeAdoptedFiles.delete(id);
+    reconcileActiveSlot();
     updateSlots();
-    if (!activeState) void loadState();
   } catch (error: unknown) {
-    if (!slots.length)
-      slots = SLOT_IDS.map((id, index) => ({
-        id,
-        title: `Session ${index + 1}`,
-        cwd: "",
-        status: "disconnected",
-        connected: false,
-      }));
+    if (request !== slotsRequest) return;
+    slotsError = hasAuth(error)
+      ? "access token required"
+      : errorMessage(error);
+    // A cold load with no cached runtimes must not keep driving a stale id:
+    // with nothing on screen the composer goes inert and the top bar says why.
+    if (!slots.length) reconcileActiveSlot();
     updateSlots();
     if (hasAuth(error)) openTokenModal();
   }
 }
 async function loadState(): Promise<void> {
+  if (!activeId) {
+    activeState = null;
+    stateError = null;
+    renderActive();
+    return;
+  }
+  const targetId = activeId;
   const request = ++stateRequest;
   try {
     const result = await api<ClientState>(
-      `/api/slots/${encodeURIComponent(activeId)}/state`,
+      `/api/slots/${encodeURIComponent(targetId)}/state`,
     );
-    if (request !== stateRequest) return;
+    if (request !== stateRequest || targetId !== activeId) return;
     activeState = result;
-    cache.set(activeId, result);
+    stateError = null;
+    cache.set(targetId, result);
     updateSlots();
     renderActive();
     window.setTimeout(() => {
-      void acknowledgeSlot(activeId);
+      if (targetId === activeId) void acknowledgeSlot(targetId);
     }, 0);
   } catch (error: unknown) {
-    if (request !== stateRequest) return;
+    if (request !== stateRequest || targetId !== activeId) return;
     activeState = null;
+    stateError = hasAuth(error) ? "access token rejected" : errorMessage(error);
+    updateSlots();
     renderActive();
     if (hasAuth(error)) openTokenModal();
+    else if (errorStatus(error) === 404) void loadSlots();
   }
+}
+
+/**
+ * Lists the daemon's transcripts under the same contract as the desktop
+ * sidebar: the 60 most recent by activity, and a daemon-side search so older
+ * transcripts stay reachable beyond that window. The query is whatever the
+ * sidebar search box currently holds, so the periodic refresh and a keystroke
+ * never fight over the list.
+ */
+async function loadSessions(): Promise<void> {
+  const request = ++sessionsRequest;
+  const query = sessionsQuery.trim();
+  sessionsLoading = true;
+  updateSlots();
+  try {
+    const params = new URLSearchParams({ limit: "60" });
+    if (query) params.set("search", query);
+    const result = await api<SessionsResponse>(
+      `/api/sessions?${params.toString()}`,
+    );
+    if (request !== sessionsRequest) return;
+    sessions = (Array.isArray(result?.sessions) ? result.sessions : []).filter(
+      (session) =>
+        session &&
+        typeof session.id === "string" &&
+        typeof session.path === "string" &&
+        typeof session.cwd === "string" &&
+        typeof session.title === "string" &&
+        typeof session.updatedAt === "string" &&
+        typeof session.costUsd === "number",
+    );
+    sessionsError = null;
+    sessionsQueryLoaded = query.toLowerCase();
+  } catch (error: unknown) {
+    if (request !== sessionsRequest) return;
+    sessions = [];
+    sessionsError = hasAuth(error)
+      ? "access token rejected"
+      : errorMessage(error);
+    if (hasAuth(error)) openTokenModal();
+  } finally {
+    if (request === sessionsRequest) {
+      sessionsLoading = false;
+      updateSlots();
+    }
+  }
+}
+
+/**
+ * Opens a transcript from the history list. A runtime may already own it — the
+ * desktop started one, or the last slots poll has not caught up yet — so the
+ * transcript is matched against live runtimes first and only resumed through a
+ * new runtime when none does, the desktop sidebar's reuse-then-resume contract.
+ */
+async function openHistorySession(path: string): Promise<void> {
+  const live = slots.find((slot) => slot.sessionFile === path);
+  if (live) {
+    selectSlot(live.id);
+    return;
+  }
+  await loadSlots();
+  const fresh = slots.find((slot) => slot.sessionFile === path);
+  if (fresh) {
+    selectSlot(fresh.id);
+    return;
+  }
+  await createSlot({ resume: path }, "Session resumed");
+}
+function updateSessionActions(): void {
+  const button = document.querySelector<HTMLButtonElement>("#new-session");
+  if (!button) return;
+  button.disabled = creatingSession;
+  button.setAttribute("aria-busy", creatingSession ? "true" : "false");
+}
+async function createSlot(
+  request: CreateSlotRequest,
+  successMessage: string,
+): Promise<void> {
+  if (creatingSession) return;
+  creatingSession = true;
+  updateSessionActions();
+  try {
+    const result = await api<SlotResponse>("/api/slots", {
+      method: "POST",
+      body: JSON.stringify(request),
+    });
+    const slot = result?.slot;
+    if (!slot || !isSlotId(slot.id))
+      throw new Error("Desktop did not return a runtime id");
+    if (request.resume && !slot.sessionFile) {
+      // The daemon may not have sniffed the resumed transcript yet; keep the
+      // requested file as the runtime's identity so its history row dedupes and
+      // a second tap adopts this runtime instead of spawning a sibling.
+      slot.sessionFile = request.resume;
+      resumeAdoptedFiles.set(slot.id, request.resume);
+    }
+    slots = slots.some((existing) => existing.id === slot.id)
+      ? slots.map((existing) => (existing.id === slot.id ? slot : existing))
+      : [...slots, slot];
+    selectSlot(slot.id);
+    showToast(successMessage);
+    void loadSlots();
+    void loadSessions();
+  } catch (error: unknown) {
+    showToast(
+      hasAuth(error) ? "Access token rejected" : errorMessage(error),
+      true,
+    );
+    if (hasAuth(error)) openTokenModal();
+  } finally {
+    creatingSession = false;
+    updateSessionActions();
+  }
+}
+function startNewSession(): void {
+  void createSlot({}, "Session started");
+}
+/**
+ * Remove a stopped runtime locally and immediately, so no stale id can drive
+ * another action while the next /api/slots poll catches up.
+ */
+function forgetSlot(id: SlotId): void {
+  slots = slots.filter((slot) => slot.id !== id);
+  cache.delete(id);
+  drafts.delete(id);
+  unreadBySlot.delete(id);
+  resumeAdoptedFiles.delete(id);
+  if (activeId === id) {
+    activeId = "";
+    activeState = null;
+    stateError = null;
+  }
+}
+async function stopSlot(id: SlotId): Promise<void> {
+  const slot = slotById(id);
+  confirmModal(
+    "Stop session",
+    `Kill the live runtime “${slotTitle(slot)}”? The transcript stays on disk and can be resumed later.`,
+    "Stop session",
+    () => {
+      void api<{ ok: boolean }>(`/api/slots/${encodeURIComponent(id)}`, {
+        method: "DELETE",
+      })
+        .then(() => {
+          showToast(`Stopped ${slotTitle(slot)}`);
+          forgetSlot(id);
+          reconcileActiveSlot();
+          updateSlots();
+          void loadSessions();
+        })
+        .catch((error: unknown) => {
+          showToast(
+            hasAuth(error) ? "Access token rejected" : errorMessage(error),
+            true,
+          );
+          if (hasAuth(error)) openTokenModal();
+          void loadSlots();
+        });
+    },
+  );
+}
+function relativeTime(value: string): string {
+  const then = Date.parse(value);
+  if (!Number.isFinite(then)) return "";
+  const minutes = Math.max(0, Math.round((Date.now() - then) / 60_000));
+  if (minutes < 1) return "just now";
+  if (minutes < 60) return `${minutes}m ago`;
+  const hours = Math.round(minutes / 60);
+  if (hours < 24) return `${hours}h ago`;
+  return `${Math.round(hours / 24)}d ago`;
 }
 async function sendAction(
   action: ApiAction,
   targetId: SlotId = activeId,
   targetState: ClientState | null = activeState,
 ): Promise<boolean> {
+  if (!slots.some((slot) => slot.id === targetId)) {
+    showToast("That session is no longer live; action not sent", true);
+    void loadSlots();
+    return false;
+  }
   const generation = targetState?.generation;
   if (generation == null) {
     showToast("Live state is not ready; action not sent", true);
@@ -2793,8 +3216,38 @@ function sendPrompt(): void {
   );
 }
 function closeModal(): void {
+  const dismiss = modalDismiss;
+  modalDismiss = null;
   modal?.remove();
   modal = null;
+  dismiss?.();
+}
+function confirmModal(
+  title: string,
+  message: string,
+  confirmLabel: string,
+  onConfirm: () => void,
+): void {
+  const body = document.createElement("div");
+  body.innerHTML = `<p class="notice">${esc(message)}</p><div class="modal-actions"><button type="button" class="ghost-btn modal-cancel">Cancel</button><button type="button" class="danger-btn modal-confirm">${esc(confirmLabel)}</button></div>`;
+  makeModal(title, body);
+  let settled = false;
+  modalDismiss = () => {
+    settled = true;
+  };
+  requiredElement<HTMLButtonElement>(".modal-cancel", body).addEventListener(
+    "click",
+    closeModal,
+  );
+  requiredElement<HTMLButtonElement>(".modal-confirm", body).addEventListener(
+    "click",
+    () => {
+      if (settled) return;
+      settled = true;
+      closeModal();
+      onConfirm();
+    },
+  );
 }
 function makeModal(title: string, body: HTMLElement): HTMLDivElement {
   closeModal();
@@ -2911,7 +3364,18 @@ function openModelModal(): void {
   }, 20);
 }
 let effortPopoverDocClickListener: ((event: MouseEvent) => void) | null = null;
+// Set while the popover slider is under an active pointer; the state re-sync
+// in renderActive must not clobber the value the finger is picking.
+let effortSliderDragging = false;
+
+/** True while the composer owns focus; effort controls must not steal it. */
+function composerFocused(): boolean {
+  const active = document.activeElement;
+  return active instanceof HTMLTextAreaElement && active.id === "prompt";
+}
+
 function closeEffortPopover(): void {
+  effortSliderDragging = false;
   if (effortPopoverDocClickListener) {
     document.removeEventListener("click", effortPopoverDocClickListener);
     effortPopoverDocClickListener = null;
@@ -2966,20 +3430,89 @@ function toggleEffortPopover(): void {
   };
   updateRange();
 
-  range.addEventListener("input", () => {
+  const applyRange = (): void => {
     updateRange();
     const val = values[Number(range.value)];
     if (val !== undefined) {
       currentLabel.textContent = val;
     }
-  });
+  };
 
-  range.addEventListener("change", () => {
+  const commitRange = (): void => {
     if (!actionTargetCurrent(targetId, targetGeneration)) return;
     const val = values[Number(range.value)];
     if (val !== undefined) {
       void sendAction({ type: "effort", value: val }, targetId, targetState);
     }
+  };
+
+  range.addEventListener("input", applyRange);
+  range.addEventListener("change", commitRange);
+
+  /**
+   * Point → value mapping that mirrors the native thumb inset, so a driven
+   * slider lands on the same stop a native drag would have reached.
+   */
+  const sliderIndexFor = (clientX: number): number => {
+    const rect = range.getBoundingClientRect();
+    const thumb = 24; // .effort-range thumb width; half is the inset per side
+    const usable = Math.max(1, rect.width - thumb);
+    const fraction = Math.min(
+      1,
+      Math.max(0, (clientX - rect.left - thumb / 2) / usable),
+    );
+    const min = Number(range.min) || 0;
+    const max = Number(range.max) || 0;
+    return Math.round(min + fraction * (max - min));
+  };
+
+  let activePointer: number | null = null;
+  let dragIndex = Number(range.value) || 0;
+  const endSliderDrag = (event: PointerEvent): void => {
+    if (activePointer !== event.pointerId) return;
+    activePointer = null;
+    effortSliderDragging = false;
+    if (range.hasPointerCapture(event.pointerId)) {
+      range.releasePointerCapture(event.pointerId);
+    }
+    // Commit the stop the pointer picked, not a poll's re-synced value.
+    range.value = String(dragIndex);
+    commitRange();
+  };
+
+  /**
+   * Canceled native slider drags also cancel the focus transfer, so while the
+   * composer is focused the slider is driven from pointer events instead: the
+   * textarea (and the software keyboard) never blurs.
+   */
+  range.addEventListener("pointerdown", (event) => {
+    if (!composerFocused()) return;
+    event.preventDefault();
+    activePointer = event.pointerId;
+    effortSliderDragging = true;
+    try {
+      range.setPointerCapture(event.pointerId);
+    } catch {
+      // Capture is best-effort; moves still arrive while over the input.
+    }
+    dragIndex = sliderIndexFor(event.clientX);
+    range.value = String(dragIndex);
+    applyRange();
+  });
+
+  range.addEventListener("pointermove", (event) => {
+    if (activePointer !== event.pointerId) return;
+    dragIndex = sliderIndexFor(event.clientX);
+    range.value = String(dragIndex);
+    applyRange();
+  });
+
+  range.addEventListener("pointerup", endSliderDrag);
+  range.addEventListener("pointercancel", endSliderDrag);
+
+  // Taps on the popover chrome (label, padding) must keep composer focus too.
+  popover.addEventListener("pointerdown", (event) => {
+    if (composerFocused()) event.preventDefault();
   });
 
   effortPopoverDocClickListener = (event: MouseEvent) => {
@@ -3160,7 +3693,7 @@ async function openDirectoryModal(
       }
     }
 
-    return `<li class="tree-node" data-node-path="${esc(node.path)}"><div class="tree-row">${toggleHtml}<span class="tree-icon">${ICONS.folder}</span><button type="button" class="tree-name" data-toggle="${esc(node.path)}" title="Open ${esc(node.path)}">${esc(node.name)}</button><div class="tree-actions"><button type="button" class="tree-pin-btn${isPinned ? " pinned" : ""}" data-tree-pin="${esc(node.path)}" title="${isPinned ? "Unpin" : "Pin"} folder">${isPinned ? "★" : "☆"}</button><button type="button" class="tree-select-btn" data-select="${esc(node.path)}" aria-label="Select ${esc(node.path)}">Select</button></div></div>${childrenHtml}</li>`;
+    return `<li class="tree-node" data-node-path="${esc(node.path)}"><div class="tree-row">${toggleHtml}<span class="tree-icon">${ICONS.folder}</span><button type="button" class="tree-name" data-toggle="${esc(node.path)}" title="Open ${esc(node.path)}">${esc(node.name)}</button><div class="tree-actions"><button type="button" class="tree-pin-btn${isPinned ? " pinned" : ""}" data-tree-pin="${esc(node.path)}" title="${isPinned ? "Unpin" : "Pin"} folder">${isPinned ? "★" : "☆"}</button><button type="button" class="tree-start-btn" data-start="${esc(node.path)}" title="Start a session in ${esc(node.path)}">Start</button><button type="button" class="tree-select-btn" data-select="${esc(node.path)}" aria-label="Select ${esc(node.path)}">Select</button></div></div>${childrenHtml}</li>`;
   };
 
   const renderTreeDOM = (): void => {
@@ -3233,6 +3766,21 @@ async function openDirectoryModal(
         el.addEventListener("click", () => {
           const selectedPath = el.dataset.select;
           if (selectedPath) selectDirectory(selectedPath);
+        });
+      });
+
+    treeContainer
+      .querySelectorAll<HTMLButtonElement>("[data-start]")
+      .forEach((btn) => {
+        btn.addEventListener("click", (event) => {
+          event.stopPropagation();
+          const startPath = btn.dataset.start;
+          if (!startPath) return;
+          closeModal();
+          void createSlot(
+            { cwd: startPath },
+            `Session started in ${compactPath(startPath)}`,
+          );
         });
       });
 
@@ -3366,7 +3914,7 @@ async function start(): Promise<void> {
     registerNotifications(),
     loadNotificationConfig(),
   ]);
-  await loadSlots();
+  await Promise.all([loadSlots(), loadSessions()]);
   await loadNotifications();
   window.setInterval(() => {
     void loadSlots();
@@ -3380,13 +3928,17 @@ async function start(): Promise<void> {
   window.setInterval(() => {
     if (document.visibilityState === "visible") void loadRawTerminal();
   }, 2000);
+  window.setInterval(() => {
+    if (document.visibilityState === "visible") void loadSessions();
+  }, 30000);
   document.addEventListener("visibilitychange", () => {
     if (document.visibilityState === "visible") {
       void syncPermissionState().then(() => updateNotificationButton());
       void loadNotifications();
-      void loadState();
+      void loadSessions();
+      if (activeId) void loadState();
       window.setTimeout(() => {
-        void acknowledgeSlot(activeId);
+        if (activeId) void acknowledgeSlot(activeId);
       }, 0);
     }
     // Indicators only repaint while the app is on screen.

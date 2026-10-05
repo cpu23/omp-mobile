@@ -1,16 +1,23 @@
 export const API_VERSION = 1 as const;
 
-export const SLOT_IDS = [
-  "left",
-  "right",
-  "w2-left",
-  "w2-right",
-  "w3-left",
-  "w3-right",
-] as const;
-export type SlotId = (typeof SLOT_IDS)[number];
+/**
+ * Live runtime identity minted by the omp-desktop daemon (`rt-<uuid>`).
+ *
+ * Ids are opaque and dynamic: discovery comes from the daemon's runtime list
+ * (or the IPC sockets a runtime's extension owns), never from a fixed table.
+ * The shape is validated wherever an id crosses a process boundary (URLs,
+ * socket filenames, notification payloads) so a stale or hostile id can never
+ * be used to build a path or address another session.
+ */
+export const RUNTIME_ID_RE = /^rt-[A-Za-z0-9-]{1,64}$/;
+export type SlotId = string;
+
+export function isSlotId(value: unknown): value is SlotId {
+  return typeof value === "string" && RUNTIME_ID_RE.test(value);
+}
 
 export type SlotSummary = {
+  /** Desktop runtime id, verbatim. */
   id: SlotId;
   title: string;
   summary?: string;
@@ -18,7 +25,24 @@ export type SlotSummary = {
   cwd: string;
   status: string;
   connected: boolean;
+  /** Absolute transcript path the runtime is writing, when the daemon knows it. */
+  sessionFile?: string | null;
 };
+
+/** A transcript in omp's on-disk session store, as listed by the desktop daemon. */
+export type SessionSummary = {
+  id: string;
+  path: string;
+  cwd: string;
+  title: string;
+  updatedAt: string;
+  costUsd: number;
+};
+
+export type SessionsResponse = { sessions: SessionSummary[] };
+export type SlotsResponse = { slots: SlotSummary[] };
+export type SlotResponse = { slot: SlotSummary };
+export type CreateSlotRequest = { cwd?: string; resume?: string };
 
 export type OmpMessage = {
   id?: string;

@@ -2,16 +2,15 @@ import { createConnection, type Socket } from "node:net";
 import { promises as fs } from "node:fs";
 import { dirname, join } from "node:path";
 import { lookup } from "node:dns/promises";
+import { isSlotId } from "./shared";
 
-export const NOTIFICATION_SLOTS = [
-  "left",
-  "right",
-  "w2-left",
-  "w2-right",
-  "w3-left",
-  "w3-right",
-] as const;
-export type NotificationSlot = (typeof NOTIFICATION_SLOTS)[number];
+/**
+ * Notifications are keyed by the live runtime identity (see shared.ts
+ * `SlotId`), never by a fixed slot table. Identities are discovered on every
+ * poll: from `listSlots` when the gateway provides it, otherwise from the
+ * `<runtime-id>.sock` extension sockets under `ipcRoot`.
+ */
+export type NotificationSlot = string;
 
 export type PushSubscriptionInput = {
   endpoint: string;
@@ -44,7 +43,7 @@ type StoredSlot = {
 type StoredState = {
   version: 1;
   subscriptions: PushSubscriptionInput[];
-  slots: Record<NotificationSlot, StoredSlot>;
+  slots: Record<string, StoredSlot>;
 };
 type WebPush = {
   generateVAPIDKeys(): { publicKey: string; privateKey: string };
@@ -65,6 +64,11 @@ export type NotificationServiceOptions = {
   vapidSubject?: string;
   vapidPublicKey?: string;
   vapidPrivateKey?: string;
+  /**
+   * Active runtime ids. When omitted, `ipcRoot` is scanned for
+   * `<runtime-id>.sock` extension sockets instead.
+   */
+  listSlots?: () => Promise<string[]> | string[];
 };
 export type NotificationService = {
   start(): void;
@@ -82,6 +86,7 @@ const MAX_IDENTITY = 512;
 const MAX_TITLE = 200;
 const MAX_UNREAD = 128;
 const MAX_SEEN = 256;
+const MAX_TRACKED_SLOTS = 128;
 const DEFAULT_STATE_FILE = join(
   process.env.HOME ?? "/tmp",
   ".local/state/omp-mobile/notifications.json",
@@ -95,13 +100,8 @@ function blankState(): StoredState {
   return {
     version: 1,
     subscriptions: [],
-    slots: Object.fromEntries(
-      NOTIFICATION_SLOTS.map((slot) => [slot, blankSlot()]),
-    ) as Record<NotificationSlot, StoredSlot>,
+    slots: {},
   };
-}
-function asSlot(value: string): value is NotificationSlot {
-  return (NOTIFICATION_SLOTS as readonly string[]).includes(value);
 }
 function asString(value: unknown, max: number): string | undefined {
   return typeof value === "string" && value.length > 0 && value.length <= max
@@ -351,8 +351,9 @@ async function loadState(path: string): Promise<StoredState> {
           typeof item.keys === "object",
       )
       .slice(0, 64) as PushSubscriptionInput[];
-    for (const slot of NOTIFICATION_SLOTS) {
-      const stored = value.slots?.[slot];
+    for (const slot of Object.keys(value.slots ?? {}).slice(0, MAX_TRACKED_SLOTS)) {
+      if (!isSlotId(slot)) continue;
+      const stored = value.slots?.[slot] as Partial<StoredSlot> | undefined;
       if (!stored || typeof stored !== "object") continue;
       result.slots[slot] = {
         initialized:
@@ -417,6 +418,8 @@ export function createNotificationService(
   let pollTail: Promise<void> = Promise.resolve();
   let polling = false;
   let saveTail: Promise<void> = Promise.resolve();
+  /** Ids from the most recent successful discovery; drives status(). */
+  const activeSlots = new Set<string>();
 
   const save = () => {
     const snapshot = JSON.stringify(state);
@@ -518,18 +521,74 @@ export function createNotificationService(
       await save();
     }
   };
+  /**
+   * Runtime ids to poll. `undefined` means discovery itself failed, which must
+   * not be mistaken for "no runtimes exist". The gateway's `listSlots` is
+   * authoritative when provided; otherwise extension sockets are scanned.
+   * Either way an empty list is treated as "no data" — the desktop daemon
+   * being unreachable must never forget unread notifications.
+   */
+  const discoverSlots = async (): Promise<string[] | undefined> => {
+    if (options.listSlots) {
+      try {
+        const listed = await options.listSlots();
+        return [...new Set(listed)].filter(isSlotId).slice(0, MAX_TRACKED_SLOTS);
+      } catch {
+        return undefined;
+      }
+    }
+    try {
+      const entries = await fs.readdir(options.ipcRoot, { withFileTypes: true });
+      const ids: string[] = [];
+      for (const entry of entries) {
+        if (!entry.name.endsWith(".sock")) continue;
+        const id = entry.name.slice(0, -".sock".length);
+        if (!isSlotId(id)) continue;
+        if (!entry.isFile() && !entry.isSocket()) continue;
+        ids.push(id);
+      }
+      return ids.slice(0, MAX_TRACKED_SLOTS);
+    } catch {
+      return undefined;
+    }
+  };
+  /** Forget slots the daemon no longer lists, never their unread notices. */
+  const pruneSlots = (active: readonly string[]): boolean => {
+    if (active.length === 0) return false;
+    const live = new Set(active);
+    let changed = false;
+    for (const slot of Object.keys(state.slots)) {
+      if (!live.has(slot) && state.slots[slot].unread.length === 0) {
+        delete state.slots[slot];
+        changed = true;
+      }
+    }
+    let overflow = Object.keys(state.slots).length - MAX_TRACKED_SLOTS;
+    for (const slot of Object.keys(state.slots)) {
+      if (overflow <= 0) break;
+      if (live.has(slot)) continue;
+      delete state.slots[slot];
+      overflow -= 1;
+      changed = true;
+    }
+    return changed;
+  };
   const pollOnce = async () => {
     await ensureLoaded();
     if (polling) return pollTail;
     polling = true;
     pollTail = (async () => {
-      for (const slot of NOTIFICATION_SLOTS) {
+      const active = await discoverSlots();
+      if (!active) return;
+      activeSlots.clear();
+      for (const slot of active) activeSlots.add(slot);
+      for (const slot of active) {
         const raw = await socketState(
           join(options.ipcRoot, `${slot}.sock`),
           options.token,
         );
         if (!raw) continue;
-        const entry = state.slots[slot];
+        const entry = (state.slots[slot] ??= blankSlot());
         const completion =
           raw.completion && typeof raw.completion === "object"
             ? (raw.completion as Record<string, unknown>)
@@ -567,6 +626,7 @@ export function createNotificationService(
         await save();
         await send(slot, notice);
       }
+      if (pruneSlots(active)) await save();
     })().finally(() => {
       polling = false;
     });
@@ -592,14 +652,22 @@ export function createNotificationService(
     async status() {
       await ensureLoaded();
       await ensurePush();
-      const slots = NOTIFICATION_SLOTS.map((slot) => {
-        const item = state.slots[slot];
-        return {
+      const seen = new Set<string>();
+      const slots: NotificationSlotStatus[] = [];
+      const collect = (slot: string) => {
+        const item = state.slots[slot] ?? blankSlot();
+        seen.add(slot);
+        slots.push({
           slot,
           unread: [...item.unread],
           latest: item.unread[item.unread.length - 1],
-        };
-      });
+        });
+      };
+      for (const slot of activeSlots) collect(slot);
+      for (const slot of Object.keys(state.slots)) {
+        if (seen.has(slot) || state.slots[slot].unread.length === 0) continue;
+        collect(slot);
+      }
       return {
         enabled: Boolean(push),
         ...(push && publicKey ? { publicKey } : {}),
@@ -636,11 +704,13 @@ export function createNotificationService(
     },
     async ack(slot, identity) {
       await ensureLoaded();
-      if (!asSlot(slot) || !asString(identity, MAX_IDENTITY))
+      if (!isSlotId(slot) || !asString(identity, MAX_IDENTITY))
         throw new Error("completion identity is invalid");
-      state.slots[slot].unread = state.slots[slot].unread.filter(
-        (item) => item.identity !== identity,
-      );
+      const entry = state.slots[slot];
+      if (entry)
+        entry.unread = entry.unread.filter(
+          (item) => item.identity !== identity,
+        );
       await save();
     },
   };

@@ -360,6 +360,9 @@ textarea:focus-visible {
 /* Slot cards */
 .slot-card {
   width: 100%;
+  /* The list scrolls: rows must keep their content height instead of being
+     squeezed by the flex container once the history list outgrows it. */
+  flex: 0 0 auto;
   text-align: left;
   color: var(--text);
   border: 1px solid var(--line);
@@ -506,6 +509,56 @@ textarea:focus-visible {
   flex: 1;
 }
 
+.slot-state {
+  display: inline-flex;
+  align-items: center;
+  min-height: 16px;
+  padding: 0 5px;
+  border: 1px solid var(--line);
+  border-radius: 999px;
+  color: var(--muted);
+  font: 700 9px var(--mono);
+  text-transform: uppercase;
+  letter-spacing: 0.04em;
+}
+
+.slot-empty {
+  padding: 14px 12px;
+  border: 1px dashed var(--line);
+  border-radius: 8px;
+  color: var(--muted);
+  font: 11px/1.45 var(--mono);
+}
+
+.slot-empty.error {
+  border-color: rgba(255, 71, 87, 0.4);
+  color: #ff8b95;
+}
+
+.slot-card:focus-visible {
+  outline: 1px solid var(--effort-accent);
+  outline-offset: 1px;
+}
+
+.slot-stop {
+  flex: 0 0 auto;
+  padding: 2px 8px;
+  border: 1px solid var(--line);
+  border-radius: 999px;
+  background: transparent;
+  color: var(--dim);
+  font: 700 9px var(--mono);
+  text-transform: uppercase;
+  letter-spacing: 0.04em;
+  cursor: pointer;
+}
+
+.slot-stop:hover,
+.slot-stop:focus-visible {
+  border-color: var(--danger, #ff5555);
+  color: var(--danger, #ff5555);
+}
+
 /* Workspace */
 .workspace {
   flex: 1;
@@ -525,6 +578,12 @@ textarea:focus-visible {
   padding: 4px clamp(16px, 4vw, 42px) calc(var(--composer-height, 150px) + 24px);
   scroll-behavior: smooth;
   font-family: var(--mono);
+}
+
+.transcript-empty {
+  padding: 18px clamp(4px, 2vw, 12px);
+  color: var(--muted);
+  font: 12px/1.5 var(--mono);
 }
 
 .message {
@@ -1421,6 +1480,90 @@ pre,
   overflow: hidden;
 }
 
+.modal-actions {
+  display: flex;
+  justify-content: flex-end;
+  gap: 8px;
+  margin-top: 14px;
+  flex: 0 0 auto;
+}
+
+.danger-btn {
+  min-height: 40px;
+  padding: 0 12px;
+  border: 1px solid var(--danger, #ff5555);
+  border-radius: 8px;
+  background: rgba(255, 71, 87, 0.12);
+  color: var(--danger, #ff5555);
+  font: 600 12px var(--mono);
+  cursor: pointer;
+}
+
+.danger-btn:hover {
+  background: rgba(255, 71, 87, 0.2);
+}
+
+.sidebar-search {
+  margin-bottom: 8px;
+  flex-shrink: 0;
+}
+
+.sidebar-search input {
+  width: 100%;
+  box-sizing: border-box;
+  padding: 8px 10px;
+  border: 1px solid var(--line);
+  border-radius: 8px;
+  background: var(--panel-raised);
+  color: var(--text);
+  font: 12px var(--mono);
+}
+
+.sidebar-search input::placeholder {
+  color: var(--dim);
+}
+
+.sidebar-search input:focus-visible {
+  outline: 1px solid var(--accent);
+  outline-offset: 1px;
+  border-color: var(--accent);
+}
+
+/* Separates live runtimes from historical rows inside the one session list. */
+.slot-sep {
+  flex: 0 0 auto;
+  padding: 2px 4px 0;
+  color: var(--dim);
+  font: 10px var(--mono);
+  letter-spacing: 0.06em;
+  text-transform: uppercase;
+}
+
+/* Historical transcripts: resumable rows, visually quieter than live cards. */
+.slot-card.recent {
+  border-color: var(--line-muted);
+  background: transparent;
+  min-height: 0;
+}
+
+.slot-card.recent .slot-title > span:first-child {
+  color: var(--muted);
+  font-weight: 600;
+}
+
+.slot-card.recent:hover {
+  background: var(--panel-soft);
+}
+
+.slot-card.recent:hover .slot-title > span:first-child {
+  color: var(--text);
+}
+
+.slot-cost {
+  color: var(--dim);
+  font: 700 9px var(--mono);
+}
+
 .modal-head {
   display: flex;
   align-items: center;
@@ -1718,6 +1861,23 @@ pre,
   background: rgba(0, 180, 255, 0.08);
 }
 
+.tree-start-btn {
+  min-height: 32px;
+  border: 1px solid var(--line);
+  background: transparent;
+  color: var(--muted);
+  border-radius: 4px;
+  padding: 2px 8px;
+  font: 11px var(--mono);
+  cursor: pointer;
+}
+
+.tree-start-btn:hover {
+  border-color: var(--success, #00ff88);
+  color: var(--success, #00ff88);
+  background: rgba(0, 255, 136, 0.08);
+}
+
 .tree-pin-btn {
   min-height: 32px;
   border: none;
@@ -1861,6 +2021,7 @@ pre,
   padding: 0;
   margin: 0 4px;
   cursor: pointer;
+  touch-action: none;
 }
 
 .effort-range::-webkit-slider-runnable-track {

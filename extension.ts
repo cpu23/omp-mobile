@@ -7,10 +7,8 @@ import {
   writeFileSync,
 } from "node:fs";
 import { join } from "node:path";
+import { createHash } from "node:crypto";
 import type { ExtensionAPI, ExtensionContext } from "@oh-my-pi/pi-coding-agent";
-import * as codingAgentModule from "@oh-my-pi/pi-coding-agent";
-import { getSessionAccentHex } from "@oh-my-pi/pi-coding-agent/utils/session-color";
-import { BUILTIN_SLASH_COMMAND_DEFS } from "@oh-my-pi/pi-coding-agent/slash-commands/builtin-registry";
 
 /**
  * In-process OMP mobile bridge.
@@ -18,12 +16,18 @@ import { BUILTIN_SLASH_COMMAND_DEFS } from "@oh-my-pi/pi-coding-agent/slash-comm
  * This extension deliberately only uses the public extension surface. It does
  * not construct an AgentSession, read provider credentials, or overwrite an
  * existing editor/dialog. Guarded terminal commands are prepared in an empty
- * editor; the gateway submits them to the verified owning Zellij pane.
+ * editor; the gateway submits them to the owning desktop PTY that runs this
+ * process.
+ *
+ * It must not value-import the host package: the compiled omp binary loads
+ * extension files with plain Bun resolution, which fails for host specifiers
+ * unless the extension has its own matching node_modules install. Optional
+ * host helpers are loaded lazily below and degrade to local fallbacks.
+ *
  * The socket is a narrow, owner-only IPC seam; the gateway remains responsible
  * for exposing it over Tailscale.
  */
 
-type JsonObject = Record<string, unknown>;
 type Action = {
   generation?: unknown;
   type?: unknown;
@@ -138,37 +142,16 @@ type ChatMessage = {
 };
 type MobileServer = { stop(closeActiveConnections?: boolean): void };
 
-const SLOT_RE = /^(left|right|w2-left|w2-right|w3-left|w3-right)$/;
+/**
+ * Desktop runtime ids, minted by omp-desktop's RuntimeManager as `rt-<uuid>`.
+ * These are the only accepted IPC identities; the retired fixed Zellij slot
+ * names (`left`, `w2-right`, ...) are rejected outright.
+ */
+const RUNTIME_ID_RE = /^rt-[A-Za-z0-9-]{1,64}$/;
 const MAX_STRING_BYTES = 8 * 1024;
-const DROPPED_KEYS: Record<string, true> = {
-  thoughtSignature: true,
-  thinkingSignature: true,
-  textSignature: true,
-  itemId: true,
-  signature: true,
-  "[kStreamingPartialJson]": true,
-  kStreamingPartialJson: true,
-};
-const SENSITIVE_KEY_RE =
-  /(?:api[_-]?key|access[_-]?token|refresh[_-]?token|client[_-]?secret|secret|password|cookie|authorization|credential|providerpayload|headers?|thoughtSignature|thinkingSignature|textSignature|itemId|signature|kStreamingPartialJson)/i;
 const FIXED_EFFORTS = ["inherit", "off"] as const;
 type OmpModel = NonNullable<ExtensionContext["model"]>;
 type ThinkingLevel = Parameters<ExtensionAPI["setThinkingLevel"]>[0];
-
-function isDroppedKey(key: string): boolean {
-  if (DROPPED_KEYS[key]) return true;
-  if (
-    key.includes("Signature") ||
-    key.includes("kStreamingPartialJson") ||
-    key.includes("thoughtSignature") ||
-    key.includes("thinkingSignature") ||
-    key.includes("textSignature") ||
-    key.includes("itemId")
-  )
-    return true;
-  if (SENSITIVE_KEY_RE.test(key)) return true;
-  return false;
-}
 
 function asString(value: unknown): string | undefined {
   return typeof value === "string" && value.length > 0 ? value : undefined;
@@ -180,24 +163,6 @@ function safeString(value: string): string {
   while (Buffer.byteLength(result, "utf8") > MAX_STRING_BYTES - 32)
     result = result.slice(0, -256);
   return `${result}\n[…truncated]`;
-}
-
-/** Drop provider payloads, signatures, and credential-shaped fields before anything reaches HTTP. */
-function sanitize(value: unknown, depth = 0): unknown {
-  if (value === null || typeof value === "boolean" || typeof value === "number")
-    return value;
-  if (typeof value === "string") return safeString(value);
-  if (depth > 8) return "[…depth limit]";
-  if (Array.isArray(value))
-    return value.slice(0, 256).map((item) => sanitize(item, depth + 1));
-  if (typeof value !== "object") return undefined;
-  const result: JsonObject = {};
-  for (const [key, child] of Object.entries(value as Record<string, unknown>)) {
-    if (isDroppedKey(key)) continue;
-    const safe = sanitize(child, depth + 1);
-    if (safe !== undefined) result[key] = safe;
-  }
-  return result;
 }
 
 function json(data: unknown, status = 200): Response {
@@ -340,28 +305,74 @@ function themeAccentInputs(
   return { hexes, surfaceLuminance };
 }
 
+function hexToHue(hex: string): number | undefined {
+  const match = /^#?([0-9a-f]{6})$/i.exec(hex);
+  if (!match) return undefined;
+  const value = Number.parseInt(match[1], 16);
+  const r = ((value >> 16) & 0xff) / 255;
+  const g = ((value >> 8) & 0xff) / 255;
+  const b = (value & 0xff) / 255;
+  const max = Math.max(r, g, b);
+  const min = Math.min(r, g, b);
+  if (max === min) return 0;
+  const d = max - min;
+  let hue: number;
+  if (max === r) hue = ((g - b) / d) % 6;
+  else if (max === g) hue = (b - r) / d + 2;
+  else hue = (r - g) / d + 4;
+  return ((hue * 60) % 360 + 360) % 360;
+}
+
+function hueToHex(hue: number, lightness: number): string {
+  const c = (1 - Math.abs(2 * lightness - 1)) * 1;
+  const h = ((hue % 360) + 360) % 360;
+  const x = c * (1 - Math.abs(((h / 60) % 2) - 1));
+  const m = lightness - c / 2;
+  const sector = Math.floor(h / 60) % 6;
+  const [r1, g1, b1] =
+    sector === 0
+      ? [c, x, 0]
+      : sector === 1
+        ? [x, c, 0]
+        : sector === 2
+          ? [0, c, x]
+          : sector === 3
+            ? [0, x, c]
+            : sector === 4
+              ? [x, 0, c]
+              : [c, 0, x];
+  const toByte = (channel: number): string =>
+    Math.round((channel + m) * 255)
+      .toString(16)
+      .padStart(2, "0");
+  return `#${toByte(r1)}${toByte(g1)}${toByte(b1)}`;
+}
+
+/**
+ * Per-session accent used to tell runtimes apart in the phone list.
+ *
+ * omp ships `getSessionAccentHex` in an internal subpath module; the compiled
+ * binary cannot resolve that specifier for a `-e` extension, so this keeps the
+ * same idea (a deterministic hue shift of the theme accent keyed by the session
+ * name) with local color math instead of a version-coupled import.
+ */
 function sessionAccent(ctx: ExtensionContext): string | null {
   try {
     const theme = ctx.ui?.theme;
     if (!theme || typeof theme !== "object") return null;
     const sessionName = ctx.sessionManager?.getSessionName?.() ?? "";
     if (!sessionName.trim()) return null;
-    // The shipped runtime bundles a newer session-color build whose second
-    // parameter is a `{ accentHex, colorHexes, surfaceLuminance }` record
-    // exposed as `theme.sessionAccentInputs`; older builds take a hex array.
-    const runtimeInputs =
-      "sessionAccentInputs" in theme ? theme.sessionAccentInputs : undefined;
-    const inputs =
-      runtimeInputs && typeof runtimeInputs === "object"
-        ? runtimeInputs
-        : themeAccentInputs(ctx);
-    if (!inputs) return null;
-    const hex: unknown = Reflect.apply(getSessionAccentHex, undefined, [
-      sessionName,
-      inputs,
-    ]);
-    if (typeof hex === "string" && hex.length > 0) return hex;
-    return null;
+    const inputs = themeAccentInputs(ctx);
+    const base =
+      inputs?.hexes.find((hex) => /^#[0-9a-f]{6}$/i.test(hex)) ??
+      themeSnapshot(ctx)?.tokens.accent ??
+      null;
+    if (!base) return null;
+    const baseHue = hexToHue(base);
+    if (baseHue === undefined) return null;
+    const digest = createHash("sha1").update(sessionName).digest();
+    const offset = ((digest[0] << 8) | digest[1]) % 360;
+    return hueToHex(baseHue + offset, 0.62);
   } catch {
     return null;
   }
@@ -416,15 +427,71 @@ function latestSummary(branch: unknown): string | undefined {
   return undefined;
 }
 
-const runtimeFormatToolCallPrimaryArg =
-  typeof (codingAgentModule as Record<string, unknown>)
-    .formatToolCallPrimaryArg === "function"
-    ? ((codingAgentModule as Record<string, unknown>)
-        .formatToolCallPrimaryArg as (
-        name: string,
-        args: Record<string, unknown> | undefined,
-      ) => string)
-    : undefined;
+/**
+ * Optional host helper: omp's canonical tool-call summary. Loaded lazily and
+ * entirely best-effort — the compiled binary cannot resolve host specifiers for
+ * `-e` extensions, so the local formatter below is the normal path.
+ */
+let runtimeFormatToolCallPrimaryArg:
+  | ((
+      name: string,
+      args: Record<string, unknown> | undefined,
+    ) => string)
+  | undefined;
+try {
+  void import("@oh-my-pi/pi-coding-agent")
+    .then((module) => {
+      const candidate = (module as Record<string, unknown>)
+        .formatToolCallPrimaryArg;
+      if (typeof candidate === "function") {
+        runtimeFormatToolCallPrimaryArg = candidate as typeof runtimeFormatToolCallPrimaryArg;
+      }
+    })
+    .catch(() => undefined);
+} catch {
+  // Static resolution rejected the specifier; local formatting still applies.
+}
+
+/**
+ * Builtin slash commands (name/aliases/description) for the phone's command
+ * palette. The public `pi.getCommands()` surface lists only dynamically
+ * registered commands, and the internal registry subpath cannot be value-
+ * imported by a `-e` extension under the compiled binary, so this is a lazy
+ * best-effort load. `handleAction` accepts plain builtin names even when the
+ * list is unavailable, so command execution never depends on this.
+ */
+let builtinCommands: MobileSlashCommand[] | undefined;
+try {
+  void import("@oh-my-pi/pi-coding-agent/slash-commands/builtin-registry")
+    .then((module) => {
+      const defs = (module as Record<string, unknown>).BUILTIN_SLASH_COMMAND_DEFS;
+      if (!Array.isArray(defs)) return;
+      builtinCommands = defs.flatMap((def): MobileSlashCommand[] => {
+        if (!def || typeof def !== "object") return [];
+        const value = def as Record<string, unknown>;
+        const name = typeof value.name === "string" ? value.name : "";
+        if (!name) return [];
+        return [
+          {
+            name,
+            ...(Array.isArray(value.aliases)
+              ? {
+                  aliases: value.aliases.filter(
+                    (alias): alias is string => typeof alias === "string",
+                  ),
+                }
+              : {}),
+            ...(typeof value.description === "string"
+              ? { description: value.description }
+              : {}),
+          },
+        ];
+      });
+    })
+    .catch(() => undefined);
+} catch {
+  // Static resolution rejected the specifier; typed commands still work.
+}
 
 function oneLine(text: string, max = 90): string {
   const flat = text.replace(/\s+/g, " ").trim();
@@ -870,10 +937,10 @@ function requestToken(request: Request): string | undefined {
 }
 
 export default function registerMobileRemote(pi: ExtensionAPI): void {
-  const slot = process.env.OMP_MOBILE_SLOT ?? process.env.OMP_ZELLIJ_PANE;
-  if (!slot || !SLOT_RE.test(slot)) {
+  const slot = process.env.OMP_MOBILE_SLOT;
+  if (!slot || !RUNTIME_ID_RE.test(slot)) {
     pi.logger.warn(
-      "OMP mobile extension disabled: OMP_MOBILE_SLOT is not a known slot",
+      "OMP mobile extension disabled: OMP_MOBILE_SLOT must be a desktop runtime id (rt-…)",
     );
     return;
   }
@@ -938,33 +1005,37 @@ export default function registerMobileRemote(pi: ExtensionAPI): void {
         if (parsed && typeof parsed === "object")
           current = parsed as { pid?: unknown; instanceId?: unknown };
       } catch {
-        return false;
+        // Missing or unreadable owner record: treated as a crash leftover.
       }
-      if (
-        current?.instanceId === instanceId ||
-        typeof current?.pid !== "number"
-      )
-        return false;
+      if (current) {
+        if (current.instanceId === instanceId || typeof current.pid !== "number")
+          return false;
+        try {
+          process.kill(current.pid, 0);
+          return false;
+        } catch {
+          // Owner pid is gone; the record is stale.
+        }
+      }
+      // Claim the path. The stale unix socket inode must go first, otherwise
+      // Bun.serve fails with "address in use" after a hard-killed runtime.
+      for (const path of [ownerPath, socketPath]) {
+        try {
+          unlinkSync(path);
+        } catch {
+          /* already gone */
+        }
+      }
       try {
-        process.kill(current.pid, 0);
-        return false;
+        writeFileSync(ownerPath, `${record}\n`, {
+          encoding: "utf8",
+          mode: 0o600,
+          flag: "wx",
+        });
+        ownsSocket = true;
+        return true;
       } catch {
-        try {
-          unlinkSync(ownerPath);
-        } catch {
-          return false;
-        }
-        try {
-          writeFileSync(ownerPath, `${record}\n`, {
-            encoding: "utf8",
-            mode: 0o600,
-            flag: "wx",
-          });
-          ownsSocket = true;
-          return true;
-        } catch {
-          return false;
-        }
+        return false;
       }
     }
   }
@@ -1056,13 +1127,7 @@ export default function registerMobileRemote(pi: ExtensionAPI): void {
       seen.add(command.name);
       commands.push(command);
     };
-    for (const command of BUILTIN_SLASH_COMMAND_DEFS) {
-      append({
-        name: command.name,
-        aliases: command.aliases,
-        description: command.description,
-      });
-    }
+    for (const command of builtinCommands ?? []) append(command);
     for (const command of pi.getCommands()) {
       append({
         name: command.name,
@@ -1146,6 +1211,25 @@ export default function registerMobileRemote(pi: ExtensionAPI): void {
     if (title) state.title = safeString(title);
     if (summary) state.summary = summary;
     return state;
+  }
+
+  /**
+   * Presentation-only projection of `snapshot` for a remote sidebar. Building
+   * the full state materializes the transcript (bounded but large); a caller
+   * that only paints accent/working/done must not pay for that or fail on the
+   * byte cap for long sessions.
+   */
+  function statusSnapshot(ctx: ExtensionContext): {
+    accent: string | null;
+    agentActive: boolean;
+    completion?: CompletionMarker;
+  } {
+    observeSession(ctx);
+    return {
+      accent: sessionAccent(ctx),
+      agentActive,
+      ...(completion ? { completion } : {}),
+    };
   }
 
   function checkGeneration(ctx: ExtensionContext, action: Action): void {
@@ -1249,12 +1333,12 @@ export default function registerMobileRemote(pi: ExtensionAPI): void {
             { status: 400 },
           );
         const commandName = command.match(/^\/([^\s/]+)(?:\s|$)/)?.[1];
-        const available = commandsForSnapshot().some(
-          (candidate) =>
-            candidate.name === commandName ||
-            candidate.aliases?.includes(commandName ?? ""),
-        );
-        if (!available)
+        // The host TUI is authoritative: a `-e` extension cannot enumerate
+        // every builtin of the running omp version (the local registry copy is
+        // version-stale and misses newer commands), so one well-formed token is
+        // always forwarded and omp itself rejects names it does not know. The
+        // phone palette still lists commandsForSnapshot() as a hint only.
+        if (!commandName || !/^[a-z0-9][a-z0-9_-]*$/i.test(commandName))
           throw Object.assign(new Error("slash command is not available"), {
             status: 404,
           });
@@ -1392,6 +1476,8 @@ export default function registerMobileRemote(pi: ExtensionAPI): void {
             const url = new URL(request.url);
             if (request.method === "GET" && url.pathname === "/state")
               return json(snapshot(ctx));
+            if (request.method === "GET" && url.pathname === "/status")
+              return json(statusSnapshot(ctx));
             if (request.method === "POST" && url.pathname === "/action") {
               let action: Action;
               try {

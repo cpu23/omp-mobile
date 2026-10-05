@@ -1,11 +1,7 @@
-const SLOT_IDS = new Set([
-  "left",
-  "right",
-  "w2-left",
-  "w2-right",
-  "w3-left",
-  "w3-right",
-]);
+// Live runtime ids are minted by the desktop daemon (rt-<uuid>) and change as
+// runtimes appear and disappear. Mirrors RUNTIME_ID_RE in shared.ts; a malformed
+// or stale id must never be navigated to.
+const RUNTIME_ID_RE = /^rt-[A-Za-z0-9-]{1,64}$/;
 
 self.addEventListener("install", (event) => {
   event.waitUntil(self.skipWaiting());
@@ -19,7 +15,9 @@ self.addEventListener("push", (event) => {
     data = event.data?.json() || {};
   } catch {}
   const slot =
-    typeof data.slot === "string" && SLOT_IDS.has(data.slot) ? data.slot : "";
+    typeof data.slot === "string" && RUNTIME_ID_RE.test(data.slot)
+      ? data.slot
+      : "";
   const title =
     typeof data.title === "string" && data.title.trim()
       ? data.title.trim().slice(0, 120)
@@ -52,7 +50,9 @@ self.addEventListener("notificationclick", (event) => {
   event.notification.close();
   const rawSlot = event.notification.data?.slot;
   const slot =
-    typeof rawSlot === "string" && SLOT_IDS.has(rawSlot) ? rawSlot : undefined;
+    typeof rawSlot === "string" && RUNTIME_ID_RE.test(rawSlot)
+      ? rawSlot
+      : undefined;
   const target = new URL("/", self.location.origin);
   if (slot) target.searchParams.set("slot", slot);
   event.waitUntil(

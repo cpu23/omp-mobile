@@ -96,9 +96,18 @@ Ports of OmpCode's `taskIndexRepo.ts` behavior, reimplemented on omp's real data
 
 ## 8. Mobile client
 
-Existing PWA keeps its screens but swaps gateway for the daemon: `/api/slots` → `/api/runtimes`, terminal snapshot →
-WS terminal topic (real bytes), actions unchanged (`shared.ts` types survive). Desktop is the source of truth; mobile is a
-read/write client (prompt, abort, model, view panes), matching the "shared live" goal.
+The PWA keeps its screens and talks to the existing gateway, which is now a client of this daemon instead of zellij:
+
+- `GET /api/slots` lists the daemon's live runtimes (ids are the runtime ids verbatim, e.g. `rt-<uuid>`); starting,
+  resuming (`--resume <session file>`) and stopping map to the daemon's runtime API.
+- `GET /api/sessions` exposes the daemon's session index for the saved-session picker.
+- State/actions stay on the existing `/api/slots/:id/state` + `/action` contract (generation-guarded), and the raw
+  terminal snapshot is relayed from the daemon's PTY screen.
+- Web Push notifications poll each runtime's extension socket; runtime identities are discovered dynamically, never
+  from a fixed slot table.
+
+Desktop is the source of truth; mobile is a read/write client (prompt, abort, model, effort, view panes), matching the
+"shared live" goal. No fixed-slot aliases remain on either side.
 
 ## 9. Phases and acceptance
 

@@ -3,6 +3,7 @@ import { promises as fs, type Stats } from "node:fs";
 import {
   dirname,
   extname,
+  isAbsolute,
   join,
   normalize,
   relative,
@@ -12,15 +13,16 @@ import {
 import { fileURLToPath } from "node:url";
 import { homedir } from "node:os";
 import { randomUUID, timingSafeEqual } from "node:crypto";
+import { Terminal as HeadlessTerminal } from "@xterm/headless";
 import {
   API_VERSION,
-  SLOT_IDS,
+  isSlotId,
   type CapabilityMap,
   type DirectoryListing,
   type CommandResponse,
   type MoveResponse,
+  type SessionSummary,
   type SlotAction,
-  type SlotId,
   type SlotState,
   type SlotSummary,
   type TerminalSnapshot,
@@ -28,16 +30,12 @@ import {
 import {
   createNotificationService,
   type NotificationService,
-  type NotificationSlot,
   type PushSubscriptionInput,
 } from "./notifications";
 
 const ROOT = dirname(fileURLToPath(import.meta.url));
 const HOME = homedir();
 const WORKSPACE_ROOT = resolve(process.env.OMP_MOBILE_ROOT ?? HOME);
-const STATE_ROOT = resolve(
-  process.env.OMP_ZELLIJ_STATE_DIR ?? join(HOME, ".local/state/omp-zellij"),
-);
 const IPC_ROOT = resolve(
   process.env.OMP_MOBILE_IPC_DIR ?? join(HOME, ".local/state/omp-mobile"),
 );
@@ -46,11 +44,19 @@ const TOKEN_FILE =
   process.env.OMP_MOBILE_TOKEN_FILE ??
   join(HOME, ".config/zellij/ompbox-mobile.token");
 const PORT = Number.parseInt(process.env.OMP_MOBILE_PORT ?? "4173", 10);
-const ZELLIJ_SESSION = process.env.OMP_MOBILE_ZELLIJ_SESSION ?? "ompbox";
+const DESKTOP_URL =
+  process.env.OMP_MOBILE_DESKTOP_URL ?? "http://127.0.0.1:4180";
+const SESSIONS_ROOT = resolve(
+  process.env.OMP_DESKTOP_SESSIONS_DIR ?? join(HOME, ".omp/agent/sessions"),
+);
 const MAX_BODY = 128 * 1024;
 const MAX_IPC = 4 * 1024 * 1024;
 const MAX_METADATA = 64 * 1024;
 const MAX_ENTRIES = 250;
+const MAX_DESKTOP_BODY = 8 * 1024 * 1024;
+const STREAM_IDLE_MS = 45_000;
+const STREAM_READY_TIMEOUT_MS = 3_500;
+const TERMINAL_WRITE_LIMIT = 16 * 1024;
 const ALLOWED_ORIGINS = new Set(
   (process.env.OMP_MOBILE_ORIGINS ?? "")
     .split(",")
@@ -58,9 +64,35 @@ const ALLOWED_ORIGINS = new Set(
     .filter(Boolean),
 );
 
+/**
+ * The desktop daemon owns every omp process; this gateway never spawns omp.
+ * Its URL must stay loopback: the daemon has no authentication of its own, and
+ * a phone-reachable address would let anyone on the tailnet control PTYs.
+ */
+function desktopBaseUrl(): URL {
+  const url = new URL(DESKTOP_URL);
+  const host = url.hostname.replace(/^\[|\]$/g, "");
+  const loopback = host === "127.0.0.1" || host === "::1" || host === "localhost";
+  if (
+    url.protocol !== "http:" ||
+    !loopback ||
+    url.username ||
+    url.password ||
+    (url.pathname !== "/" && url.pathname !== "")
+  )
+    throw new Error(
+      "OMP_MOBILE_DESKTOP_URL must be a loopback http URL, e.g. http://127.0.0.1:4180",
+    );
+  return url;
+}
+
+const DESKTOP = desktopBaseUrl();
+const DESKTOP_WS = `ws://${DESKTOP.host}/ws/term`;
+
 let mobileToken = "";
 let clientBundle: ArrayBuffer | undefined;
 let notificationService: NotificationService | undefined;
+let knownSlotIds: string[] = [];
 
 function json(data: unknown, status = 200, extra: HeadersInit = {}): Response {
   return new Response(JSON.stringify(data), {
@@ -139,7 +171,7 @@ async function realPathWithin(
 
 /**
  * Dot-entries hold configuration and credentials. They are never browsable,
- * pinnable, or valid move destinations from the phone.
+ * pinnable, valid move destinations, or runtime working directories.
  */
 function hiddenPath(candidate: string): boolean {
   return relative(WORKSPACE_ROOT, candidate)
@@ -148,142 +180,6 @@ function hiddenPath(candidate: string): boolean {
       (segment) =>
         segment.startsWith(".") && segment !== "." && segment !== "..",
     );
-}
-
-async function readJsonFile(
-  path: string,
-  limit: number,
-): Promise<Record<string, unknown> | undefined> {
-  try {
-    const stat = await fs.lstat(path);
-    if (!stat.isFile() || stat.size > limit || (stat.mode & 0o077) !== 0)
-      return undefined;
-    const value = JSON.parse(await fs.readFile(path, "utf8")) as unknown;
-    return value && typeof value === "object" && !Array.isArray(value)
-      ? (value as Record<string, unknown>)
-      : undefined;
-  } catch {
-    return undefined;
-  }
-}
-
-async function slotMetadata(slot: SlotId): Promise<SlotSummary> {
-  const connected = await socketAvailable(slot);
-
-  let liveTitle: string | undefined;
-  let liveSummary: string | undefined;
-  let liveCwd: string | undefined;
-  let liveActive = false;
-  let liveAccent: string | undefined;
-
-  if (connected) {
-    try {
-      const response = await ipcRequest(
-        join(IPC_ROOT, `${slot}.sock`),
-        "GET",
-        "/state",
-        undefined,
-        400,
-      );
-      if (response.status >= 200 && response.status < 300) {
-        const value = JSON.parse(response.body) as Record<string, unknown>;
-        if (value && typeof value === "object" && !Array.isArray(value)) {
-          liveActive = value.agentActive === true;
-          if (typeof value.title === "string" && value.title.trim()) {
-            liveTitle = value.title.trim();
-          }
-          if (typeof value.summary === "string" && value.summary.trim()) {
-            liveSummary = value.summary.trim();
-          }
-          if (typeof value.cwd === "string" && value.cwd.trim()) {
-            liveCwd = normalize(value.cwd.trim());
-          }
-          if (
-            typeof value.accent === "string" &&
-            /^#[0-9a-f]{6}$/i.test(value.accent)
-          ) {
-            liveAccent = value.accent;
-          }
-        }
-      }
-    } catch {
-      // Socket read failed or timed out; fall back silently to metadata.
-    }
-  }
-
-  const activePath = join(STATE_ROOT, slot, "active.json");
-  const metadata = await readJsonFile(activePath, MAX_METADATA);
-
-  let metaTitle = "";
-  let metaSummary: string | undefined;
-  let metaCwd: string | undefined;
-
-  if (metadata) {
-    if (typeof metadata.cwd === "string" && metadata.cwd.trim()) {
-      metaCwd = normalize(metadata.cwd.trim());
-    }
-    if (typeof metadata.title === "string" && metadata.title.trim()) {
-      metaTitle = metadata.title.trim();
-    }
-    if (typeof metadata.summary === "string" && metadata.summary.trim()) {
-      metaSummary = metadata.summary.trim();
-    }
-    const sessionFile =
-      typeof metadata.sessionFile === "string" ? metadata.sessionFile : "";
-    if (!metaTitle && sessionFile) {
-      try {
-        const stat = await fs.lstat(sessionFile);
-        const uid =
-          typeof process.getuid === "function" ? process.getuid() : undefined;
-        if (
-          stat.isFile() &&
-          stat.size <= MAX_METADATA &&
-          (uid === undefined || stat.uid === uid) &&
-          (stat.mode & 0o002) === 0
-        ) {
-          const firstLine = (await fs.readFile(sessionFile, "utf8")).split(
-            "\n",
-            1,
-          )[0];
-          const row = JSON.parse(firstLine) as Record<string, unknown>;
-          if (typeof row.title === "string" && row.title.trim()) {
-            metaTitle = row.title.trim();
-          }
-        }
-      } catch {
-        // Session files may disappear during a switch; active.json remains safe metadata.
-      }
-    }
-  }
-
-  const title = (liveTitle || metaTitle || slot).slice(0, 200) || slot;
-  const summary = liveSummary ?? metaSummary;
-  const cwd = (liveCwd || metaCwd || WORKSPACE_ROOT).slice(0, 2000);
-
-  return {
-    id: slot,
-    title,
-    ...(summary ? { summary: summary.slice(0, 500) } : {}),
-    ...(liveAccent ? { accent: liveAccent } : {}),
-    cwd,
-    status: connected ? (liveActive ? "running" : "connected") : "offline",
-    connected,
-  };
-}
-
-async function socketAvailable(slot: SlotId): Promise<boolean> {
-  try {
-    const stat = await fs.lstat(join(IPC_ROOT, `${slot}.sock`));
-    const uid =
-      typeof process.getuid === "function" ? process.getuid() : undefined;
-    return (
-      stat.isSocket() &&
-      (uid === undefined || stat.uid === uid) &&
-      (stat.mode & 0o077) === 0
-    );
-  } catch {
-    return false;
-  }
 }
 
 function readBody(request: Request): Promise<string> {
@@ -300,6 +196,155 @@ function parseJson(text: string): Record<string, unknown> {
   return value as Record<string, unknown>;
 }
 
+/* -------------------------------------------------------------------------- */
+/* Desktop daemon client                                                      */
+/* -------------------------------------------------------------------------- */
+
+type DesktopRuntimeInfo = {
+  id: string;
+  alive: boolean;
+  pid: number | null;
+  cols: number;
+  rows: number;
+  startedAt: string | null;
+  bytesOut: number;
+  cwd: string;
+  sessionFile: string | null;
+  title: string;
+  status: string;
+  lastActivity: string | null;
+};
+
+function isRuntimeInfo(value: unknown): value is DesktopRuntimeInfo {
+  if (!value || typeof value !== "object" || Array.isArray(value)) return false;
+  const runtime = value as Record<string, unknown>;
+  return (
+    typeof runtime.id === "string" &&
+    isSlotId(runtime.id) &&
+    typeof runtime.alive === "boolean" &&
+    typeof runtime.cols === "number" &&
+    typeof runtime.rows === "number" &&
+    typeof runtime.cwd === "string" &&
+    typeof runtime.title === "string" &&
+    typeof runtime.status === "string"
+  );
+}
+
+async function desktopRequest(
+  path: string,
+  init: RequestInit = {},
+  timeoutMs = 4000,
+): Promise<Response | undefined> {
+  try {
+    return await fetch(new URL(path, DESKTOP), {
+      ...init,
+      signal: AbortSignal.timeout(timeoutMs),
+    });
+  } catch {
+    return undefined;
+  }
+}
+
+async function readDesktopJson(response: Response): Promise<unknown> {
+  try {
+    const text = await response.text();
+    if (text.length > MAX_DESKTOP_BODY) return undefined;
+    return JSON.parse(text) as unknown;
+  } catch {
+    return undefined;
+  }
+}
+
+async function listDesktopRuntimes(): Promise<
+  DesktopRuntimeInfo[] | undefined
+> {
+  const response = await desktopRequest("/api/runtimes");
+  if (!response || !response.ok) return undefined;
+  const body = await readDesktopJson(response);
+  if (!body || typeof body !== "object" || Array.isArray(body))
+    return undefined;
+  const runtimes = (body as Record<string, unknown>).runtimes;
+  if (!Array.isArray(runtimes)) return undefined;
+  return runtimes.filter(isRuntimeInfo);
+}
+
+async function createDesktopRuntime(request: {
+  cwd?: string;
+  resume?: string;
+}): Promise<{ runtime?: DesktopRuntimeInfo; status: number; error?: string }> {
+  const response = await desktopRequest("/api/runtimes", {
+    method: "POST",
+    headers: { "content-type": "application/json" },
+    body: JSON.stringify(request),
+  });
+  if (!response) return { status: 503, error: "desktop daemon unavailable" };
+  const text = await response.text().catch(() => "");
+  if (!response.ok) {
+    const message = text.trim().slice(0, 300);
+    return {
+      status:
+        response.status >= 400 && response.status <= 599 ? response.status : 502,
+      error: message || "desktop daemon rejected the runtime",
+    };
+  }
+  let body: unknown;
+  try {
+    body = JSON.parse(text) as unknown;
+  } catch {
+    return { status: 502, error: "desktop daemon returned an invalid runtime" };
+  }
+  const runtime =
+    body && typeof body === "object" && !Array.isArray(body)
+      ? (body as Record<string, unknown>).runtime
+      : undefined;
+  if (!isRuntimeInfo(runtime))
+    return { status: 502, error: "desktop daemon returned an invalid runtime" };
+  return { runtime, status: 200 };
+}
+
+async function listDesktopSessions(
+  limit: number,
+  search?: string,
+): Promise<SessionSummary[] | undefined> {
+  const params = new URLSearchParams({ limit: String(limit) });
+  if (search) params.set("search", search);
+  const response = await desktopRequest(`/api/sessions?${params.toString()}`);
+  if (!response || !response.ok) return undefined;
+  const body = await readDesktopJson(response);
+  if (!body || typeof body !== "object" || Array.isArray(body))
+    return undefined;
+  const sessions = (body as Record<string, unknown>).sessions;
+  if (!Array.isArray(sessions)) return undefined;
+  const result: SessionSummary[] = [];
+  for (const entry of sessions) {
+    if (!entry || typeof entry !== "object" || Array.isArray(entry)) continue;
+    const value = entry as Record<string, unknown>;
+    if (
+      typeof value.id !== "string" ||
+      typeof value.path !== "string" ||
+      typeof value.cwd !== "string" ||
+      typeof value.title !== "string" ||
+      typeof value.updatedAt !== "string" ||
+      typeof value.costUsd !== "number" ||
+      !Number.isFinite(value.costUsd)
+    )
+      continue;
+    result.push({
+      id: value.id,
+      path: value.path,
+      cwd: value.cwd,
+      title: value.title,
+      updatedAt: value.updatedAt,
+      costUsd: value.costUsd,
+    });
+  }
+  return result;
+}
+
+/* -------------------------------------------------------------------------- */
+/* Extension IPC                                                              */
+/* -------------------------------------------------------------------------- */
+
 type IpcResponse = { status: number; body: string };
 
 function ipcRequest(
@@ -309,70 +354,608 @@ function ipcRequest(
   body?: string,
   timeoutMs: number = 3000,
 ): Promise<IpcResponse> {
-  return new Promise((resolveRequest, rejectRequest) => {
-    let settled = false;
-    const chunks: Buffer[] = [];
-    let total = 0;
-    const socket: Socket = createConnection({ path: socketPath });
-    const finish = (error?: Error, response?: IpcResponse) => {
-      if (settled) return;
-      settled = true;
-      socket.destroy();
-      if (error) rejectRequest(error);
-      else resolveRequest(response as IpcResponse);
-    };
-    socket.setTimeout(timeoutMs, () =>
-      finish(new Error("extension socket timeout")),
-    );
-    socket.once("error", (error) => finish(error));
-    socket.on("data", (chunk: Buffer) => {
-      total += chunk.length;
-      if (total > MAX_IPC)
-        return finish(new Error("extension response too large"));
-      chunks.push(Buffer.from(chunk));
-    });
-    socket.once("end", () => {
-      const raw = Buffer.concat(chunks).toString("utf8");
-      const split = raw.indexOf("\r\n\r\n");
-      if (split < 0) return finish(new Error("malformed extension response"));
-      const header = raw.slice(0, split);
-      const statusMatch = /^HTTP\/1\.1\s+(\d{3})/m.exec(header);
-      if (!statusMatch) return finish(new Error("malformed extension status"));
-      const contentLength = /\r\ncontent-length:\s*(\d+)/i.exec(header)?.[1];
-      const payload = raw.slice(split + 4);
-      if (
-        contentLength !== undefined &&
-        Buffer.byteLength(payload) < Number(contentLength)
-      )
-        return finish(new Error("truncated extension response"));
-      finish(undefined, {
-        status: Number(statusMatch[1]),
-        body:
-          contentLength === undefined
-            ? payload
-            : payload.slice(0, Number(contentLength)),
-      });
-    });
-    socket.once("connect", () => {
-      const requestBody = body ?? "";
-      const headers = [
-        `${method} ${path} HTTP/1.1`,
-        "Host: omp-mobile",
-        "Connection: close",
-        `Authorization: Bearer ${mobileToken}`,
-        `X-OMP-Mobile-Token: ${mobileToken}`,
-        ...(requestBody
-          ? [
-              "Content-Type: application/json",
-              `Content-Length: ${Buffer.byteLength(requestBody)}`,
-            ]
-          : []),
-        "",
-        requestBody,
-      ].join("\r\n");
-      socket.write(headers);
+  const { promise, resolve: resolveRequest, reject: rejectRequest } =
+    Promise.withResolvers<IpcResponse>();
+  let settled = false;
+  const chunks: Buffer[] = [];
+  let total = 0;
+  const socket: Socket = createConnection({ path: socketPath });
+  const finish = (error?: Error, response?: IpcResponse) => {
+    if (settled) return;
+    settled = true;
+    socket.destroy();
+    if (error) rejectRequest(error);
+    else resolveRequest(response as IpcResponse);
+  };
+  socket.setTimeout(timeoutMs, () => finish(new Error("extension socket timeout")));
+  socket.once("error", (error) => finish(error));
+  socket.on("data", (chunk: Buffer) => {
+    total += chunk.length;
+    if (total > MAX_IPC) return finish(new Error("extension response too large"));
+    chunks.push(Buffer.from(chunk));
+  });
+  socket.once("end", () => {
+    const raw = Buffer.concat(chunks).toString("utf8");
+    const split = raw.indexOf("\r\n\r\n");
+    if (split < 0) return finish(new Error("malformed extension response"));
+    const header = raw.slice(0, split);
+    const statusMatch = /^HTTP\/1\.1\s+(\d{3})/m.exec(header);
+    if (!statusMatch) return finish(new Error("malformed extension status"));
+    const contentLength = /\r\ncontent-length:\s*(\d+)/i.exec(header)?.[1];
+    const payload = raw.slice(split + 4);
+    if (
+      contentLength !== undefined &&
+      Buffer.byteLength(payload) < Number(contentLength)
+    )
+      return finish(new Error("truncated extension response"));
+    finish(undefined, {
+      status: Number(statusMatch[1]),
+      body:
+        contentLength === undefined
+          ? payload
+          : payload.slice(0, Number(contentLength)),
     });
   });
+  socket.once("connect", () => {
+    const requestBody = body ?? "";
+    const headers = [
+      `${method} ${path} HTTP/1.1`,
+      "Host: omp-mobile",
+      "Connection: close",
+      `Authorization: Bearer ${mobileToken}`,
+      `X-OMP-Mobile-Token: ${mobileToken}`,
+      ...(requestBody
+        ? [
+            "Content-Type: application/json",
+            `Content-Length: ${Buffer.byteLength(requestBody)}`,
+          ]
+        : []),
+      "",
+      requestBody,
+    ].join("\r\n");
+    socket.write(headers);
+  });
+  return promise;
+}
+
+async function socketAvailable(id: string): Promise<boolean> {
+  if (!isSlotId(id)) return false;
+  try {
+    const stat = await fs.lstat(join(IPC_ROOT, `${id}.sock`));
+    const uid =
+      typeof process.getuid === "function" ? process.getuid() : undefined;
+    return (
+      stat.isSocket() &&
+      (uid === undefined || stat.uid === uid) &&
+      (stat.mode & 0o077) === 0
+    );
+  } catch {
+    return false;
+  }
+}
+
+/**
+ * Raw `/state` read for list/status enrichment. Failures never throw: a
+ * runtime without a live extension still shows up via the desktop list.
+ */
+async function readExtensionState(
+  id: string,
+  timeoutMs = 1200,
+): Promise<Record<string, unknown> | undefined> {
+  if (!(await socketAvailable(id))) return undefined;
+  try {
+    const response = await ipcRequest(
+      join(IPC_ROOT, `${id}.sock`),
+      "GET",
+      "/state",
+      undefined,
+      timeoutMs,
+    );
+    if (response.status < 200 || response.status >= 300) return undefined;
+    const value = JSON.parse(response.body) as unknown;
+    return value && typeof value === "object" && !Array.isArray(value)
+      ? (value as Record<string, unknown>)
+      : undefined;
+  } catch {
+    return undefined;
+  }
+}
+
+/* -------------------------------------------------------------------------- */
+/* Headless terminal mirror                                                   */
+/* -------------------------------------------------------------------------- */
+
+/**
+ * The phone's terminal view is rendered by the same xterm core as the desktop
+ * client (`@xterm/headless`, xterm 6): each attached runtime feeds its PTY
+ * bytes into a headless Terminal, and snapshots read the visible viewport of
+ * its active buffer. Styling, alt-screen handling, wide chars and scroll
+ * regions therefore follow xterm's own parser instead of a private one.
+ */
+
+
+/* -------------------------------------------------------------------------- */
+/* Desktop stream attachments                                                 */
+/* -------------------------------------------------------------------------- */
+
+type DesktopStream = {
+  id: string;
+  socket: WebSocket;
+  terminal: HeadlessTerminal;
+  ready: Promise<boolean>;
+  closed: boolean;
+  hello: boolean;
+  replayBytes: number;
+  receivedBytes: number;
+  /** Writes handed to the xterm parser that have not finished parsing yet. */
+  pendingWrites: number;
+  drained: Promise<void> | null;
+  resolveDrained: (() => void) | null;
+  closeTimer?: Timer;
+};
+
+const streams = new Map<string, DesktopStream>();
+
+function closeStream(stream: DesktopStream): void {
+  if (stream.closed) return;
+  stream.closed = true;
+  clearTimeout(stream.closeTimer);
+  try {
+    stream.socket.close();
+  } catch {
+    // already closed
+  }
+  stream.terminal.dispose();
+  stream.pendingWrites = 0;
+  const resolve = stream.resolveDrained;
+  stream.drained = null;
+  stream.resolveDrained = null;
+  resolve?.();
+  if (streams.get(stream.id) === stream) streams.delete(stream.id);
+}
+
+function touchStream(stream: DesktopStream): void {
+  clearTimeout(stream.closeTimer);
+  stream.closeTimer = setTimeout(() => closeStream(stream), STREAM_IDLE_MS);
+}
+
+/**
+ * Snapshot reads must not race the parser: xterm's `write` callback fires
+ * after the chunk has been parsed, so a snapshot waits until every queued
+ * write has drained (in order) before reading the buffer.
+ */
+function drainWrites(stream: DesktopStream): Promise<void> {
+  if (stream.closed || stream.pendingWrites === 0) return Promise.resolve();
+  if (!stream.drained) {
+    const { promise, resolve } = Promise.withResolvers<void>();
+    stream.drained = promise;
+    stream.resolveDrained = resolve;
+  }
+  return stream.drained;
+}
+
+function toBytes(data: unknown): Uint8Array | undefined {
+  if (data instanceof Uint8Array) return data;
+  if (data instanceof ArrayBuffer) return new Uint8Array(data);
+  return undefined;
+}
+
+/**
+ * A read-mostly attachment to the desktop PTY: it keeps the omp process
+ * started (a fresh runtime spawns on first attach), mirrors its bytes into a
+ * headless xterm terminal, and can send input frames back. Closing the socket
+ * only detaches; the runtime keeps running and the next request reattaches.
+ */
+function attachStream(info: DesktopRuntimeInfo): DesktopStream {
+  const existing = streams.get(info.id);
+  if (existing && !existing.closed) {
+    touchStream(existing);
+    return existing;
+  }
+  const terminal = new HeadlessTerminal({
+    cols: info.cols,
+    rows: info.rows,
+    scrollback: 1000,
+    allowProposedApi: true,
+  });
+  const socket = new WebSocket(
+    `${DESKTOP_WS}?runtime=${encodeURIComponent(info.id)}`,
+  );
+  socket.binaryType = "arraybuffer";
+  const { promise: ready, resolve: resolveReady } =
+    Promise.withResolvers<boolean>();
+  let settled = false;
+  const stream: DesktopStream = {
+    id: info.id,
+    socket,
+    terminal,
+    ready,
+    closed: false,
+    hello: false,
+    replayBytes: 0,
+    receivedBytes: 0,
+    pendingWrites: 0,
+    drained: null,
+    resolveDrained: null,
+  };
+  const decoder = new TextDecoder();
+  const timeout = setTimeout(() => {
+    if (settled) return;
+    settled = true;
+    resolveReady(false);
+  }, STREAM_READY_TIMEOUT_MS);
+  const finishReady = (value: boolean): void => {
+    if (settled) return;
+    settled = true;
+    clearTimeout(timeout);
+    resolveReady(value);
+  };
+  socket.addEventListener("message", (event) => {
+    touchStream(stream);
+    const data = (event as MessageEvent).data;
+    if (typeof data === "string") {
+      let hello: unknown;
+      try {
+        hello = JSON.parse(data);
+      } catch {
+        return;
+      }
+      if (!hello || typeof hello !== "object") return;
+      const message = hello as Record<string, unknown>;
+      if (message.type !== "hello") return;
+      const runtime =
+        message.runtime && typeof message.runtime === "object"
+          ? (message.runtime as Record<string, unknown>)
+          : undefined;
+      const cols = typeof runtime?.cols === "number" ? runtime.cols : info.cols;
+      const rows = typeof runtime?.rows === "number" ? runtime.rows : info.rows;
+      terminal.resize(cols, rows);
+      stream.hello = true;
+      stream.replayBytes =
+        typeof message.replayBytes === "number" &&
+        Number.isFinite(message.replayBytes)
+          ? message.replayBytes
+          : 0;
+      if (stream.receivedBytes >= stream.replayBytes) finishReady(true);
+      return;
+    }
+    const bytes = toBytes(data);
+    if (!bytes) return;
+    stream.receivedBytes += bytes.byteLength;
+    stream.pendingWrites += 1;
+    terminal.write(decoder.decode(bytes, { stream: true }), () => {
+      if (stream.closed) return;
+      stream.pendingWrites -= 1;
+      if (stream.pendingWrites > 0) return;
+      const resolve = stream.resolveDrained;
+      stream.drained = null;
+      stream.resolveDrained = null;
+      resolve?.();
+    });
+    if (stream.hello && stream.receivedBytes >= stream.replayBytes)
+      finishReady(true);
+  });
+  socket.addEventListener("close", () => {
+    closeStream(stream);
+    finishReady(false);
+  });
+  socket.addEventListener("error", () => finishReady(false));
+  streams.set(info.id, stream);
+  touchStream(stream);
+  return stream;
+}
+
+async function ensureStream(
+  info: DesktopRuntimeInfo,
+): Promise<DesktopStream | undefined> {
+  const stream = attachStream(info);
+  const ready = await stream.ready;
+  if (!ready || stream.closed) {
+    closeStream(stream);
+    return undefined;
+  }
+  return stream;
+}
+
+async function findDesktopRuntime(
+  id: string,
+): Promise<DesktopRuntimeInfo | undefined | "unavailable"> {
+  const runtimes = await listDesktopRuntimes();
+  if (!runtimes) return "unavailable";
+  return runtimes.find((runtime) => runtime.id === id);
+}
+
+/** Send a raw input frame to the desktop PTY that owns `id`. */
+async function sendRuntimeInput(id: string, data: string): Promise<boolean> {
+  const info = await findDesktopRuntime(id);
+  if (!info || info === "unavailable" || !info.alive) return false;
+  const stream = await ensureStream(info);
+  if (!stream) return false;
+  if (stream.socket.readyState !== WebSocket.OPEN) return false;
+  try {
+    stream.socket.send(JSON.stringify({ type: "input", data }));
+  } catch {
+    return false;
+  }
+  touchStream(stream);
+  return true;
+}
+
+async function waitForExtension(id: string, timeoutMs: number): Promise<void> {
+  const deadline = Date.now() + timeoutMs;
+  while (Date.now() < deadline) {
+    if (await socketAvailable(id)) return;
+    await Bun.sleep(100);
+  }
+}
+
+/* -------------------------------------------------------------------------- */
+/* Slot views                                                                 */
+/* -------------------------------------------------------------------------- */
+
+async function runtimeSummary(info: DesktopRuntimeInfo): Promise<SlotSummary> {
+  const raw = await readExtensionState(info.id);
+  const title =
+    typeof raw?.title === "string" && raw.title.trim()
+      ? raw.title.trim().slice(0, 200)
+      : info.title;
+  const cwd =
+    typeof raw?.cwd === "string" && raw.cwd.trim()
+      ? normalize(raw.cwd.trim()).slice(0, 2000)
+      : info.cwd;
+  const summary =
+    typeof raw?.summary === "string" && raw.summary.trim()
+      ? raw.summary.trim().slice(0, 500)
+      : undefined;
+  const accent =
+    typeof raw?.accent === "string" && /^#[0-9a-f]{6}$/i.test(raw.accent)
+      ? raw.accent
+      : undefined;
+  const status =
+    raw?.agentActive === true
+      ? "running"
+      : info.alive
+        ? "connected"
+        : "offline";
+  return {
+    id: info.id,
+    title,
+    ...(summary ? { summary } : {}),
+    ...(accent ? { accent } : {}),
+    cwd,
+    status,
+    connected: raw !== undefined,
+    sessionFile: info.sessionFile,
+  };
+}
+
+const TERMINAL_UNAVAILABLE = {
+  read: false,
+  write: false,
+  resize: false,
+  focus: false,
+};
+
+async function slotsResponse(): Promise<Response> {
+  const runtimes = await listDesktopRuntimes();
+  if (!runtimes)
+    return errorResponse(503, "desktop daemon unavailable");
+  knownSlotIds = runtimes.map((runtime) => runtime.id);
+  const slots = await Promise.all(runtimes.map(runtimeSummary));
+  return json({ apiVersion: API_VERSION, slots });
+}
+
+async function validCwdPath(value: unknown): Promise<string | undefined> {
+  if (
+    typeof value !== "string" ||
+    value.length === 0 ||
+    value.length > 4096 ||
+    !isAbsolute(value) ||
+    /[\u0000-\u001f\u007f-\u009f]/.test(value)
+  )
+    return undefined;
+  const path = await realPathWithin(resolve(value));
+  if (!path || hiddenPath(path)) return undefined;
+  try {
+    return (await fs.stat(path)).isDirectory() ? path : undefined;
+  } catch {
+    return undefined;
+  }
+}
+
+async function validResumePath(value: unknown): Promise<string | undefined> {
+  if (
+    typeof value !== "string" ||
+    value.length === 0 ||
+    value.length > 4096 ||
+    !isAbsolute(value) ||
+    !value.endsWith(".jsonl") ||
+    /[\u0000-\u001f\u007f-\u009f]/.test(value)
+  )
+    return undefined;
+  try {
+    const [real, root] = await Promise.all([
+      fs.realpath(resolve(value)),
+      fs.realpath(SESSIONS_ROOT),
+    ]);
+    if (real !== root && !real.startsWith(`${root}${sep}`)) return undefined;
+    const stat = await fs.stat(real);
+    return stat.isFile() ? real : undefined;
+  } catch {
+    return undefined;
+  }
+}
+
+async function createSlot(request: Request): Promise<Response> {
+  let body: Record<string, unknown>;
+  try {
+    body = parseJson(await readBody(request));
+  } catch (error) {
+    return errorResponse(
+      400,
+      error instanceof Error ? error.message : "invalid JSON",
+    );
+  }
+  let cwd: string | undefined;
+  if (body.cwd !== undefined) {
+    cwd = await validCwdPath(body.cwd);
+    if (!cwd)
+      return errorResponse(
+        403,
+        "cwd must be an existing non-hidden directory inside the workspace",
+      );
+  }
+  let resume: string | undefined;
+  if (body.resume !== undefined) {
+    resume = await validResumePath(body.resume);
+    if (!resume)
+      return errorResponse(
+        400,
+        "resume must be an existing session file under the desktop session store",
+      );
+  }
+  const created = await createDesktopRuntime({ cwd, resume });
+  if (!created.runtime)
+    return errorResponse(
+      created.status,
+      created.error ?? "desktop daemon unavailable",
+    );
+  const info = created.runtime;
+  // A fresh runtime spawns on first attach; the desktop UI does the same when
+  // a pane binds to it. Waiting for the extension socket makes the returned
+  // slot immediately actionable for prompt/model/terminal calls.
+  const stream = attachStream(info);
+  void stream.ready;
+  await waitForExtension(info.id, 2500);
+  // Re-read the runtime so the response carries what the daemon learned while
+  // the process booted (sniffed session file, title, live status).
+  const fresh = (await listDesktopRuntimes())?.find(
+    (runtime) => runtime.id === info.id,
+  );
+  return json({ slot: await runtimeSummary(fresh ?? info) });
+}
+
+async function deleteSlot(id: string): Promise<Response> {
+  const info = await findDesktopRuntime(id);
+  if (info === "unavailable")
+    return errorResponse(503, "desktop daemon unavailable");
+  if (!info) return errorResponse(404, "unknown runtime");
+  const response = await desktopRequest(
+    `/api/runtimes/${encodeURIComponent(id)}`,
+    { method: "DELETE" },
+  );
+  if (!response)
+    return errorResponse(503, "desktop daemon unavailable");
+  if (!response.ok) {
+    return errorResponse(
+      response.status === 404 ? 404 : 502,
+      response.status === 404 ? "unknown runtime" : "desktop daemon rejected the stop",
+    );
+  }
+  const stream = streams.get(id);
+  if (stream) closeStream(stream);
+  return json({ ok: true });
+}
+
+async function sessionsResponse(request: Request): Promise<Response> {
+  const params = new URL(request.url).searchParams;
+  const rawLimit = Number.parseInt(params.get("limit") ?? "60", 10);
+  const limit =
+    Number.isFinite(rawLimit) && rawLimit > 0
+      ? Math.min(200, Math.floor(rawLimit))
+      : 60;
+  const search = params.get("search")?.slice(0, 200) || undefined;
+  const sessions = await listDesktopSessions(limit, search);
+  if (!sessions) return errorResponse(503, "desktop daemon unavailable");
+  return json({ sessions });
+}
+
+async function terminalSnapshot(id: string): Promise<Response> {
+  const info = await findDesktopRuntime(id);
+  if (info === "unavailable")
+    return errorResponse(503, "desktop daemon unavailable", {
+      capabilities: { reconnect: true },
+    });
+  if (!info)
+    return errorResponse(404, "unknown runtime");
+  if (!info.alive)
+    return errorResponse(503, "runtime is not running", {
+      capabilities: TERMINAL_UNAVAILABLE,
+    });
+  const stream = await ensureStream(info);
+  if (!stream)
+    return errorResponse(503, "terminal stream unavailable", {
+      capabilities: TERMINAL_UNAVAILABLE,
+    });
+  await drainWrites(stream);
+  if (stream.closed)
+    return errorResponse(503, "terminal stream unavailable", {
+      capabilities: TERMINAL_UNAVAILABLE,
+    });
+  const raw = await readExtensionState(id);
+  // Visible viewport of whichever buffer is active (primary or alternate):
+  // the phone mirrors what a pane shows right now.
+  const buffer = stream.terminal.buffer.active;
+  const lines: string[] = [];
+  for (let row = 0; row < stream.terminal.rows; row += 1) {
+    const line = buffer.getLine(buffer.viewportY + row);
+    lines.push(line ? line.translateToString(false) : "");
+  }
+  const snapshot: TerminalSnapshot = {
+    apiVersion: API_VERSION,
+    generation:
+      typeof raw?.generation === "string" ? raw.generation : `desktop:${id}`,
+    paneId: id,
+    screen: lines.join("\n"),
+    capabilities: { read: true, write: true, resize: false, focus: false },
+  };
+  return json(snapshot);
+}
+
+async function terminalAction(id: string, request: Request): Promise<Response> {
+  let body: Record<string, unknown>;
+  try {
+    body = parseJson(await readBody(request));
+  } catch (error) {
+    return errorResponse(
+      400,
+      error instanceof Error ? error.message : "invalid JSON",
+    );
+  }
+  if (
+    typeof body.generation !== "string" ||
+    body.generation.length === 0 ||
+    body.generation.length > 200 ||
+    body.type !== "write" ||
+    body.confirmed !== true ||
+    typeof body.text !== "string" ||
+    body.text.length > TERMINAL_WRITE_LIMIT
+  )
+    return errorResponse(
+      400,
+      "terminal write requires generation, confirmed:true, and text",
+    );
+  const info = await findDesktopRuntime(id);
+  if (info === "unavailable")
+    return errorResponse(503, "desktop daemon unavailable", {
+      capabilities: { reconnect: true },
+    });
+  if (!info) return errorResponse(404, "unknown runtime");
+  const raw = await readExtensionState(id);
+  if (!raw)
+    return errorResponse(503, "extension unavailable", {
+      capabilities: { reconnect: true },
+    });
+  if (
+    raw.generation !== undefined &&
+    String(raw.generation) !== body.generation
+  )
+    return errorResponse(409, "session changed; refresh before writing", {
+      generation: raw.generation,
+    });
+  if (!(await sendRuntimeInput(id, body.text)))
+    return errorResponse(503, "terminal write failed");
+  return json({ ok: true, generation: body.generation });
 }
 
 function normaliseState(raw: Record<string, unknown>): SlotState | undefined {
@@ -504,7 +1087,7 @@ function normaliseState(raw: Record<string, unknown>): SlotState | undefined {
 }
 
 async function getSlotState(
-  slot: SlotId,
+  slot: string,
 ): Promise<{ state?: SlotState; response?: IpcResponse; error?: string }> {
   if (!(await socketAvailable(slot))) return { error: "extension unavailable" };
   try {
@@ -532,141 +1115,196 @@ async function getSlotState(
   }
 }
 
-type ZellijPane = { paneId: string; tabId?: number };
-
-async function zellijOutput(args: string[], limit: number): Promise<string> {
-  const process = Bun.spawn(["zellij", "-s", ZELLIJ_SESSION, ...args], {
-    stdout: "pipe",
-    stderr: "pipe",
-  });
-  const timeout = setTimeout(() => process.kill(), 3000);
-  const reader = process.stdout.getReader();
-  const chunks: Uint8Array[] = [];
-  let total = 0;
+async function slotAction(slot: string, request: Request): Promise<Response> {
+  let body: Record<string, unknown>;
   try {
-    for (;;) {
-      const part = await reader.read();
-      if (part.done) break;
-      total += part.value.byteLength;
-      if (total > limit) {
-        process.kill();
-        throw new Error("zellij output too large");
-      }
-      chunks.push(part.value);
-    }
-  } finally {
-    reader.releaseLock();
-    clearTimeout(timeout);
+    body = parseJson(await readBody(request));
+  } catch (error) {
+    return errorResponse(
+      400,
+      error instanceof Error ? error.message : "invalid JSON",
+    );
   }
-  const exitCode = await process.exited;
-  if (exitCode !== 0) throw new Error(`zellij action failed (${exitCode})`);
-  const output = new Uint8Array(total);
-  let offset = 0;
-  for (const chunk of chunks) {
-    output.set(chunk, offset);
-    offset += chunk.byteLength;
-  }
-  return new TextDecoder().decode(output);
-}
+  const generation =
+    typeof body.generation === "string"
+      ? body.generation
+      : typeof body.generation === "number"
+        ? String(body.generation)
+        : "";
+  if (!generation || generation.length > 200 || typeof body.type !== "string")
+    return errorResponse(400, "generation and action type are required");
+  body.generation = generation;
 
-async function paneForSlot(slot: SlotId): Promise<ZellijPane | undefined> {
-  try {
-    const value = JSON.parse(
-      await zellijOutput(
-        ["action", "list-panes", "--all", "--json"],
-        256 * 1024,
-      ),
-    ) as unknown;
-    if (!Array.isArray(value)) return undefined;
-    const matches: ZellijPane[] = [];
-    for (const item of value) {
-      if (!item || typeof item !== "object") continue;
-      const pane = item as Record<string, unknown>;
-      const command =
-        typeof pane.terminal_command === "string"
-          ? pane.terminal_command
-          : typeof pane.pane_command === "string"
-            ? pane.pane_command
-            : "";
-      const id =
-        typeof pane.id === "number" && Number.isInteger(pane.id) && pane.id >= 0
-          ? pane.id
-          : undefined;
-      if (
-        pane.is_plugin === true ||
-        pane.exited === true ||
-        pane.is_held === true ||
-        id === undefined ||
-        !command.endsWith(`omp-zellij-pane ${slot}`)
-      )
-        continue;
-      matches.push({
-        paneId: `terminal_${id}`,
-        ...(typeof pane.tab_id === "number" ? { tabId: pane.tab_id } : {}),
-      });
-    }
-    return matches.length === 1 ? matches[0] : undefined;
-  } catch {
-    return undefined;
-  }
-}
-
-async function terminalSnapshot(slot: SlotId): Promise<Response> {
-  const state = await getSlotState(slot);
-  if (!state.state)
-    return errorResponse(503, state.error ?? "extension unavailable", {
+  const current = await getSlotState(slot);
+  if (!current.state)
+    return errorResponse(503, current.error ?? "extension unavailable", {
       capabilities: { reconnect: true },
     });
-  const pane = await paneForSlot(slot);
-  if (!pane)
-    return errorResponse(503, "Zellij pane is unavailable or ambiguous", {
-      capabilities: { read: false, write: false, resize: false, focus: false },
+  if (current.state.generation !== generation) {
+    return errorResponse(409, "session changed; refresh before mutating", {
+      generation: current.state.generation,
     });
+  }
+
+  const type = body.type;
+  let stagesInEditor = false;
+  if (type === "prompt") {
+    if (
+      typeof body.text !== "string" ||
+      body.text.length === 0 ||
+      body.text.length > 100_000
+    )
+      return errorResponse(400, "prompt text is invalid");
+  } else if (type === "abort") {
+    // No additional fields.
+  } else if (type === "model") {
+    if (
+      typeof body.provider !== "string" ||
+      typeof body.id !== "string" ||
+      body.provider.length > 200 ||
+      body.id.length > 300
+    )
+      return errorResponse(400, "model is invalid");
+  } else if (type === "effort") {
+    if (typeof body.value !== "string" || body.value.length > 100)
+      return errorResponse(400, "effort is invalid");
+  } else if (type === "command") {
+    if (
+      body.confirmed !== true ||
+      typeof body.text !== "string" ||
+      body.text.length === 0 ||
+      body.text.length > 10_000 ||
+      !body.text.startsWith("/") ||
+      /[\u0000-\u001f\u007f-\u009f]/.test(body.text)
+    )
+      return errorResponse(
+        400,
+        "command requires explicit confirmation and one line without controls",
+      );
+    // The owning extension forwards one well-formed token to the omp TUI,
+    // which is authoritative about which commands exist; the gateway must not
+    // pre-filter, because builtin commands are not enumerable per omp version.
+    stagesInEditor = true;
+  } else if (type === "move") {
+    if (
+      body.confirmed !== true ||
+      typeof body.path !== "string" ||
+      body.path.length === 0 ||
+      body.path.length > 4096 ||
+      /[\u0000-\u001f\u007f-\u009f]/.test(body.path)
+    )
+      return errorResponse(
+        400,
+        "move requires explicit confirmation and a path without controls",
+      );
+    const inputPath = body.path.startsWith("/")
+      ? body.path
+      : join(WORKSPACE_ROOT, body.path);
+    const normalizedPath = await realPathWithin(resolve(inputPath));
+    if (!normalizedPath)
+      return errorResponse(
+        403,
+        "move destination is outside the workspace or unavailable",
+      );
+    if (hiddenPath(normalizedPath))
+      return errorResponse(403, "move destination is not browsable");
+    try {
+      if (!(await fs.stat(normalizedPath)).isDirectory())
+        return errorResponse(400, "move destination is not a directory");
+    } catch {
+      return errorResponse(404, "move destination is unavailable");
+    }
+    // Forward the normalized absolute path so the extension and the terminal
+    // parse the same command, regardless of how the picker addressed it.
+    body.path = normalizedPath;
+    stagesInEditor = true;
+  } else {
+    return errorResponse(400, "unsupported action");
+  }
+
+  const action: SlotAction = body as unknown as SlotAction;
   try {
-    // Visible viewport only: a full scrollback dump can exceed the cap on a
-    // large pane, and the phone mirrors the live screen rather than history.
-    const raw = await zellijOutput(
-      ["action", "dump-screen", "--pane-id", pane.paneId],
-      512 * 1024,
+    const response = await ipcRequest(
+      join(IPC_ROOT, `${slot}.sock`),
+      "POST",
+      "/action",
+      JSON.stringify(action),
     );
-    const screen = raw
-      .split("\n")
-      .map((line) => line.replace(/[ \t]+$/, ""))
-      .join("\n");
-    const snapshot: TerminalSnapshot = {
-      apiVersion: API_VERSION,
-      generation: state.state.generation,
-      paneId: pane.paneId,
-      ...(pane.tabId === undefined ? {} : { tabId: pane.tabId }),
-      screen,
-      capabilities: { read: true, write: false, resize: false, focus: false },
-    };
-    return json(snapshot);
+    let payload: unknown;
+    try {
+      payload = JSON.parse(response.body);
+    } catch {
+      payload = { error: "invalid extension response" };
+    }
+    if (response.status === 409) return json(payload, 409);
+    if (response.status < 200 || response.status >= 300)
+      return json(payload, response.status >= 400 ? response.status : 502);
+    if (stagesInEditor) {
+      const prepared = payload as Record<string, unknown> | null;
+      const expectedCommand =
+        action.type === "move"
+          ? `/move ${action.path}`
+          : action.type === "command"
+            ? action.text
+            : "";
+      if (
+        !prepared ||
+        prepared.ok !== true ||
+        prepared.staged !== true ||
+        prepared.generation !== generation ||
+        prepared.command !== expectedCommand ||
+        (action.type === "move" && prepared.path !== action.path)
+      )
+        return errorResponse(502, "Extension did not prepare the command");
+      const latest = await getSlotState(slot);
+      if (
+        latest.state?.generation !== generation ||
+        latest.state.agentActive ||
+        latest.state.pendingApproval !== 0 ||
+        !latest.state.editor?.available ||
+        latest.state.editor.empty !== false
+      )
+        return errorResponse(
+          409,
+          "Session changed; command was not submitted",
+        );
+      // The extension staged the command in the editor of the PTY-owned omp
+      // process; Enter goes to that same runtime's terminal, exactly like the
+      // desktop client pressing it.
+      if (!(await sendRuntimeInput(slot, "\r")))
+        return errorResponse(
+          503,
+          "Command prepared but submission failed; inspect the desktop composer before retrying",
+        );
+      if (action.type === "move") {
+        return json({
+          ok: true,
+          submitted: true,
+          generation,
+          path: action.path,
+          command: expectedCommand,
+        } satisfies MoveResponse);
+      }
+      return json({
+        ok: true,
+        submitted: true,
+        generation,
+        command: expectedCommand,
+      } satisfies CommandResponse);
+    }
+    return json(payload, 200);
   } catch (error) {
     return errorResponse(
       503,
-      error instanceof Error ? error.message : "terminal unavailable",
-      {
-        capabilities: {
-          read: false,
-          write: false,
-          resize: false,
-          focus: false,
-        },
-      },
+      error instanceof Error ? error.message : "extension unavailable",
+      { capabilities: { reconnect: true } },
     );
   }
 }
 
-async function terminalAction(
-  _slot: SlotId,
-  _request: Request,
-): Promise<Response> {
-  return errorResponse(
-    501,
-    "Raw terminal input is disabled; use the guarded prompt and move actions",
-  );
-}
+/* -------------------------------------------------------------------------- */
+/* Filesystem, static assets, notifications                                   */
+/* -------------------------------------------------------------------------- */
 
 async function directoryListing(request: Request): Promise<Response> {
   const requested =
@@ -776,217 +1414,6 @@ async function pinsResponse(request: Request): Promise<Response> {
   return json({ pins });
 }
 
-function validSlot(value: string): value is SlotId {
-  return (SLOT_IDS as readonly string[]).includes(value);
-}
-
-async function slotAction(slot: SlotId, request: Request): Promise<Response> {
-  let body: Record<string, unknown>;
-  try {
-    body = parseJson(await readBody(request));
-  } catch (error) {
-    return errorResponse(
-      400,
-      error instanceof Error ? error.message : "invalid JSON",
-    );
-  }
-  const generation =
-    typeof body.generation === "string"
-      ? body.generation
-      : typeof body.generation === "number"
-        ? String(body.generation)
-        : "";
-  if (!generation || generation.length > 200 || typeof body.type !== "string")
-    return errorResponse(400, "generation and action type are required");
-  body.generation = generation;
-
-  const current = await getSlotState(slot);
-  if (!current.state)
-    return errorResponse(503, current.error ?? "extension unavailable", {
-      capabilities: { reconnect: true },
-    });
-  if (current.state.generation !== generation) {
-    return errorResponse(409, "session changed; refresh before mutating", {
-      generation: current.state.generation,
-    });
-  }
-
-  const type = body.type;
-  let stagedPane: ZellijPane | undefined;
-  if (type === "prompt") {
-    if (
-      typeof body.text !== "string" ||
-      body.text.length === 0 ||
-      body.text.length > 100_000
-    )
-      return errorResponse(400, "prompt text is invalid");
-  } else if (type === "abort") {
-    // No additional fields.
-  } else if (type === "model") {
-    if (
-      typeof body.provider !== "string" ||
-      typeof body.id !== "string" ||
-      body.provider.length > 200 ||
-      body.id.length > 300
-    )
-      return errorResponse(400, "model is invalid");
-  } else if (type === "effort") {
-    if (typeof body.value !== "string" || body.value.length > 100)
-      return errorResponse(400, "effort is invalid");
-  } else if (type === "command") {
-    if (
-      body.confirmed !== true ||
-      typeof body.text !== "string" ||
-      body.text.length === 0 ||
-      body.text.length > 10_000 ||
-      !body.text.startsWith("/") ||
-      /[\u0000-\u001f\u007f-\u009f]/.test(body.text)
-    )
-      return errorResponse(
-        400,
-        "command requires explicit confirmation and one line without controls",
-      );
-    const commandName = body.text.match(/^\/([^\s/]+)(?:\s|$)/)?.[1];
-    const available = current.state.commands.some(
-      (command) =>
-        command.name === commandName ||
-        command.aliases?.includes(commandName ?? ""),
-    );
-    if (!available) return errorResponse(404, "slash command is not available");
-    stagedPane = await paneForSlot(slot);
-    if (!stagedPane)
-      return errorResponse(
-        503,
-        "Command requires an unambiguous live Zellij pane",
-      );
-  } else if (type === "move") {
-    if (
-      body.confirmed !== true ||
-      typeof body.path !== "string" ||
-      body.path.length === 0 ||
-      body.path.length > 4096 ||
-      /[\u0000-\u001f\u007f-\u009f]/.test(body.path)
-    )
-      return errorResponse(
-        400,
-        "move requires explicit confirmation and a path without controls",
-      );
-    const inputPath = body.path.startsWith("/")
-      ? body.path
-      : join(WORKSPACE_ROOT, body.path);
-    const normalizedPath = await realPathWithin(resolve(inputPath));
-    if (!normalizedPath)
-      return errorResponse(
-        403,
-        "move destination is outside the workspace or unavailable",
-      );
-    if (hiddenPath(normalizedPath))
-      return errorResponse(403, "move destination is not browsable");
-    try {
-      if (!(await fs.stat(normalizedPath)).isDirectory())
-        return errorResponse(400, "move destination is not a directory");
-    } catch {
-      return errorResponse(404, "move destination is unavailable");
-    }
-    // Forward the normalized absolute path so the extension and the terminal
-    // parse the same command, regardless of how the picker addressed it.
-    body.path = normalizedPath;
-    stagedPane = await paneForSlot(slot);
-    if (!stagedPane)
-      return errorResponse(
-        503,
-        "Move requires an unambiguous live Zellij pane",
-      );
-  } else {
-    return errorResponse(400, "unsupported action");
-  }
-
-  const action: SlotAction = body as unknown as SlotAction;
-  try {
-    const response = await ipcRequest(
-      join(IPC_ROOT, `${slot}.sock`),
-      "POST",
-      "/action",
-      JSON.stringify(action),
-    );
-    let payload: unknown;
-    try {
-      payload = JSON.parse(response.body);
-    } catch {
-      payload = { error: "invalid extension response" };
-    }
-    if (response.status === 409) return json(payload, 409);
-    if (response.status < 200 || response.status >= 300)
-      return json(payload, response.status >= 400 ? response.status : 502);
-    if (
-      (action.type === "move" || action.type === "command") &&
-      stagedPane
-    ) {
-      const prepared = payload as Record<string, unknown> | null;
-      const expectedCommand =
-        action.type === "move" ? `/move ${action.path}` : action.text;
-      if (
-        !prepared ||
-        prepared.ok !== true ||
-        prepared.staged !== true ||
-        prepared.generation !== generation ||
-        prepared.command !== expectedCommand ||
-        (action.type === "move" && prepared.path !== action.path)
-      )
-        return errorResponse(502, "Extension did not prepare the command");
-      const [latest, pane] = await Promise.all([
-        getSlotState(slot),
-        paneForSlot(slot),
-      ]);
-      if (
-        latest.state?.generation !== generation ||
-        latest.state.agentActive ||
-        latest.state.pendingApproval !== 0 ||
-        !latest.state.editor?.available ||
-        latest.state.editor.empty !== false ||
-        pane?.paneId !== stagedPane.paneId
-      )
-        return errorResponse(
-          409,
-          "Session or pane changed; command was not submitted",
-        );
-      try {
-        await zellijOutput(
-          ["action", "write", "--pane-id", stagedPane.paneId, "13"],
-          4096,
-        );
-      } catch {
-        return errorResponse(
-          503,
-          "Command prepared but submission failed; inspect the desktop composer before retrying",
-        );
-      }
-      if (action.type === "move") {
-        return json({
-          ok: true,
-          submitted: true,
-          generation,
-          path: action.path,
-          command: expectedCommand,
-        } satisfies MoveResponse);
-      }
-      return json({
-        ok: true,
-        submitted: true,
-        generation,
-        command: expectedCommand,
-      } satisfies CommandResponse);
-    }
-    return json(payload, 200);
-  } catch (error) {
-    return errorResponse(
-      503,
-      error instanceof Error ? error.message : "extension unavailable",
-      { capabilities: { reconnect: true } },
-    );
-  }
-}
-
 const MIME: Record<string, string> = {
   ".html": "text/html; charset=utf-8",
   ".js": "text/javascript; charset=utf-8",
@@ -1083,12 +1510,12 @@ async function notificationsApi(request: Request): Promise<Response> {
   if (request.method === "POST" && pathname === "/api/notifications/ack") {
     if (
       typeof body.slot !== "string" ||
-      !(SLOT_IDS as readonly string[]).includes(body.slot) ||
+      !isSlotId(body.slot) ||
       typeof body.identity !== "string"
     )
       return errorResponse(400, "slot and identity are required");
     try {
-      await service.ack(body.slot as NotificationSlot, body.identity);
+      await service.ack(body.slot, body.identity);
       return json({ ok: true });
     } catch (error) {
       return errorResponse(
@@ -1101,6 +1528,13 @@ async function notificationsApi(request: Request): Promise<Response> {
   }
   return errorResponse(404, "not found");
 }
+
+function withCors(response: Response, request: Request): Response {
+  for (const [key, value] of Object.entries(corsHeaders(request)))
+    response.headers.set(key, value);
+  return response;
+}
+
 async function handle(request: Request): Promise<Response> {
   const url = new URL(request.url);
   if (request.method === "OPTIONS") {
@@ -1125,72 +1559,53 @@ async function handle(request: Request): Promise<Response> {
     url.pathname === "/api/notifications" ||
     url.pathname.startsWith("/api/notifications/")
   ) {
-    const response = await notificationsApi(request);
-    for (const [key, value] of Object.entries(corsHeaders(request)))
-      response.headers.set(key, value);
-    return response;
+    return withCors(await notificationsApi(request), request);
   }
 
-  if (request.method === "GET" && url.pathname === "/api/slots") {
-    const response = json(
-      {
-        apiVersion: API_VERSION,
-        slots: await Promise.all(SLOT_IDS.map(slotMetadata)),
-      },
-      200,
-      corsHeaders(request),
-    );
-    return response;
+  if (url.pathname === "/api/slots") {
+    if (request.method === "GET") return withCors(await slotsResponse(), request);
+    if (request.method === "POST")
+      return withCors(await createSlot(request), request);
+    return errorResponse(405, "method not allowed");
   }
+  if (url.pathname === "/api/sessions" && request.method === "GET")
+    return withCors(await sessionsResponse(request), request);
+  const deleteMatch = /^\/api\/slots\/([^/]+)$/.exec(url.pathname);
+  if (deleteMatch && request.method === "DELETE" && isSlotId(deleteMatch[1]))
+    return withCors(await deleteSlot(deleteMatch[1]), request);
   const stateMatch = /^\/api\/slots\/([^/]+)\/state$/.exec(url.pathname);
-  if (request.method === "GET" && stateMatch && validSlot(stateMatch[1])) {
+  if (request.method === "GET" && stateMatch && isSlotId(stateMatch[1])) {
     const result = await getSlotState(stateMatch[1]);
     if (!result.state) {
-      const response = errorResponse(
-        503,
-        result.error ?? "extension unavailable",
-        { capabilities: { reconnect: true } },
+      return withCors(
+        errorResponse(503, result.error ?? "extension unavailable", {
+          capabilities: { reconnect: true },
+        }),
+        request,
       );
-      for (const [key, value] of Object.entries(corsHeaders(request)))
-        response.headers.set(key, value);
-      return response;
     }
-    return json(result.state, 200, corsHeaders(request));
+    return withCors(json(result.state), request);
   }
   const terminalMatch = /^\/api\/slots\/([^/]+)\/terminal$/.exec(url.pathname);
-  if (terminalMatch && validSlot(terminalMatch[1])) {
+  if (terminalMatch && isSlotId(terminalMatch[1])) {
     const response =
       request.method === "GET"
         ? await terminalSnapshot(terminalMatch[1])
         : request.method === "POST"
           ? await terminalAction(terminalMatch[1], request)
           : errorResponse(405, "method not allowed");
-    for (const [key, value] of Object.entries(corsHeaders(request)))
-      response.headers.set(key, value);
-    return response;
+    return withCors(response, request);
   }
   const actionMatch = /^\/api\/slots\/([^/]+)\/action$/.exec(url.pathname);
-  if (request.method === "POST" && actionMatch && validSlot(actionMatch[1])) {
-    const response = await slotAction(actionMatch[1], request);
-    for (const [key, value] of Object.entries(corsHeaders(request)))
-      response.headers.set(key, value);
-    return response;
-  }
-  if (url.pathname === "/api/directories" && request.method === "GET") {
-    const response = await directoryListing(request);
-    for (const [key, value] of Object.entries(corsHeaders(request)))
-      response.headers.set(key, value);
-    return response;
-  }
+  if (request.method === "POST" && actionMatch && isSlotId(actionMatch[1]))
+    return withCors(await slotAction(actionMatch[1], request), request);
+  if (url.pathname === "/api/directories" && request.method === "GET")
+    return withCors(await directoryListing(request), request);
   if (
     url.pathname === "/api/pins" &&
     (request.method === "GET" || request.method === "PUT")
-  ) {
-    const response = await pinsResponse(request);
-    for (const [key, value] of Object.entries(corsHeaders(request)))
-      response.headers.set(key, value);
-    return response;
-  }
+  )
+    return withCors(await pinsResponse(request), request);
   return errorResponse(404, "not found");
 }
 
@@ -1232,6 +1647,18 @@ async function loadToken(): Promise<void> {
     throw new Error(`missing or invalid mobile token (${TOKEN_FILE})`);
 }
 
+/**
+ * Notification polling needs the live runtime ids. On a transient desktop
+ * outage the previous list is kept so a daemon restart cannot be mistaken for
+ * "every slot disappeared" (which would drop unread completions).
+ */
+async function notificationSlotIds(): Promise<string[]> {
+  const runtimes = await listDesktopRuntimes();
+  if (!runtimes) return knownSlotIds;
+  knownSlotIds = runtimes.map((runtime) => runtime.id);
+  return knownSlotIds;
+}
+
 export async function start() {
   await loadToken();
   await fs.mkdir(IPC_ROOT, { recursive: true, mode: 0o700 });
@@ -1242,6 +1669,7 @@ export async function start() {
     ipcRoot: IPC_ROOT,
     token: mobileToken,
     stateFile: join(IPC_ROOT, "notifications.json"),
+    listSlots: notificationSlotIds,
   });
   notificationService.start();
   const server = Bun.serve({
@@ -1250,7 +1678,7 @@ export async function start() {
     fetch: handle,
   });
   console.log(
-    `omp-mobile listening on http://127.0.0.1:${server.port} (serve privately with: tailscale serve --bg ${server.port})`,
+    `omp-mobile listening on http://127.0.0.1:${server.port} (desktop daemon: ${DESKTOP.origin}; serve privately with: tailscale serve --bg ${server.port})`,
   );
   return server;
 }
