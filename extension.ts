@@ -7,8 +7,8 @@ import {
   writeFileSync,
 } from "node:fs";
 import { join } from "node:path";
-import { createHash } from "node:crypto";
 import type { ExtensionAPI, ExtensionContext } from "@oh-my-pi/pi-coding-agent";
+import { getSessionAccentHex, type SessionAccentInputs } from "./session-accent";
 
 /**
  * In-process OMP mobile bridge.
@@ -272,107 +272,59 @@ function themeSnapshot(ctx: ExtensionContext): {
   };
 }
 
-function themeAccentInputs(
-  ctx: ExtensionContext,
-): { hexes: string[]; surfaceLuminance?: number } | null {
-  const theme = ctx.ui?.theme;
-  if (!theme || typeof theme !== "object") return null;
-  let hexes: string[] = [];
-  const majorGetter =
-    "getMajorThemeColorHexes" in theme
-      ? theme.getMajorThemeColorHexes
+function normalizeSessionAccentInputs(
+  value: unknown,
+): SessionAccentInputs | null {
+  if (!value || typeof value !== "object") return null;
+  const raw = value as Record<string, unknown>;
+  const accentHex =
+    typeof raw.accentHex === "string" && raw.accentHex.length > 0
+      ? raw.accentHex
       : undefined;
-  if (typeof majorGetter === "function") {
-    try {
-      const value: unknown = Reflect.apply(majorGetter, theme, []);
-      if (Array.isArray(value))
-        hexes = value.filter((hex): hex is string => typeof hex === "string");
-    } catch {
-      hexes = [];
-    }
-  }
-  if (hexes.length === 0) {
-    // Older runtimes expose resolved colors only through getColorHex; the token
-    // snapshot is a good-enough collision set for the universal hue shift.
-    hexes = Object.values(themeSnapshot(ctx)?.tokens ?? {});
-  }
-  let surfaceLuminance: number | undefined;
-  const luminance =
-    "accentSurfaceLuminance" in theme
-      ? theme.accentSurfaceLuminance
+  const colorHexes = Array.isArray(raw.colorHexes)
+    ? raw.colorHexes.filter((hex): hex is string => typeof hex === "string")
+    : [];
+  const surfaceLuminance =
+    typeof raw.surfaceLuminance === "number" &&
+    Number.isFinite(raw.surfaceLuminance)
+      ? raw.surfaceLuminance
       : undefined;
-  if (typeof luminance === "number") surfaceLuminance = luminance;
-  return { hexes, surfaceLuminance };
-}
-
-function hexToHue(hex: string): number | undefined {
-  const match = /^#?([0-9a-f]{6})$/i.exec(hex);
-  if (!match) return undefined;
-  const value = Number.parseInt(match[1], 16);
-  const r = ((value >> 16) & 0xff) / 255;
-  const g = ((value >> 8) & 0xff) / 255;
-  const b = (value & 0xff) / 255;
-  const max = Math.max(r, g, b);
-  const min = Math.min(r, g, b);
-  if (max === min) return 0;
-  const d = max - min;
-  let hue: number;
-  if (max === r) hue = ((g - b) / d) % 6;
-  else if (max === g) hue = (b - r) / d + 2;
-  else hue = (r - g) / d + 4;
-  return ((hue * 60) % 360 + 360) % 360;
-}
-
-function hueToHex(hue: number, lightness: number): string {
-  const c = (1 - Math.abs(2 * lightness - 1)) * 1;
-  const h = ((hue % 360) + 360) % 360;
-  const x = c * (1 - Math.abs(((h / 60) % 2) - 1));
-  const m = lightness - c / 2;
-  const sector = Math.floor(h / 60) % 6;
-  const [r1, g1, b1] =
-    sector === 0
-      ? [c, x, 0]
-      : sector === 1
-        ? [x, c, 0]
-        : sector === 2
-          ? [0, c, x]
-          : sector === 3
-            ? [0, x, c]
-            : sector === 4
-              ? [x, 0, c]
-              : [c, 0, x];
-  const toByte = (channel: number): string =>
-    Math.round((channel + m) * 255)
-      .toString(16)
-      .padStart(2, "0");
-  return `#${toByte(r1)}${toByte(g1)}${toByte(b1)}`;
+  if (accentHex === undefined && colorHexes.length === 0) return null;
+  return { accentHex, colorHexes, surfaceLuminance };
 }
 
 /**
- * Per-session accent used to tell runtimes apart in the phone list.
- *
- * omp ships `getSessionAccentHex` in an internal subpath module; the compiled
- * binary cannot resolve that specifier for a `-e` extension, so this keeps the
- * same idea (a deterministic hue shift of the theme accent keyed by the session
- * name) with local color math instead of a version-coupled import.
+ * Read the frozen `theme.sessionAccentInputs` token the host CLI feeds to its
+ * `getSessionAccentHex`. Hosts that expose no token yield null; callers then
+ * fall back to the neutral client default instead of a guessed hue.
  */
-function sessionAccent(ctx: ExtensionContext): string | null {
+function readThemeAccentInputs(
+  ctx: ExtensionContext,
+): SessionAccentInputs | null {
+  const theme = ctx.ui?.theme;
+  if (!theme || typeof theme !== "object" || !("sessionAccentInputs" in theme))
+    return null;
   try {
-    const theme = ctx.ui?.theme;
-    if (!theme || typeof theme !== "object") return null;
+    return normalizeSessionAccentInputs(
+      Reflect.get(theme, "sessionAccentInputs"),
+    );
+  } catch {
+    return null;
+  }
+}
+
+/**
+ * Per-session accent used to tell runtimes apart in the phone list and the
+ * desktop sidebar. Mirrors the host CLI exactly, including the host's
+ * "unnamed sessions have no accent" rule.
+ */
+export function sessionAccent(ctx: ExtensionContext): string | null {
+  try {
     const sessionName = ctx.sessionManager?.getSessionName?.() ?? "";
     if (!sessionName.trim()) return null;
-    const inputs = themeAccentInputs(ctx);
-    const base =
-      inputs?.hexes.find((hex) => /^#[0-9a-f]{6}$/i.test(hex)) ??
-      themeSnapshot(ctx)?.tokens.accent ??
-      null;
-    if (!base) return null;
-    const baseHue = hexToHue(base);
-    if (baseHue === undefined) return null;
-    const digest = createHash("sha1").update(sessionName).digest();
-    const offset = ((digest[0] << 8) | digest[1]) % 360;
-    return hueToHex(baseHue + offset, 0.62);
+    const inputs = readThemeAccentInputs(ctx);
+    if (!inputs) return null;
+    return getSessionAccentHex(sessionName, inputs);
   } catch {
     return null;
   }

@@ -58,6 +58,11 @@ for matching session colors, Working animation, and Done badges without dependin
 Update the extension alongside Desktop; existing extension instances load the new endpoint when their
 OMP processes next start.
 
+Session accents match OMP 18's CLI exactly: `session-accent.ts` mirrors the host's OKLCH algorithm using
+the frozen `theme.sessionAccentInputs` token. Compiled host internals cannot be imported by extensions,
+so parity vectors must be checked when upgrading OMP. Missing tokens or unnamed sessions yield no accent
+(the UI uses gray), rather than a guessed hue. Both `/state` and `/status` share this computation.
+
 ## API used by the PWA
 
 | Route | Purpose |
