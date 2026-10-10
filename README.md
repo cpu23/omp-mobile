@@ -2,7 +2,7 @@
 
 **Your desktop sessions. On your phone.**
 
-Send prompts, read replies, and switch sessions from your phone. OMP Mobile uses the same live [OMP](https://omp.sh) sessions as [OMP Desktop](https://github.com/cpu23/omp-desktop). Add it to your home screen. No app store is required.
+Send prompts, read replies, and switch sessions from your phone. OMP Mobile uses the same live [OMP](https://omp.sh) sessions as [OMP Desktop](https://github.com/cpu23/omp-desktop). Add it to your home screen.
 
 <p align="center">
   <a href="docs/images/mobile.png"><img src="docs/images/mobile.png" alt="Open session sidebar with working icons and live session status" width="260"></a>
@@ -10,7 +10,7 @@ Send prompts, read replies, and switch sessions from your phone. OMP Mobile uses
   <a href="docs/images/mobile-folders.png"><img src="docs/images/mobile-folders.png" alt="Folder tree with a pinned project and session start controls" width="260"></a>
 </p>
 
-*Session sidebar · Live replies · Folders and pins. Select an image for full resolution (1290 × 2796). Demo sessions use a local test stream. No personal data is shown.*
+*Session sidebar · Live replies · Folders and pins. Demo sessions use a local test stream.*
 
 ## Requirements
 
