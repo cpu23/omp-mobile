@@ -34,7 +34,7 @@ import {
 } from "./notifications";
 
 const ROOT = dirname(fileURLToPath(import.meta.url));
-const HOME = homedir();
+const HOME = process.env.HOME?.trim() || homedir();
 const WORKSPACE_ROOT = resolve(process.env.OMP_MOBILE_ROOT ?? HOME);
 const IPC_ROOT = resolve(
   process.env.OMP_MOBILE_IPC_DIR ?? join(HOME, ".local/state/omp-mobile"),
@@ -1639,12 +1639,17 @@ async function buildClient(): Promise<void> {
 }
 
 async function loadToken(): Promise<void> {
-  const value =
-    process.env.OMP_MOBILE_TOKEN ??
-    (await fs.readFile(TOKEN_FILE, "utf8").catch(() => ""));
+  const fromEnv = process.env.OMP_MOBILE_TOKEN !== undefined;
+  const value = fromEnv
+    ? (process.env.OMP_MOBILE_TOKEN as string)
+    : await fs.readFile(TOKEN_FILE, "utf8").catch(() => "");
   mobileToken = value.trim();
   if (mobileToken.length < 16 || mobileToken.length > 512)
-    throw new Error(`missing or invalid mobile token (${TOKEN_FILE})`);
+    throw new Error(
+      fromEnv
+        ? `OMP_MOBILE_TOKEN must be 16-512 characters (got ${mobileToken.length})`
+        : `missing or invalid mobile token at ${TOKEN_FILE} — run \`bun run setup\`, or set OMP_MOBILE_TOKEN / OMP_MOBILE_TOKEN_FILE`,
+    );
 }
 
 /**

@@ -1,9 +1,11 @@
 /**
  * Exact replica of the host CLI's session-accent algorithm.
  *
- * omp 18.4.9 paints the session name and editor border from the frozen
+ * omp's TUI paints the session name and editor border from the frozen
  * `theme.sessionAccentInputs` token via `getSessionAccentHex` in
  * `packages/tui/src/theme/session-color.ts` (OKLCH hue bands + gamut mapping).
+ * This mirror was written against omp 18.4.9 and is pinned by the golden
+ * vectors in session-accent.test.ts, which must be re-checked on host upgrades.
  * A `-e` extension cannot value-import that internal module from the compiled
  * binary, so the algorithm is mirrored here bit-for-bit; the extension entry
  * point feeds it the token exposed on `ctx.ui.theme`. When the host exposes no

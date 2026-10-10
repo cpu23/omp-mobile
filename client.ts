@@ -3566,9 +3566,7 @@ type DirTreeNode = {
   entries?: DirectoryEntry[];
   error?: string;
 };
-async function openDirectoryModal(
-  path: string = "/home/mrw/dev",
-): Promise<void> {
+async function openDirectoryModal(): Promise<void> {
   const body = document.createElement("div");
   body.className = "directory-modal";
   body.innerHTML = `<div class="directory-toolbar"><button type="button" class="ghost-btn" id="tree-up" title="Go to parent directory">↑ Up</button><input type="text" class="path-input" id="tree-path-input" aria-label="Directory path" placeholder="Directory path"><button type="button" class="ghost-btn" id="tree-go">Go</button><button type="button" class="ghost-btn" id="tree-pin-btn" title="Pin or unpin directory">☆ Pin</button></div><div class="directory-pins" id="tree-pins-bar"></div><div class="directory-tree" id="tree-container"><div class="tree-notice">Loading directories…</div></div>`;
@@ -3588,7 +3586,7 @@ async function openDirectoryModal(
     body,
   );
 
-  let currentBrowsingPath = path;
+  let currentBrowsingPath = "";
   let currentParent = "";
   let workspaceRoot = "/";
   const nodeCache = new Map<string, DirTreeNode>();
@@ -3804,10 +3802,10 @@ async function openDirectoryModal(
   };
 
   const navigateTo = async (
-    targetPath: string,
+    targetPath: string | undefined,
     expandIfPinned: boolean = false,
   ): Promise<void> => {
-    let listing = await fetchDirEntries(targetPath);
+    let listing = targetPath ? await fetchDirEntries(targetPath) : null;
     if (!listing) {
       listing = await api<DirectoryResponse>("/api/directories").catch(
         () => null,
@@ -3816,7 +3814,7 @@ async function openDirectoryModal(
         treeContainer.innerHTML = `<div class="tree-notice error">Directory access is unavailable.</div>`;
         return;
       }
-      showToast(`Showing workspace root (${listing.path})`);
+      if (targetPath) showToast(`Showing workspace root (${listing.path})`);
     }
 
     currentBrowsingPath = listing.path;
@@ -3898,7 +3896,7 @@ async function openDirectoryModal(
   });
 
   renderPinsBar();
-  await navigateTo(path, true);
+  await navigateTo(undefined, true);
 }
 async function start(): Promise<void> {
   renderShell();
