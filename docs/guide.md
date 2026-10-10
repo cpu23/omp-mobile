@@ -134,8 +134,9 @@ Notification constraints come from the platforms, not the app: an HTTPS origin a
 required; iOS delivers Web Push only to home-screen PWAs; Brave blocks notification prompts for unvisited sites
 until allowed in Site settings; browsers without Google Play services cannot reach the push service (the app says so
 and unread badges still work while it is open). Completions are detected per runtime by the gateway polling the
-extension socket; the phone acknowledges each one (`POST /api/notifications/ack`), and tapping a notification opens
-`?slot=<runtime id>` directly.
+extension's compact `/status` endpoint every three seconds, without downloading the transcript. Long conversations
+therefore do not consume the notification response limit. The phone acknowledges each completion
+(`POST /api/notifications/ack`), and tapping a notification opens `?slot=<runtime id>` directly.
 
 ## How it fits together
 
@@ -166,10 +167,16 @@ sessions remain reachable beyond that recent window. The list scrolls independen
 Opening, dragging or closing the reasoning-effort popover while typing preserves composer focus, keeping the
 software keyboard open. When the composer is not focused, the slider retains native pointer and keyboard controls.
 
-The extension also exposes owner-only `GET /status` on each runtime socket for Desktop's sidebar:
-`{accent, agentActive, completion?}` with the same token/origin checks as `GET /state`. It excludes transcript,
-model, and command enumeration, so polling long chats stays small. Desktop uses these authoritative fields
-for matching session colors, Working animation, and Done badges without depending on this HTTP gateway.
+State still refreshes while the page is visible, but unchanged transcript inputs retain their existing DOM instead
+of rebuilding Markdown and message controls. Status, model, cost, and theme updates remain independent; changed
+messages, session switches, and generation changes refresh the transcript while preserving the existing scroll
+and detail-expansion behavior.
+
+The extension also exposes owner-only `GET /status` on each runtime socket for Desktop's sidebar and Mobile's
+completion notifications: `{accent, agentActive, title?, completion?}` with the same token/origin checks as
+`GET /state`. The title is limited to 200 characters. It excludes transcript, model, and command enumeration, so
+polling long chats stays small. Desktop uses these authoritative fields for matching session colors, Working
+animation, and Done badges without depending on this HTTP gateway.
 Update the extension alongside Desktop; existing extension instances load the new endpoint when their
 OMP processes next start.
 

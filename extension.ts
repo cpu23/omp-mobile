@@ -1166,20 +1166,22 @@ export default function registerMobileRemote(pi: ExtensionAPI): void {
   }
 
   /**
-   * Presentation-only projection of `snapshot` for a remote sidebar. Building
-   * the full state materializes the transcript (bounded but large); a caller
-   * that only paints accent/working/done must not pay for that or fail on the
-   * byte cap for long sessions.
+   * Compact projection for sidebar presentation and completion notifications.
+   * Neither caller needs the full transcript, which can exceed their response
+   * byte caps on long sessions.
    */
   function statusSnapshot(ctx: ExtensionContext): {
     accent: string | null;
     agentActive: boolean;
+    title?: string;
     completion?: CompletionMarker;
   } {
     observeSession(ctx);
+    const title = ctx.sessionManager.getSessionName();
     return {
       accent: sessionAccent(ctx),
       agentActive,
+      ...(title ? { title: title.slice(0, 200) } : {}),
       ...(completion ? { completion } : {}),
     };
   }

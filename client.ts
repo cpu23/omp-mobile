@@ -254,6 +254,8 @@ let toastTimer = 0;
 let pins: string[] = [];
 let transcriptNearBottom = true;
 let lastRenderedMessageCount = 0;
+let lastTranscriptSnapshot: TranscriptRenderSnapshot | null = null;
+let lastEmptyTranscriptContent: string | null = null;
 let commandSelection = 0;
 let dismissedCommandDraft: string | null = null;
 let unreadBySlot = new Map<SlotId, CompletionMarker[]>();
@@ -2336,32 +2338,86 @@ function messageKind(
   if (value.includes("user") || value.includes("prompt")) return "user";
   return "assistant";
 }
+type PreparedTranscriptMessage = {
+  msgKey: string;
+  role: string;
+  liveMessage: boolean;
+  parts: ChatPart[];
+  actions: Array<{ label: string; url: string | undefined }>;
+};
+type TranscriptRenderSnapshot = {
+  slotId: SlotId;
+  generation: string | undefined;
+  active: boolean;
+  messages: PreparedTranscriptMessage[];
+};
+
+function sameTranscriptPart(a: ChatPart, b: ChatPart): boolean {
+  if (a === b) return true;
+  if (!a || !b || a.kind !== b.kind) return false;
+  if (
+    (a.kind === "text" || a.kind === "thinking") &&
+    (b.kind === "text" || b.kind === "thinking")
+  )
+    return a.text === b.text;
+  if (a.kind === "tool" && b.kind === "tool")
+    return (
+      a.id === b.id &&
+      a.name === b.name &&
+      a.summary === b.summary &&
+      a.output === b.output &&
+      a.isError === b.isError
+    );
+  return false;
+}
+
+function sameTranscriptSnapshot(
+  a: TranscriptRenderSnapshot,
+  b: TranscriptRenderSnapshot,
+): boolean {
+  if (
+    a.slotId !== b.slotId ||
+    a.generation !== b.generation ||
+    a.active !== b.active ||
+    a.messages.length !== b.messages.length
+  )
+    return false;
+  for (let i = 0; i < a.messages.length; i += 1) {
+    const left = a.messages[i]!;
+    const right = b.messages[i]!;
+    if (
+      left.msgKey !== right.msgKey ||
+      left.role !== right.role ||
+      left.liveMessage !== right.liveMessage ||
+      left.parts.length !== right.parts.length ||
+      left.actions.length !== right.actions.length
+    )
+      return false;
+    for (let partIndex = 0; partIndex < left.parts.length; partIndex += 1)
+      if (
+        !sameTranscriptPart(
+          left.parts[partIndex]!,
+          right.parts[partIndex]!,
+        )
+      )
+        return false;
+    for (let actionIndex = 0; actionIndex < left.actions.length; actionIndex += 1) {
+      const leftAction = left.actions[actionIndex]!;
+      const rightAction = right.actions[actionIndex]!;
+      if (
+        leftAction.label !== rightAction.label ||
+        leftAction.url !== rightAction.url
+      )
+        return false;
+    }
+  }
+  return true;
+}
+
 function renderMessages(messages: ClientMessage[], active = false): void {
   const transcript = document.querySelector<HTMLDivElement>("#transcript");
   if (!transcript) return;
-  const wasNear = transcriptNearBottom;
-  const oldTop = transcript.scrollTop;
-
-  let anchorKey: string | null = null;
-  let anchorOffset = 0;
-  if (!wasNear && lastRenderedMessageCount > 0) {
-    const articles =
-      transcript.querySelectorAll<HTMLElement>("article.message");
-    for (const art of articles) {
-      if (art.offsetTop + art.offsetHeight > oldTop) {
-        anchorKey = art.dataset.msgKey || null;
-        anchorOffset = oldTop - art.offsetTop;
-        break;
-      }
-    }
-  }
-
-  transcript.innerHTML = "";
-  if (messages.length === 0) {
-    lastRenderedMessageCount = 0;
-    return;
-  }
-
+  lastEmptyTranscriptContent = null;
   const toolCalls = new Map<
     string,
     { name: string; arguments?: Record<string, unknown> }
@@ -2405,21 +2461,66 @@ function renderMessages(messages: ClientMessage[], active = false): void {
       }
     }
   }
-
+  const prepared: PreparedTranscriptMessage[] = [];
+  // Compare rendered inputs; renderActive updates theme and status chrome separately.
   messages.forEach((message, messageIndex) => {
     const parts = Array.isArray(message.parts)
       ? message.parts
       : projectParts(message, toolCalls);
-    // OMP spins a tool block while its call has no result; only the newest
-    // message can hold one, so older abandoned calls never animate.
-    const liveMessage = active && messageIndex === messages.length - 1;
+    const actions = (message.actions ?? []).map((action) => ({
+      label: action.label || action.title || "Open",
+      url: typeof action.url === "string" ? action.url : undefined,
+    }));
+    if (parts.length === 0 && actions.length === 0) return;
+    prepared.push({
+      msgKey:
+        asString(message.entryId) ??
+        asString(message.id) ??
+        `msg-${messageIndex}`,
+      role: message.role || messageKind(message),
+      liveMessage: active && messageIndex === messages.length - 1,
+      parts,
+      actions,
+    });
+  });
+  const snapshot: TranscriptRenderSnapshot = {
+    slotId: activeId,
+    generation: activeState?.generation,
+    active,
+    messages: prepared,
+  };
+  if (
+    lastTranscriptSnapshot &&
+    sameTranscriptSnapshot(lastTranscriptSnapshot, snapshot)
+  ) {
+    lastRenderedMessageCount = messages.length;
+    return;
+  }
 
-    if (parts.length === 0 && !message.actions?.length) return;
-    const msgKey =
-      asString(message.entryId) ??
-      asString(message.id) ??
-      `msg-${messageIndex}`;
-    const role = message.role || messageKind(message);
+  const wasNear = transcriptNearBottom;
+  const oldTop = transcript.scrollTop;
+  let anchorKey: string | null = null;
+  let anchorOffset = 0;
+  if (!wasNear && lastRenderedMessageCount > 0) {
+    const articles =
+      transcript.querySelectorAll<HTMLElement>("article.message");
+    for (const art of articles) {
+      if (art.offsetTop + art.offsetHeight > oldTop) {
+        anchorKey = art.dataset.msgKey || null;
+        anchorOffset = oldTop - art.offsetTop;
+        break;
+      }
+    }
+  }
+
+  transcript.innerHTML = "";
+  if (messages.length === 0) {
+    lastRenderedMessageCount = 0;
+    lastTranscriptSnapshot = snapshot;
+    return;
+  }
+
+  prepared.forEach(({ msgKey, role, liveMessage, parts, actions }) => {
     const article = document.createElement("article");
     article.className = `message ${role}`;
     article.dataset.msgKey = msgKey;
@@ -2527,13 +2628,13 @@ function renderMessages(messages: ClientMessage[], active = false): void {
       }
     });
 
-    if (message.actions?.length) {
-      const actions = document.createElement("div");
-      actions.className = "message-actions";
-      message.actions.forEach((action) => {
+    if (actions.length > 0) {
+      const actionList = document.createElement("div");
+      actionList.className = "message-actions";
+      actions.forEach((action) => {
         const button = document.createElement("button");
         button.className = "ghost-btn";
-        button.textContent = action.label || action.title || "Open";
+        button.textContent = action.label;
         button.addEventListener("click", () => {
           if (
             typeof action.url === "string" &&
@@ -2542,9 +2643,9 @@ function renderMessages(messages: ClientMessage[], active = false): void {
             window.open(action.url, "_blank", "noopener");
           else showToast("This action is not available on mobile", true);
         });
-        actions.append(button);
+        actionList.append(button);
       });
-      article.append(actions);
+      article.append(actionList);
     }
 
     transcript.append(article);
@@ -2571,6 +2672,7 @@ function renderMessages(messages: ClientMessage[], active = false): void {
   document
     .querySelector("#scroll-bottom")
     ?.classList.toggle("hidden", transcriptNearBottom);
+  lastTranscriptSnapshot = snapshot;
   lastRenderedMessageCount = messages.length;
 }
 let rawMode = localStorage.getItem("omp-mobile-raw") === "1";
@@ -2643,17 +2745,21 @@ function renderActive(): void {
     renderMessages(state.messages, active);
   } else {
     applyTheme(null);
-    transcript.innerHTML = `<div class="transcript-empty">${esc(
-      activeId
-        ? stateError
-          ? `Live state unavailable: ${stateError}`
-          : "Waiting for live state…"
-        : slotsError
-          ? `Live sessions unavailable: ${slotsError}`
-          : slots.length
-            ? "Select a session from the sidebar."
-            : "No live session. Start a new one or resume a saved session.",
-    )}</div>`;
+    const emptyText = activeId
+      ? stateError
+        ? `Live state unavailable: ${stateError}`
+        : "Waiting for live state…"
+      : slotsError
+        ? `Live sessions unavailable: ${slotsError}`
+        : slots.length
+          ? "Select a session from the sidebar."
+          : "No live session. Start a new one or resume a saved session.";
+    lastTranscriptSnapshot = null;
+    lastRenderedMessageCount = 0;
+    if (lastEmptyTranscriptContent !== emptyText) {
+      transcript.innerHTML = `<div class="transcript-empty">${esc(emptyText)}</div>`;
+      lastEmptyTranscriptContent = emptyText;
+    }
   }
   requiredElement<HTMLElement>("#composer-working").classList.toggle(
     "hidden",

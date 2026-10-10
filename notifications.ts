@@ -265,7 +265,7 @@ function safeSubscription(input: PushSubscriptionInput): PushSubscriptionInput {
   };
 }
 
-function socketState(
+function socketStatus(
   socketPath: string,
   token: string,
 ): Promise<Record<string, unknown> | undefined> {
@@ -314,7 +314,7 @@ function socketState(
     socket.once("connect", () => {
       socket.write(
         [
-          "GET /state HTTP/1.1",
+          "GET /status HTTP/1.1",
           "Host: omp-mobile",
           "Connection: close",
           `Authorization: Bearer ${token}`,
@@ -583,7 +583,7 @@ export function createNotificationService(
       activeSlots.clear();
       for (const slot of active) activeSlots.add(slot);
       for (const slot of active) {
-        const raw = await socketState(
+        const raw = await socketStatus(
           join(options.ipcRoot, `${slot}.sock`),
           options.token,
         );
