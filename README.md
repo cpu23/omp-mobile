@@ -9,15 +9,11 @@ Send prompts, read replies, and switch sessions from your phone. OMP Mobile uses
   <br><a href="https://github.com/cpu23/omp-mobile/releases/download/v0.1.0/launch.mp4">Watch the launch video — 17 seconds, 1080p (MP4)</a> · <a href="docs/media/demo.gif">Open demo GIF</a>
 </p>
 
-[Video file in this repository](docs/media/launch.mp4). The GIF above links to the full video with instrumental audio.
-
 <p align="center">
   <a href="docs/images/mobile.png"><img src="docs/images/mobile.png" alt="Open session sidebar with working icons and live session status" width="260"></a>
   <a href="docs/images/mobile-chat.png"><img src="docs/images/mobile-chat.png" alt="Live reply with the working indicator and Stop control" width="260"></a>
   <a href="docs/images/mobile-folders.png"><img src="docs/images/mobile-folders.png" alt="Folder tree with a pinned project and session start controls" width="260"></a>
 </p>
-
-*Real browser footage with Codex GPT-6 Luna: send a prompt, read the genuine reply, and switch live sessions. The 17-second, 1080p60 film uses fixed framing, minimal headings, tap feedback, and original audio. The 430 × 900 browser recording is shown at native size, not enlarged or represented as physical-phone footage. Static screenshots use a local test stream. [Capture and rendering details](https://github.com/cpu23/omp-desktop/blob/main/docs/media/README.md).*
 
 ## Requirements
 
