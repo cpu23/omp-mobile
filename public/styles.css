@@ -1480,7 +1480,7 @@ pre,
 }
 
 #effort-open {
-  color: var(--thinking-color, var(--effort-accent));
+  color: var(--session-accent, var(--accent));
 }
 
 #ctx-label,
@@ -2133,7 +2133,7 @@ pre,
 #effort-current,
 .effort-current {
   font: 700 20px/28px var(--mono);
-  color: var(--accent);
+  color: var(--session-accent, var(--accent));
   text-transform: capitalize;
   display: flex;
   align-items: center;
@@ -2159,7 +2159,7 @@ pre,
   border-radius: 16px;
   height: 100%;
   width: var(--effort-fill, 0%);
-  background: var(--accent);
+  background: var(--session-accent, var(--accent));
 }
 
 .effort-range {
@@ -2176,6 +2176,11 @@ pre,
   margin: 0 4px;
   cursor: pointer;
   touch-action: none;
+}
+
+.effort-range:focus-visible,
+#effort-open:focus-visible {
+  outline-color: var(--session-accent, var(--accent));
 }
 
 .effort-range::-webkit-slider-runnable-track {
