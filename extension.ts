@@ -74,6 +74,11 @@ type CompletionMarker = {
   completedAt: number;
 };
 
+type PendingMobileMessage = {
+  id: string;
+  text: string;
+  status: "sending" | "queued";
+};
 type MobileState = {
   apiVersion: 1;
   generation: string;
@@ -98,6 +103,8 @@ type MobileState = {
   editor: { available: boolean; empty: boolean | null; reason?: string };
   completion?: CompletionMarker;
   agentActive: boolean;
+  hasPendingMessages: boolean;
+  pendingMessages: PendingMobileMessage[];
   title?: string;
   summary?: string;
 };
@@ -122,6 +129,26 @@ const MAX_TEXT_CHARS = 8000;
 const MAX_THINKING_CHARS = 4000;
 const MAX_TOOL_OUTPUT_CHARS = 6000;
 
+type AskOption = { label: string; description?: string };
+type AskQuestion = {
+  id?: string;
+  question: string;
+  header?: string;
+  options: AskOption[];
+  multi: boolean;
+  recommended?: number;
+};
+type AskAnswer = {
+  selectedOptions: string[];
+  customInput?: string;
+  note?: string;
+  timedOut?: boolean;
+};
+type AskDisplay = {
+  status: "pending" | "completed" | "redirected";
+  questions: AskQuestion[];
+  answers?: Array<AskAnswer | null>;
+};
 type ChatPart =
   | { kind: "text"; text: string }
   | { kind: "thinking"; text: string }
@@ -131,6 +158,7 @@ type ChatPart =
       name: string;
       summary: string;
       output?: string;
+      ask?: AskDisplay;
       isError?: boolean;
     };
 
@@ -573,6 +601,156 @@ function extractContentText(content: unknown): string | undefined {
   return String(content);
 }
 
+function parseToolArguments(value: unknown): Record<string, unknown> | undefined {
+  if (value && typeof value === "object" && !Array.isArray(value))
+    return value as Record<string, unknown>;
+  if (typeof value !== "string") return undefined;
+  try {
+    const parsed: unknown = JSON.parse(value);
+    return parsed && typeof parsed === "object" && !Array.isArray(parsed)
+      ? (parsed as Record<string, unknown>)
+      : undefined;
+  } catch {
+    return undefined;
+  }
+}
+
+function normalizeAskQuestion(value: unknown): AskQuestion | undefined {
+  if (!value || typeof value !== "object" || Array.isArray(value))
+    return undefined;
+  const raw = value as Record<string, unknown>;
+  const question = asString(raw.question);
+  if (!question) return undefined;
+  const options: AskOption[] = [];
+  if (Array.isArray(raw.options)) {
+    for (const option of raw.options) {
+      if (typeof option === "string") {
+        if (option) options.push({ label: truncateText(option, MAX_TEXT_CHARS) });
+        continue;
+      }
+      if (!option || typeof option !== "object" || Array.isArray(option))
+        continue;
+      const item = option as Record<string, unknown>;
+      const label = asString(item.label);
+      if (!label) continue;
+      const description = asString(item.description);
+      options.push({
+        label: truncateText(label, MAX_TEXT_CHARS),
+        ...(description
+          ? { description: truncateText(description, MAX_TEXT_CHARS) }
+          : {}),
+      });
+    }
+  }
+  const id = asString(raw.id);
+  const header = asString(raw.header);
+  const recommended =
+    typeof raw.recommended === "number" &&
+    Number.isInteger(raw.recommended) &&
+    raw.recommended >= 0 &&
+    raw.recommended < options.length
+      ? raw.recommended
+      : undefined;
+  return {
+    ...(id ? { id: truncateText(id, 256) } : {}),
+    question: truncateText(question, MAX_TEXT_CHARS),
+    ...(header ? { header: truncateText(header, 256) } : {}),
+    options,
+    multi: raw.multi === true,
+    ...(recommended !== undefined ? { recommended } : {}),
+  };
+}
+
+function normalizeAskQuestions(value: unknown): AskQuestion[] | undefined {
+  const args = parseToolArguments(value);
+  if (!args || !Array.isArray(args.questions)) return undefined;
+  const questions = args.questions.flatMap((item): AskQuestion[] => {
+    const question = normalizeAskQuestion(item);
+    return question ? [question] : [];
+  });
+  return questions.length > 0 ? questions : undefined;
+}
+
+function normalizeAskAnswer(value: unknown): AskAnswer | undefined {
+  if (!value || typeof value !== "object" || Array.isArray(value))
+    return undefined;
+  const raw = value as Record<string, unknown>;
+  const selectedOptions = Array.isArray(raw.selectedOptions)
+    ? raw.selectedOptions
+        .filter((item): item is string => typeof item === "string")
+        .map((item) => truncateText(item, MAX_TEXT_CHARS))
+    : [];
+  const customInput = asString(raw.customInput);
+  const note = asString(raw.note);
+  return {
+    selectedOptions,
+    ...(customInput
+      ? { customInput: truncateText(customInput, MAX_TEXT_CHARS) }
+      : {}),
+    ...(note ? { note: truncateText(note, MAX_TEXT_CHARS) } : {}),
+    ...(typeof raw.timedOut === "boolean" ? { timedOut: raw.timedOut } : {}),
+  };
+}
+
+function askDisplay(
+  name: string,
+  args: Record<string, unknown> | undefined,
+  rawDetails: unknown,
+  completed: boolean,
+): AskDisplay | undefined {
+  if (name !== "ask") return undefined;
+  const details =
+    rawDetails && typeof rawDetails === "object" && !Array.isArray(rawDetails)
+      ? (rawDetails as Record<string, unknown>)
+      : undefined;
+  const inputQuestions = normalizeAskQuestions(args);
+  const resultRows = Array.isArray(details?.results)
+    ? details.results
+    : details?.question !== undefined
+      ? [details]
+      : [];
+  const resultQuestions = resultRows.flatMap((item): AskQuestion[] => {
+    const question = normalizeAskQuestion(item);
+    return question ? [question] : [];
+  });
+  let questions = inputQuestions ?? resultQuestions;
+  if (!questions.length && Array.isArray(details?.questions)) {
+    questions = details.questions.flatMap((question): AskQuestion[] =>
+      typeof question === "string" && question
+        ? [{ question: truncateText(question, MAX_TEXT_CHARS), options: [], multi: false }]
+        : [],
+    );
+  }
+  if (!questions.length) return undefined;
+
+  const chatRedirect = details?.chatRedirect === true;
+  const answers: Array<AskAnswer | null> = resultRows.length
+    ? questions.map((question, index) => {
+        const match = question.id
+          ? resultRows.find(
+              (row) =>
+                !!row &&
+                typeof row === "object" &&
+                (row as Record<string, unknown>).id === question.id,
+            )
+          : undefined;
+        return normalizeAskAnswer(match ?? resultRows[index]) ?? null;
+      })
+    : details
+      ? [normalizeAskAnswer(details) ?? null]
+      : [];
+  const hasAnswers = answers.some((answer) => answer !== null);
+  return {
+    status: chatRedirect
+      ? "redirected"
+      : completed
+        ? "completed"
+        : "pending",
+    questions,
+    ...(!chatRedirect && hasAnswers ? { answers } : {}),
+  };
+}
+
 function transcript(branch: unknown): ChatMessage[] {
   if (!Array.isArray(branch)) return [];
 
@@ -612,13 +790,11 @@ function transcript(branch: unknown): ChatMessage[] {
           const id = asString(b.id) ?? asString(b.toolCallId);
           const name =
             asString(b.name) ?? asString(b.toolName) ?? asString(b.tool) ?? "";
-          const args = (b.arguments ?? b.args ?? b.input) as
-            Record<string, unknown> | undefined;
+          const args = parseToolArguments(
+            b.arguments ?? b.args ?? b.input,
+          );
           if (id) {
-            toolCalls.set(id, {
-              name,
-              arguments: typeof args === "object" && args ? args : undefined,
-            });
+            toolCalls.set(id, { name, arguments: args });
           }
         } else if (bType === "toolResult") {
           const id = asString(b.toolCallId) ?? asString(b.id);
@@ -634,14 +810,9 @@ function transcript(branch: unknown): ChatMessage[] {
         const id = asString(t.id);
         const fn = t.function as Record<string, unknown> | undefined;
         const name = asString(fn?.name) ?? asString(t.name) ?? "";
-        let args: Record<string, unknown> | undefined;
-        if (typeof fn?.arguments === "string") {
-          try {
-            args = JSON.parse(fn.arguments) as Record<string, unknown>;
-          } catch {}
-        } else if (typeof fn?.arguments === "object" && fn.arguments) {
-          args = fn.arguments as Record<string, unknown>;
-        }
+        const args = parseToolArguments(
+          fn?.arguments ?? t.arguments ?? t.args ?? t.input,
+        );
         if (id) {
           toolCalls.set(id, { name, arguments: args });
         }
@@ -673,9 +844,7 @@ function transcript(branch: unknown): ChatMessage[] {
         asString(raw.toolName) ?? asString(raw.name) ?? known?.name ?? "tool";
       const args =
         known?.arguments ??
-        (typeof raw.arguments === "object" && raw.arguments
-          ? (raw.arguments as Record<string, unknown>)
-          : undefined);
+        parseToolArguments(raw.arguments ?? raw.args ?? raw.input);
       const summary = formatToolCallSummary(name, args);
       const rawOutput = extractContentText(
         raw.content ?? raw.output ?? raw.result ?? raw.error,
@@ -692,12 +861,14 @@ function transcript(branch: unknown): ChatMessage[] {
         (typeof raw.details === "object" &&
           (raw.details as Record<string, unknown>)?.error === true);
 
+      const ask = askDisplay(name, args, raw.details, true);
       const part: ChatPart = {
         kind: "tool",
         id: toolCallId,
         name,
         summary,
         ...(output !== undefined ? { output } : {}),
+        ...(ask ? { ask } : {}),
         ...(isError ? { isError: true } : {}),
       };
 
@@ -777,14 +948,17 @@ function transcript(branch: unknown): ChatMessage[] {
                 asString(b.toolName) ??
                 asString(b.tool) ??
                 "tool";
-              const args = (b.arguments ?? b.args ?? b.input) as
-                Record<string, unknown> | undefined;
+              const args = parseToolArguments(
+                b.arguments ?? b.args ?? b.input,
+              );
               const summary = formatToolCallSummary(name, args);
+              const ask = askDisplay(name, args, undefined, false);
               parts.push({
                 kind: "tool",
                 id,
                 name,
                 summary,
+                ...(ask ? { ask } : {}),
               });
             }
           }
@@ -923,6 +1097,12 @@ export default function registerMobileRemote(pi: ExtensionAPI): void {
   let streamingMessage: { role: string } | undefined;
   let streamingSequence = 0;
   let completion: CompletionMarker | undefined;
+  let pendingMessageSequence = 0;
+  let pendingMobileMessages: Array<{
+    id: string;
+    text: string;
+    submittedAt: number;
+  }> = [];
   let ownsSocket = false;
   let stopped = false;
 
@@ -1029,6 +1209,7 @@ export default function registerMobileRemote(pi: ExtensionAPI): void {
     if (!isInitial) {
       pendingApprovals = new Set();
       resetCompletion();
+      pendingMobileMessages = [];
     }
   }
 
@@ -1119,6 +1300,17 @@ export default function registerMobileRemote(pi: ExtensionAPI): void {
     const currentModel = modelForSnapshot(model);
     const branch = ctx.sessionManager.getBranch();
     const summary = latestSummary(branch);
+    const hasPendingMessages = ctx.hasPendingMessages();
+    const now = Date.now();
+    pendingMobileMessages = pendingMobileMessages.filter(
+      (message) => hasPendingMessages || now - message.submittedAt < 5000,
+    );
+    const pendingMessages: PendingMobileMessage[] =
+      pendingMobileMessages.map((message) => ({
+        id: message.id,
+        text: truncateText(message.text, MAX_TEXT_CHARS),
+        status: hasPendingMessages ? "queued" : "sending",
+      }));
     const state: MobileState = {
       apiVersion: 1,
       generation,
@@ -1155,6 +1347,8 @@ export default function registerMobileRemote(pi: ExtensionAPI): void {
       capabilities: capabilities(ctx),
       cwd: ctx.sessionManager.getCwd(),
       pendingApproval: pendingApprovals.size,
+      hasPendingMessages,
+      pendingMessages,
       editor: editorGuard(ctx),
       ...(completion ? { completion } : {}),
       agentActive,
@@ -1208,7 +1402,11 @@ export default function registerMobileRemote(pi: ExtensionAPI): void {
       throw Object.assign(new Error("action type is required"), {
         status: 400,
       });
-    if (type !== "abort" && pendingApprovals.size > 0) {
+    if (
+      type !== "abort" &&
+      type !== "force" &&
+      pendingApprovals.size > 0
+    ) {
       throw Object.assign(new Error("terminal approval dialog is pending"), {
         status: 409,
         code: "pending_dialog",
@@ -1221,7 +1419,32 @@ export default function registerMobileRemote(pi: ExtensionAPI): void {
           throw Object.assign(new Error("prompt text is required"), {
             status: 400,
           });
+        pendingMobileMessages.push({
+          id: `${generation}:${++pendingMessageSequence}`,
+          text,
+          submittedAt: Date.now(),
+        });
         pi.sendUserMessage(text);
+        break;
+      }
+      case "force": {
+        const deadline = Date.now() + 1500;
+        while (!ctx.hasPendingMessages() && Date.now() < deadline) {
+          checkGeneration(ctx, action);
+          await new Promise<void>((resolve) => setTimeout(resolve, 25));
+        }
+        checkGeneration(ctx, action);
+        if (!ctx.hasPendingMessages())
+          throw Object.assign(new Error("no pending messages to force"), {
+            status: 409,
+            code: "pending_messages",
+          });
+        if (ctx.isIdle())
+          throw Object.assign(
+            new Error("session is idle; queued messages are already draining"),
+            { status: 409, code: "session_idle" },
+          );
+        ctx.abort();
         break;
       }
       case "abort":
@@ -1517,6 +1740,15 @@ export default function registerMobileRemote(pi: ExtensionAPI): void {
   });
   pi.on("message_start", (event, ctx) => {
     observeSession(ctx);
+    if (event.message.role === "user" && "content" in event.message) {
+      const text = extractContentText(event.message.content);
+      if (text !== undefined) {
+        const pendingIndex = pendingMobileMessages.findIndex(
+          (message) => message.text === text,
+        );
+        if (pendingIndex >= 0) pendingMobileMessages.splice(pendingIndex, 1);
+      }
+    }
     if (event.message.role === "assistant") {
       streamingSequence += 1;
       streamingMessage = event.message;

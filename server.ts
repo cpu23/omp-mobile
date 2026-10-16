@@ -969,6 +969,27 @@ function normaliseState(raw: Record<string, unknown>): SlotState | undefined {
           (message) => message && typeof message === "object",
         ) as SlotState["messages"])
     : [];
+  const pendingMessages = Array.isArray(raw.pendingMessages)
+    ? raw.pendingMessages.flatMap((value) => {
+        if (!value || typeof value !== "object") return [];
+        const message = value as Record<string, unknown>;
+        if (
+          typeof message.id !== "string" ||
+          typeof message.text !== "string" ||
+          (message.status !== "sending" && message.status !== "queued")
+        )
+          return [];
+        const status: "sending" | "queued" =
+          message.status === "queued" ? "queued" : "sending";
+        return [
+          {
+            id: message.id.slice(0, 200),
+            text: message.text.slice(0, 8000),
+            status,
+          },
+        ];
+      })
+    : undefined;
   const commands: SlotState["commands"] = Array.isArray(raw.commands)
     ? raw.commands.slice(0, 500).flatMap((value) => {
         if (!value || typeof value !== "object") return [];
@@ -1051,6 +1072,10 @@ function normaliseState(raw: Record<string, unknown>): SlotState | undefined {
     Number.isFinite(raw.pendingApproval)
       ? { pendingApproval: Math.max(0, Math.min(100, raw.pendingApproval)) }
       : {}),
+    ...(typeof raw.hasPendingMessages === "boolean"
+      ? { hasPendingMessages: raw.hasPendingMessages }
+      : {}),
+    ...(pendingMessages ? { pendingMessages } : {}),
     ...(editor && typeof editor.available === "boolean"
       ? {
           editor: {
@@ -1155,7 +1180,7 @@ async function slotAction(slot: string, request: Request): Promise<Response> {
       body.text.length > 100_000
     )
       return errorResponse(400, "prompt text is invalid");
-  } else if (type === "abort") {
+  } else if (type === "abort" || type === "force") {
     // No additional fields.
   } else if (type === "model") {
     if (

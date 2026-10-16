@@ -19,6 +19,29 @@ extension changes reach existing sessions after their OMP process restarts. With
 terminal-only views and reports transcript, model and capability data as unavailable. Terminal snapshots are
 read-only and do not resize the desktop PTY.
 
+OMP `ask` prompts appear inline with their question text, options, descriptions, selection mode and recommended option.
+Pending prompts are read-only in Mobile: ask dialogs are owned by the desktop terminal, and Mobile has no remote
+answer API. Answer there; after the tool finishes, Mobile shows the terminal's recorded selections and any custom
+answers or notes. Restart an affected OMP session for this extension change to take effect.
+
+While OMP is busy, Mobile sends ordinary text through the steering path and shows its queued text until OMP starts it.
+If the same Send action is tapped again before its first submission resolves, Mobile coalesces the duplicate and, when
+the session was busy, forces the queue only after the first submission succeeds. Once OMP reports pending messages and
+the session is active, an empty composer changes **Send** to **Force**; tapping it (or submitting empty Enter)
+interrupts the current run so OMP drains the pending queue, matching desktop's empty-Enter behavior. OMP's public
+extension API exposes queue availability but not desktop-origin queued text, so those items appear as a generic notice.
+Restart the affected session for this extension update to take effect.
+
+Working sessions show a spinner beside a shimmering sidebar title, without a separate “Working…” label.
+Live tool spinners/shimmers and the composer model label use the active session's accent.
+Connected sessions have no status label; offline and unread indicators remain visible.
+The chat viewport shrinks above the software keyboard and composer. When already near the bottom,
+the latest messages stay in view as the keyboard opens or closes.
+On phone-sized screens, swipe right across the chat to open the sidebar, and left across the sidebar to close it.
+The drawer responds during the swipe. Closing swipes can start on sidebar buttons without activating them;
+ordinary taps still work. Vertical scrolling, selected text and text inputs do not trigger closing.
+Opening swipes also leave controls and code blocks alone; the menu button remains available.
+
 ## Install and start
 
 From this repository:
