@@ -1034,11 +1034,11 @@ function renderShell(): void {
     <header class="topbar"><button class="icon-btn menu-btn" id="menu-open" type="button" aria-label="Open sessions" aria-controls="sidebar" aria-expanded="false">${ICONS.menu}</button><div class="top-title-wrap"><span class="top-title" id="top-title">Connecting…</span></div></header>
     <main class="main"><aside class="sidebar" id="sidebar" aria-label="Sessions">
       <div id="sidebar-sessions" class="sidebar-view">
-        <div class="sidebar-head"><span>Sessions</span><button class="icon-btn" id="sidebar-settings-open" type="button" aria-controls="sidebar-settings" aria-expanded="false">Settings</button></div>
         <button class="sidebar-action" id="new-session" type="button" aria-label="Start a new session">${ICONS.plus}<span>New session</span></button>
         <button class="sidebar-action" id="pin-open">Folders & pins</button>
         <div class="sidebar-search"><input id="session-search" type="search" placeholder="Search sessions…" aria-label="Search sessions" autocomplete="off" spellcheck="false"></div>
         <div class="slot-list" id="slot-list"></div>
+        <button class="icon-btn" id="sidebar-settings-open" type="button" aria-label="Settings" title="Settings" aria-controls="sidebar-settings" aria-expanded="false"><svg width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="m9 3-.6 2.4-2 .9L4.2 6l-2 3.5 1.5 1.7v2L2.2 15l2 3.5 2.2-.4 2 .9L9 21h4l.6-2.4 2-.9 2.2.4 2-3.5-1.5-1.7v-2l1.5-1.7-2-3.5-2.2.4-2-.9L13 3Z"/><circle cx="11" cy="12" r="3"/></svg></button>
       </div>
       <section id="sidebar-settings" class="sidebar-view" aria-label="Settings" hidden>
         <div class="sidebar-head"><button class="icon-btn" id="sidebar-settings-back" type="button">← Back</button><span>Settings</span></div>

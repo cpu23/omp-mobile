@@ -300,11 +300,34 @@ textarea:focus-visible {
   overscroll-behavior: contain;
 }
 
-#sidebar-settings-open,
 #sidebar-settings-back {
   width: auto;
   padding-inline: 10px;
   white-space: nowrap;
+}
+
+#sidebar-sessions {
+  position: relative;
+  padding-bottom: 62px;
+}
+
+#sidebar-settings-open {
+  position: absolute;
+  right: 4px;
+  bottom: 4px;
+  width: 44px;
+  height: 44px;
+  padding: 0;
+  border-radius: 50%;
+  background: var(--panel-raised);
+  border: 1px solid var(--line);
+  box-shadow: var(--shadow);
+  color: var(--muted);
+}
+
+#sidebar-settings-open:hover {
+  color: var(--session-accent, var(--text));
+  border-color: currentColor;
 }
 
 .sidebar-head {

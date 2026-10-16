@@ -35,7 +35,7 @@ Restart the affected session for this extension update to take effect.
 Working sessions show a spinner beside a shimmering sidebar title, without a separate “Working…” label.
 Live tool and Thinking indicators, the composer model label, and the effort slider's value and fill use the active session's accent.
 The effort button retains its effort-level color. The slider offers explicit effort levels only, excluding `inherit`.
-Open **Settings** in the sessions sidebar for terminal view, reasoning visibility, notifications and access-token entry.
+Use the floating circular gear button at the bottom of the sidebar for terminal view, reasoning visibility, notifications and access-token settings.
 Use **Back** (or Escape) to return to sessions; these controls no longer occupy the sessions footer or top bar.
 Connected sessions have no status label; offline and unread indicators remain visible.
 The chat viewport shrinks above the software keyboard and composer. When already near the bottom,
