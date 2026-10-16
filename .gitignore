@@ -48,3 +48,7 @@ secrets/
 *~
 *.swp
 *.swo
+
+# Promotional media is not published with the source.
+/docs/media/
+/docs/images/
