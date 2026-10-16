@@ -34,6 +34,26 @@ type ClientTheme = Record<string, unknown> & {
   tokens?: Record<string, string>;
 };
 type ClientCost = { total: number };
+type AskOption = { label: string; description?: string };
+type AskQuestion = {
+  id?: string;
+  question: string;
+  header?: string;
+  options: AskOption[];
+  multi: boolean;
+  recommended?: number;
+};
+type AskAnswer = {
+  selectedOptions: string[];
+  customInput?: string;
+  note?: string;
+  timedOut?: boolean;
+};
+type AskDisplay = {
+  status: "pending" | "completed" | "redirected";
+  questions: AskQuestion[];
+  answers?: Array<AskAnswer | null>;
+};
 type ChatPart =
   | { kind: "text"; text: string }
   | { kind: "thinking"; text: string }
@@ -43,6 +63,7 @@ type ChatPart =
       name: string;
       summary: string;
       output?: string;
+      ask?: AskDisplay;
       isError?: boolean;
     };
 type ChatMessage = {
@@ -88,7 +109,8 @@ type ApiAction =
   | Omit<Extract<SlotAction, { type: "model" }>, "generation">
   | Omit<Extract<SlotAction, { type: "effort" }>, "generation">
   | Omit<Extract<SlotAction, { type: "command" }>, "generation">
-  | Omit<Extract<SlotAction, { type: "move" }>, "generation">;
+  | Omit<Extract<SlotAction, { type: "move" }>, "generation">
+  | Omit<Extract<SlotAction, { type: "force" }>, "generation">;
 type RequestOptions = RequestInit & { headers?: HeadersInit };
 
 /**
@@ -248,6 +270,16 @@ let stateRequest = 0;
 let creatingSession = false;
 let activeId: SlotId = "";
 let activeState: ClientState | null = null;
+type PromptSubmission = {
+  generation: string;
+  forceable: boolean;
+  forceRequested: boolean;
+};
+const inFlightPromptSubmissions = new Map<string, PromptSubmission>();
+const forceRequestsInFlight = new Set<string>();
+let recentForceableSubmission:
+  | { targetId: SlotId; generation: string; expiresAt: number }
+  | null = null;
 let modal: HTMLDivElement | null = null;
 let modalDismiss: (() => void) | null = null;
 let toastTimer = 0;
@@ -328,7 +360,6 @@ async function api<T extends ApiResult = ApiResult>(
     credentials: "same-origin",
   });
   if (response.status === 401) {
-    document.querySelector("#token-open")?.classList.remove("hidden");
     throw Object.assign(new Error("Authentication required"), {
       auth: true,
       status: 401,
@@ -349,7 +380,6 @@ async function api<T extends ApiResult = ApiResult>(
       status: response.status,
     }) as ApiError;
   }
-  document.querySelector("#token-open")?.classList.add("hidden");
   return (response.status === 204 ? null : await response.json()) as T;
 }
 
@@ -1001,13 +1031,29 @@ function applyTheme(theme: ClientTheme | null): void {
 }
 function renderShell(): void {
   app.innerHTML = `<div class="app-shell">
-    <header class="topbar"><button class="icon-btn menu-btn" id="menu-open" type="button" aria-label="Open sessions" aria-controls="sidebar" aria-expanded="false">${ICONS.menu}</button><div class="top-title-wrap"><span class="top-title" id="top-title">Connecting…</span></div><button class="icon-btn hidden" id="token-open" aria-label="Set access token" title="Set access token">${ICONS.key}</button></header>
-    <main class="main"><aside class="sidebar" id="sidebar" aria-label="Sessions"><div class="sidebar-head"><span>Sessions</span></div><button class="sidebar-action" id="new-session" type="button" aria-label="Start a new session">${ICONS.plus}<span>New session</span></button><button class="sidebar-action" id="pin-open">Folders & pins</button><div class="sidebar-search"><input id="session-search" type="search" placeholder="Search sessions…" aria-label="Search sessions" autocomplete="off" spellcheck="false"></div><div class="slot-list" id="slot-list"></div><div class="sidebar-foot"><button class="sidebar-action" id="raw-toggle" type="button" aria-label="Show raw terminal" aria-pressed="false">${ICONS.terminal}<span>Terminal view</span></button><button class="sidebar-action" id="reasoning-toggle" type="button" aria-label="Toggle reasoning" aria-pressed="true">${ICONS.sparkles}<span>Reasoning</span><span id="reasoning-state">On</span></button><button class="sidebar-action" id="notifications-enable" type="button" aria-label="Enable notifications" title="Enable notifications">${ICONS.bellDefault}<span>Notifications</span></button></div></aside><button class="sidebar-backdrop" id="sidebar-close" type="button" aria-label="Close sessions"></button>
+    <header class="topbar"><button class="icon-btn menu-btn" id="menu-open" type="button" aria-label="Open sessions" aria-controls="sidebar" aria-expanded="false">${ICONS.menu}</button><div class="top-title-wrap"><span class="top-title" id="top-title">Connecting…</span></div></header>
+    <main class="main"><aside class="sidebar" id="sidebar" aria-label="Sessions">
+      <div id="sidebar-sessions" class="sidebar-view">
+        <button class="sidebar-action" id="new-session" type="button" aria-label="Start a new session">${ICONS.plus}<span>New session</span></button>
+        <button class="sidebar-action" id="pin-open">Folders & pins</button>
+        <div class="sidebar-search"><input id="session-search" type="search" placeholder="Search sessions…" aria-label="Search sessions" autocomplete="off" spellcheck="false"></div>
+        <div class="slot-list" id="slot-list"></div>
+        <button class="icon-btn" id="sidebar-settings-open" type="button" aria-label="Settings" title="Settings" aria-controls="sidebar-settings" aria-expanded="false"><svg width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="m9 3-.6 2.4-2 .9L4.2 6l-2 3.5 1.5 1.7v2L2.2 15l2 3.5 2.2-.4 2 .9L9 21h4l.6-2.4 2-.9 2.2.4 2-3.5-1.5-1.7v-2l1.5-1.7-2-3.5-2.2.4-2-.9L13 3Z"/><circle cx="11" cy="12" r="3"/></svg></button>
+      </div>
+      <section id="sidebar-settings" class="sidebar-view" aria-label="Settings" hidden>
+        <div class="sidebar-head"><button class="icon-btn" id="sidebar-settings-back" type="button" aria-label="Back to sessions" title="Back to sessions"><svg width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.75" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="m12 5-7 7 7 7M5 12h14"/></svg></button><span>Settings</span></div>
+        <button class="sidebar-action" id="raw-toggle" type="button" aria-label="Show raw terminal" aria-pressed="false">${ICONS.terminal}<span>Terminal view</span></button>
+        <button class="sidebar-action" id="reasoning-toggle" type="button" aria-label="Toggle reasoning" aria-pressed="true">${ICONS.sparkles}<span>Reasoning</span><span id="reasoning-state">On</span></button>
+        <button class="sidebar-action" id="notifications-enable" type="button" aria-label="Enable notifications" title="Enable notifications">${ICONS.bellDefault}<span>Notifications</span></button>
+        <button class="sidebar-action" id="token-open" type="button">${ICONS.key}<span>Access token</span></button>
+      </section>
+    </aside><button class="sidebar-backdrop" id="sidebar-close" type="button" aria-label="Close sessions"></button>
     <section class="workspace"><div class="capabilities hidden" id="capabilities"></div><div class="transcript" id="transcript" tabindex="0" aria-label="Session transcript"></div><pre class="raw-view hidden" id="raw-view" tabindex="0" aria-label="Raw terminal output"></pre><button class="scroll-fab hidden" id="scroll-bottom" type="button" aria-label="Scroll to bottom">${ICONS.arrowDown}</button></section></main>
     <div class="composer-dock"><form class="composer" id="composer"><div class="command-menu hidden" id="command-menu" role="listbox" aria-label="Slash commands"></div><div class="composer-ctx"></div><div class="composer-working hidden" id="composer-working"><span class="working-spinner">${SPINNER_FRAMES[0]}</span><span class="shimmer shimmer-accent">${shimmerMarkup("Working…")}</span></div><div class="composer-input"><textarea id="prompt" rows="1" placeholder="Message this session…" aria-label="Message this session" aria-autocomplete="list" aria-controls="command-menu" aria-expanded="false"></textarea></div><div class="composer-tools"><div class="composer-meta" id="composer-meta"><button type="button" class="ghost-btn" id="model-open">Model</button><button type="button" class="ghost-btn" id="effort-open">Effort</button><span id="ctx-label"></span><span id="cost-label"></span></div><button type="button" class="abort-btn hidden" id="abort">Stop</button><button type="submit" class="send-btn" id="send">Send</button></div></form>
   </div>`;
   const sidebar = requiredElement<HTMLElement>("#sidebar");
   const menu = requiredElement<HTMLButtonElement>("#menu-open");
+  bindSidebarSettings(sidebar);
   const closeSidebar = (): void => {
     closeSidebarDrawer();
     syncAnimation();
@@ -1021,6 +1067,8 @@ function renderShell(): void {
   menu.addEventListener("click", () =>
     sidebar.classList.contains("open") ? closeSidebar() : openSidebar(),
   );
+  bindSidebarSwipe(requiredElement<HTMLElement>("#transcript"), 1, openSidebar);
+  bindSidebarSwipe(sidebar, -1, closeSidebar);
   requiredElement<HTMLButtonElement>("#sidebar-close").addEventListener(
     "click",
     closeSidebar,
@@ -1242,8 +1290,7 @@ function slotCardMarkup(slot: SlotSummary): string {
     connected && isAgentActive(slot.id === activeId ? activeState : null, slot);
   const unread = unreadBySlot.get(slot.id)?.length || 0;
   const title = slotTitle(slot, slotState);
-  const status = connected ? slot.status || "connected" : "offline";
-  return `<div class="slot-card${slot.id === activeId ? " active" : ""}${!connected ? " offline" : ""}${isBusy ? " busy" : ""}" data-slot="${esc(slot.id)}" role="button" tabindex="0" aria-label="Open ${esc(title)}"><div class="slot-title"><span>${esc(title)}</span><span class="slot-badges">${!connected ? `<span class="slot-offline">offline</span>` : isBusy ? "" : `<span class="slot-state">${esc(status)}</span>`}${isBusy ? `<span class="slot-working"><span class="working-spinner">${SPINNER_FRAMES[0]}</span><span class="shimmer shimmer-accent">${shimmerMarkup("Working…")}</span></span>` : ""}${unread > 0 ? `<span class="slot-unread" aria-label="${unread} unread completion${unread === 1 ? "" : "s"}">${unread > 99 ? "99+" : unread}</span>` : ""}</span></div>${slot.summary && slot.summary.trim() ? `<div class="slot-summary">${esc(slot.summary)}</div>` : ""}<div class="slot-meta"><span class="slot-cwd" title="${esc(slot.cwd)}">${esc(compactPath(slot.cwd) || "Working directory unavailable")}</span><button type="button" class="slot-stop" data-stop="${esc(slot.id)}" aria-label="Stop ${esc(title)}" title="Stop this session">Stop</button></div></div>`;
+  return `<div class="slot-card${slot.id === activeId ? " active" : ""}${!connected ? " offline" : ""}${isBusy ? " busy" : ""}" data-slot="${esc(slot.id)}" role="button" tabindex="0" aria-label="Open ${esc(title)}${isBusy ? " — Working" : ""}"><div class="slot-title">${isBusy ? `<span class="slot-working"><span class="working-spinner" aria-hidden="true">${SPINNER_FRAMES[0]}</span><span class="slot-title-text shimmer shimmer-accent">${shimmerMarkup(title)}</span></span>` : `<span>${esc(title)}</span>`}<span class="slot-badges">${!connected ? `<span class="slot-offline">offline</span>` : ""}${unread > 0 ? `<span class="slot-unread" aria-label="${unread} unread completion${unread === 1 ? "" : "s"}">${unread > 99 ? "99+" : unread}</span>` : ""}</span></div>${slot.summary && slot.summary.trim() ? `<div class="slot-summary">${esc(slot.summary)}</div>` : ""}<div class="slot-meta"><span class="slot-cwd" title="${esc(slot.cwd)}">${esc(compactPath(slot.cwd) || "Working directory unavailable")}</span><button type="button" class="slot-stop" data-stop="${esc(slot.id)}" aria-label="Stop ${esc(title)}" title="Stop this session">Stop</button></div></div>`;
 }
 
 /**
@@ -1350,6 +1397,93 @@ function updateSlots(): void {
   syncTopBar();
   syncAnimation();
 }
+function bindSidebarSettings(sidebar: HTMLElement): void {
+  const sessions = requiredElement<HTMLElement>("#sidebar-sessions", sidebar);
+  const settings = requiredElement<HTMLElement>("#sidebar-settings", sidebar);
+  const open = requiredElement<HTMLButtonElement>("#sidebar-settings-open", sidebar);
+  const back = requiredElement<HTMLButtonElement>("#sidebar-settings-back", sidebar);
+  const show = (visible: boolean): void => {
+    sessions.hidden = visible;
+    settings.hidden = !visible;
+    open.setAttribute("aria-expanded", String(visible));
+    (visible ? back : open).focus();
+    syncAnimation();
+  };
+  open.addEventListener("click", () => show(true));
+  back.addEventListener("click", () => show(false));
+  settings.addEventListener("keydown", (event) => {
+    if (event.key !== "Escape") return;
+    event.preventDefault();
+    event.stopPropagation();
+    show(false);
+  });
+}
+
+/** Horizontal drawer gestures leave native vertical scrolling alone. */
+function bindSidebarSwipe(chat: HTMLElement, direction: 1 | -1, activate: () => void): void {
+  let start: { id: number; x: number; y: number } | null = null;
+  let suppressClick = false;
+  chat.addEventListener("click", (event) => {
+    if (!suppressClick || event.detail === 0) return;
+    suppressClick = false;
+    event.preventDefault();
+    event.stopImmediatePropagation();
+  }, true);
+  chat.addEventListener("touchstart", (event) => {
+    start = null;
+    suppressClick = false;
+    if (!window.matchMedia("(max-width: 720px)").matches ||
+        event.touches.length !== 1 || modal ||
+        document.body.classList.contains("sidebar-open") !== (direction === -1)) return;
+    const target = event.target;
+    if (target instanceof Element &&
+        target.closest(direction === -1
+          ? "input, textarea, select, [contenteditable]"
+          : "a, button, input, textarea, select, pre, code, [contenteditable]")) return;
+    const touch = event.touches[0];
+    start = { id: touch.identifier, x: touch.clientX, y: touch.clientY };
+  }, { passive: true });
+  chat.addEventListener("touchmove", (event) => {
+    if (!start) return;
+    const origin = start;
+    const touch = Array.from(event.touches).find((touch) => touch.identifier === origin.id);
+    if (event.touches.length !== 1 || !touch) {
+      start = null;
+      return;
+    }
+    const dx = touch.clientX - origin.x;
+    const dy = Math.abs(touch.clientY - origin.y);
+    if (dy > 30 && dy >= Math.abs(dx)) {
+      start = null;
+      return;
+    }
+    const distance = dx * direction;
+    if (distance > 12 && distance >= dy * 2 &&
+        !window.getSelection()?.toString()) {
+      if (event.cancelable) event.preventDefault();
+      if (Math.abs(dx) >= 60) {
+        suppressClick = true;
+        start = null;
+        activate();
+      }
+    }
+  }, { passive: false });
+  chat.addEventListener("touchcancel", () => { start = null; }, { passive: true });
+  chat.addEventListener("touchend", (event) => {
+    const origin = start;
+    start = null;
+    if (!origin || window.getSelection()?.toString()) return;
+    const touch = Array.from(event.changedTouches).find((touch) => touch.identifier === origin.id);
+    if (!touch) return;
+    const dx = touch.clientX - origin.x;
+    const dy = Math.abs(touch.clientY - origin.y);
+    if (dx * direction >= 60 && dy <= 30 && dx * direction >= dy * 2) {
+      suppressClick = true;
+      activate();
+    }
+  }, { passive: true });
+}
+
 function closeSidebarDrawer(): void {
   document.querySelector<HTMLElement>("#sidebar")?.classList.remove("open");
   document
@@ -1464,6 +1598,12 @@ function handleViewport(): void {
     "--keyboard-inset",
     `${keyboard}px`,
   );
+  if (transcriptNearBottom) {
+    requestAnimationFrame(() => {
+      const transcript = document.querySelector<HTMLElement>("#transcript");
+      if (transcript) transcript.scrollTop = transcript.scrollHeight;
+    });
+  }
   if (modal && keyboard > 0) {
     const focused = document.activeElement;
     if (focused instanceof HTMLElement && modal.contains(focused)) {
@@ -2352,6 +2492,186 @@ type TranscriptRenderSnapshot = {
   messages: PreparedTranscriptMessage[];
 };
 
+function sameAskDisplay(
+  a: AskDisplay | undefined,
+  b: AskDisplay | undefined,
+): boolean {
+  if (a === b) return true;
+  if (
+    !a ||
+    !b ||
+    a.status !== b.status ||
+    a.questions.length !== b.questions.length ||
+    a.answers?.length !== b.answers?.length
+  )
+    return false;
+  for (let i = 0; i < a.questions.length; i += 1) {
+    const left = a.questions[i]!;
+    const right = b.questions[i]!;
+    if (
+      left.id !== right.id ||
+      left.question !== right.question ||
+      left.header !== right.header ||
+      left.multi !== right.multi ||
+      left.recommended !== right.recommended ||
+      left.options.length !== right.options.length
+    )
+      return false;
+    for (let j = 0; j < left.options.length; j += 1) {
+      const leftOption = left.options[j]!;
+      const rightOption = right.options[j]!;
+      if (
+        leftOption.label !== rightOption.label ||
+        leftOption.description !== rightOption.description
+      )
+        return false;
+    }
+  }
+  if (a.answers && b.answers) {
+    for (let i = 0; i < a.answers.length; i += 1) {
+      const left = a.answers[i];
+      const right = b.answers[i];
+      if (left === null || right === null) {
+        if (left !== right) return false;
+        continue;
+      }
+      if (
+        !left ||
+        !right ||
+        left.customInput !== right.customInput ||
+        left.note !== right.note ||
+        left.timedOut !== right.timedOut ||
+        left.selectedOptions.length !== right.selectedOptions.length
+      )
+        return false;
+      for (let j = 0; j < left.selectedOptions.length; j += 1) {
+        if (left.selectedOptions[j] !== right.selectedOptions[j]) return false;
+      }
+    }
+  }
+  return true;
+}
+
+function appendAskCard(
+  parent: HTMLElement,
+  part: Extract<ChatPart, { kind: "tool" }>,
+): void {
+  const ask = part.ask;
+  if (!ask) return;
+  const card = document.createElement("section");
+  card.className = `part part-tool part-ask${part.isError ? " part-error" : ""}`;
+  const heading = document.createElement("div");
+  heading.className = "part-ask-heading";
+  heading.textContent = "Ask";
+  card.append(heading);
+
+  const status = document.createElement("p");
+  status.className = "part-ask-status";
+  if (part.isError) {
+    status.textContent = "Ask failed in the desktop terminal.";
+  } else if (ask.status === "pending") {
+    status.textContent =
+      "Awaiting an answer in the desktop terminal. Mobile cannot submit ask answers.";
+  } else if (ask.status === "redirected") {
+    status.textContent = "Conversation continued from the desktop terminal.";
+  } else {
+    status.textContent = "Answered in the desktop terminal.";
+  }
+  card.append(status);
+
+  let hasAnswer = false;
+  ask.questions.forEach((question, questionIndex) => {
+    const block = document.createElement("div");
+    block.className = "part-ask-question";
+    if (question.header) {
+      const header = document.createElement("span");
+      header.className = "part-ask-header";
+      header.textContent = question.header;
+      block.append(header);
+    }
+    const prompt = document.createElement("div");
+    prompt.className = "part-ask-prompt";
+    prompt.textContent = question.question;
+    block.append(prompt);
+    const mode = document.createElement("div");
+    mode.className = "part-ask-mode";
+    mode.textContent = question.multi
+      ? "Select all that apply"
+      : "Select one";
+    block.append(mode);
+
+    const answer = ask.answers?.[questionIndex] ?? null;
+    if (
+      answer &&
+      (answer.selectedOptions.length > 0 ||
+        answer.customInput ||
+        answer.note ||
+        answer.timedOut)
+    ) {
+      hasAnswer = true;
+    }
+    if (question.options.length > 0) {
+      const options = document.createElement("ul");
+      options.className = "part-ask-options";
+      question.options.forEach((option, optionIndex) => {
+        const item = document.createElement("li");
+        item.className = "part-ask-option";
+        const label = document.createElement("span");
+        label.className = "part-ask-option-label";
+        label.textContent = option.label;
+        item.append(label);
+        if (answer?.selectedOptions.includes(option.label)) {
+          const selected = document.createElement("span");
+          selected.className = "part-ask-option-selected";
+          selected.textContent = "Selected";
+          item.append(selected);
+        }
+        if (question.recommended === optionIndex) {
+          const recommended = document.createElement("span");
+          recommended.className = "part-ask-option-recommended";
+          recommended.textContent = "Recommended";
+          item.append(recommended);
+        }
+        if (option.description) {
+          const description = document.createElement("div");
+          description.className = "part-ask-option-description";
+          description.textContent = option.description;
+          item.append(description);
+        }
+        options.append(item);
+      });
+      block.append(options);
+    }
+    if (answer?.customInput) {
+      const custom = document.createElement("p");
+      custom.className = "part-ask-answer";
+      custom.textContent = `Custom answer: ${answer.customInput}`;
+      block.append(custom);
+    }
+    if (answer?.note) {
+      const note = document.createElement("p");
+      note.className = "part-ask-answer";
+      note.textContent = `Note: ${answer.note}`;
+      block.append(note);
+    }
+    if (answer?.timedOut) {
+      const timedOut = document.createElement("p");
+      timedOut.className = "part-ask-answer";
+      timedOut.textContent = "Answer selected automatically after timeout.";
+      block.append(timedOut);
+    }
+    card.append(block);
+  });
+
+  if (part.output && (part.isError || !hasAnswer)) {
+    const output = document.createElement("pre");
+    output.className = "part-ask-output";
+    output.textContent = part.output;
+    card.append(output);
+  }
+  parent.append(card);
+}
+
 function sameTranscriptPart(a: ChatPart, b: ChatPart): boolean {
   if (a === b) return true;
   if (!a || !b || a.kind !== b.kind) return false;
@@ -2366,7 +2686,8 @@ function sameTranscriptPart(a: ChatPart, b: ChatPart): boolean {
       a.name === b.name &&
       a.summary === b.summary &&
       a.output === b.output &&
-      a.isError === b.isError
+      a.isError === b.isError &&
+      sameAskDisplay(a.ask, b.ask)
     );
   return false;
 }
@@ -2578,6 +2899,10 @@ function renderMessages(messages: ClientMessage[], active = false): void {
         details.append(body);
         article.append(details);
       } else if (part.kind === "tool") {
+        if (part.ask) {
+          appendAskCard(article, part);
+          return;
+        }
         const details = document.createElement("details");
         details.className = `part part-tool${part.isError ? " part-error" : ""}`;
         const toolMsgKey = msgKey;
@@ -2761,6 +3086,48 @@ function renderActive(): void {
       lastEmptyTranscriptContent = emptyText;
     }
   }
+  if (!document.querySelector("#pending-messages")) {
+    const container = document.createElement("div");
+    container.id = "pending-messages";
+    container.className = "pending-messages hidden";
+    container.setAttribute("aria-live", "polite");
+    document.querySelector(".app-shell")?.append(container);
+  }
+  const pendingContainer =
+    requiredElement<HTMLDivElement>("#pending-messages");
+  const pendingMessages = state?.pendingMessages ?? [];
+  const hasPendingMessages = state?.hasPendingMessages === true;
+  if (hasPendingMessages || pendingMessages.length > 0) {
+    const queueState = hasPendingMessages ? "Pending messages" : "Submitting";
+    const help = hasPendingMessages
+      ? active
+        ? "Tap Send again with an empty composer to interrupt this run and deliver the queue now."
+        : "OMP will deliver the queue when the session resumes."
+      : "Submitting to OMP…";
+    const messageItems = pendingMessages.length
+      ? `<ol>${pendingMessages
+          .map(
+            (message) =>
+              `<li>${esc(message.text.replace(/\r?\n/g, " ↵ "))}</li>`,
+          )
+          .join("")}</ol>`
+      : hasPendingMessages
+        ? `<p class="pending-unavailable">Message text is unavailable for items queued outside mobile.</p>`
+        : "";
+    pendingContainer.innerHTML = `<div class="pending-card"><div class="pending-heading">${queueState}</div>${messageItems}<div class="pending-help">${help}</div>${hasPendingMessages ? `<div class="pending-limitation">OMP exposes queue availability, but not desktop-origin message text.</div>` : ""}</div>`;
+    pendingContainer.classList.remove("hidden");
+  } else {
+    pendingContainer.innerHTML = "";
+    pendingContainer.classList.add("hidden");
+  }
+  const sendButton = requiredElement<HTMLButtonElement>("#send");
+  const forceReady =
+    hasPendingMessages && active && !prompt.value.trim();
+  sendButton.textContent = forceReady ? "Force" : "Send";
+  sendButton.setAttribute(
+    "aria-label",
+    forceReady ? "Force queued messages now" : "Send message",
+  );
   requiredElement<HTMLElement>("#composer-working").classList.toggle(
     "hidden",
     !active,
@@ -2797,11 +3164,7 @@ function renderActive(): void {
       ? state.accent
       : "#808080";
 
-  const modelColor = getThemeToken(
-    state?.theme ?? null,
-    "statusLineModel",
-    sessionAccent,
-  );
+  const modelColor = sessionAccent;
   const thinkingColor = getThinkingColor(state?.theme ?? null, state?.effort);
 
   const contextPercent =
@@ -2886,7 +3249,6 @@ function renderActive(): void {
   abortBtn.classList.toggle("hidden", !active || !capability("abort"));
 
   const sendBtn = requiredElement<HTMLButtonElement>("#send");
-  sendBtn.classList.toggle("hidden", active);
   sendBtn.disabled = !capability("prompt") || !slot.connected;
 
   const effort =
@@ -2899,7 +3261,7 @@ function renderActive(): void {
 
   const popover = document.querySelector<HTMLElement>("#effort-popover");
   if (popover && state) {
-    const values = state.efforts || [];
+    const values = (state.efforts || []).filter((value) => value !== "inherit");
     const range = popover.querySelector<HTMLInputElement>("#effort-range");
     const currentLabel = popover.querySelector<HTMLElement>("#effort-current");
     if (range && currentLabel && values.length && !effortSliderDragging) {
@@ -3254,13 +3616,47 @@ function handleSendSuccess(targetId: SlotId, draftAtSend: string): void {
     renderCommandMenu();
   }
 }
+async function forcePendingMessages(
+  targetId: SlotId,
+  targetState: ClientState | null,
+): Promise<void> {
+  const generation = targetState?.generation;
+  if (!generation) return;
+  const key = JSON.stringify([targetId, generation]);
+  if (forceRequestsInFlight.has(key)) return;
+  forceRequestsInFlight.add(key);
+  try {
+    const forced = await sendAction({ type: "force" }, targetId, targetState);
+    if (
+      forced &&
+      recentForceableSubmission?.targetId === targetId &&
+      recentForceableSubmission.generation === generation
+    )
+      recentForceableSubmission = null;
+  } finally {
+    forceRequestsInFlight.delete(key);
+  }
+}
 function sendPrompt(): void {
   const prompt = requiredElement<HTMLTextAreaElement>("#prompt");
   const text = prompt.value.trim();
   const targetId = activeId;
   const targetState = activeState;
   const draftAtSend = prompt.value;
-  if (!text) return;
+  if (!text) {
+    const recent = recentForceableSubmission;
+    const pendingIsBusy =
+      targetState?.hasPendingMessages === true &&
+      isAgentActive(targetState, slotById(targetId));
+    const recentMatches =
+      recent !== null &&
+      recent.targetId === targetId &&
+      recent.generation === targetState?.generation &&
+      recent.expiresAt > Date.now();
+    if (pendingIsBusy || recentMatches)
+      void forcePendingMessages(targetId, targetState);
+    return;
+  }
 
   const moveMatch = text.match(/^\/move(?:\s+(.+))?$/);
   if (moveMatch) {
@@ -3314,12 +3710,36 @@ function sendPrompt(): void {
     showToast("Prompting is unavailable for this session", true);
     return;
   }
-  void sendAction({ type: "prompt", text }, targetId, targetState).then(
-    (sent) => {
+  const generation = targetState?.generation ?? "";
+  const submissionKey = JSON.stringify([targetId, generation, text]);
+  const inFlight = inFlightPromptSubmissions.get(submissionKey);
+  if (inFlight) {
+    if (inFlight.forceable) inFlight.forceRequested = true;
+    return;
+  }
+  const submission: PromptSubmission = {
+    generation,
+    forceable:
+      isAgentActive(targetState, slotById(targetId)) ||
+      targetState?.hasPendingMessages === true,
+    forceRequested: false,
+  };
+  inFlightPromptSubmissions.set(submissionKey, submission);
+  void sendAction({ type: "prompt", text }, targetId, targetState)
+    .then(async (sent) => {
       if (!sent) return;
       handleSendSuccess(targetId, draftAtSend);
-    },
-  );
+      if (submission.forceable) {
+        recentForceableSubmission = {
+          targetId,
+          generation,
+          expiresAt: Date.now() + 3000,
+        };
+      }
+      if (submission.forceRequested)
+        await forcePendingMessages(targetId, targetState);
+    })
+    .finally(() => inFlightPromptSubmissions.delete(submissionKey));
 }
 function closeModal(): void {
   const dismiss = modalDismiss;
@@ -3374,7 +3794,6 @@ function makeModal(title: string, body: HTMLElement): HTMLDivElement {
   return overlay;
 }
 function openTokenModal(): void {
-  document.querySelector("#token-open")?.classList.remove("hidden");
   if (modal?.querySelector('[aria-label="Access token"]')) return;
   const body = document.createElement("form");
   body.innerHTML = `<p class="notice">Enter the access token configured for this gateway.</p><input type="password" autocomplete="current-password" placeholder="Access token" aria-label="Access token"><div class="modal-actions"><button type="button" class="ghost-btn modal-cancel">Cancel</button><button type="submit" class="send-btn">Save token</button></div>`;
@@ -3502,7 +3921,7 @@ function toggleEffortPopover(): void {
   const targetId = activeId;
   const targetState = activeState;
   const targetGeneration = targetState?.generation;
-  const values = targetState?.efforts || [];
+  const values = (targetState?.efforts || []).filter((value) => value !== "inherit");
   if (!values.length) {
     showToast("No supported effort levels reported", true);
     return;

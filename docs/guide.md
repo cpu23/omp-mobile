@@ -19,6 +19,33 @@ extension changes reach existing sessions after their OMP process restarts. With
 terminal-only views and reports transcript, model and capability data as unavailable. Terminal snapshots are
 read-only and do not resize the desktop PTY.
 
+OMP `ask` prompts appear inline with their question text, options, descriptions, selection mode and recommended option.
+Pending prompts are read-only in Mobile: ask dialogs are owned by the desktop terminal, and Mobile has no remote
+answer API. Answer there; after the tool finishes, Mobile shows the terminal's recorded selections and any custom
+answers or notes. Restart an affected OMP session for this extension change to take effect.
+
+While OMP is busy, Mobile sends ordinary text through the steering path and shows its queued text until OMP starts it.
+If the same Send action is tapped again before its first submission resolves, Mobile coalesces the duplicate and, when
+the session was busy, forces the queue only after the first submission succeeds. Once OMP reports pending messages and
+the session is active, an empty composer changes **Send** to **Force**; tapping it (or submitting empty Enter)
+interrupts the current run so OMP drains the pending queue, matching desktop's empty-Enter behavior. OMP's public
+extension API exposes queue availability but not desktop-origin queued text, so those items appear as a generic notice.
+Restart the affected session for this extension update to take effect.
+
+Working sessions show a spinner beside a shimmering sidebar title, without a separate “Working…” label.
+Live tool and Thinking indicators, the composer model label, and the effort slider's value and fill use the active session's accent.
+The effort button retains its effort-level color. The slider offers explicit effort levels only, excluding `inherit`.
+Use the floating circular gear button at the bottom of the sidebar for terminal view, reasoning visibility, notifications and access-token settings.
+The gear overlays the session list; bottom scroll padding lets the last card move clear of it.
+Use the back-arrow icon (or Escape) to return to sessions; these controls no longer occupy the sessions footer or top bar.
+Connected sessions have no status label; offline and unread indicators remain visible.
+The chat viewport shrinks above the software keyboard and composer. When already near the bottom,
+the latest messages stay in view as the keyboard opens or closes.
+On phone-sized screens, swipe right across the chat to open the sidebar, and left across the sidebar to close it.
+The drawer responds during the swipe. Closing swipes can start on sidebar buttons without activating them;
+ordinary taps still work. Vertical scrolling, selected text and text inputs do not trigger closing.
+Opening swipes also leave controls and code blocks alone; the menu button remains available.
+
 ## Install and start
 
 From this repository:
@@ -31,7 +58,7 @@ bun run start          # http://127.0.0.1:4173
 
 Start the daemon in `../omp-desktop` with `bun install && bun run start`. Either service may start first; they reconnect,
 and the daemon injects the extension into each session it spawns. Open the gateway URL and enter the token printed by
-`bun run setup --show`. The key icon reopens token entry after an API request returns `401`.
+`bun run setup --show`. **Settings → Access token** reopens token entry at any time.
 
 `bun run dev` runs watch mode; `bun run check` typechecks and `bun test` runs unit tests. With both sibling checkouts
 present, `bun run release:check` in `../omp-desktop` tests fresh installs, token setup/reuse and a shared-runtime start,
@@ -152,7 +179,7 @@ Extension (`extension.ts`; daemon sets values for each session):
 | --- | --- |
 | `omp-mobile failed to start: missing or invalid mobile token …` | Run `bun run setup` or set `OMP_MOBILE_TOKEN` / `OMP_MOBILE_TOKEN_FILE`. |
 | `OMP_MOBILE_TOKEN must be 16-512 characters` | Fix or unset the environment value. |
-| `access token required`, key icon, empty sidebar | Enter the token; the gateway is reachable but this browser is unauthenticated. |
+| `access token required`, empty sidebar | Open Settings → Access token; the gateway is reachable but this browser is unauthenticated. |
 | `access token rejected` after working earlier | Token changed: restart gateway, daemon and affected sessions. |
 | Empty sidebar / `desktop daemon unavailable` | Start daemon or set `OMP_MOBILE_DESKTOP_URL` to its loopback port. |
 | `extension unavailable` / no transcript or model | Align token and `OMP_MOBILE_IPC_DIR` between daemon and gateway; restart the session. |

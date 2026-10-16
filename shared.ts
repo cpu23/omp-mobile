@@ -96,6 +96,8 @@ export type SlotState = {
   title?: string;
   summary?: string;
   pendingApproval?: number;
+  hasPendingMessages?: boolean;
+  pendingMessages?: PendingMessage[];
   editor?: { available: boolean; empty: boolean | null };
   completion?: CompletionMarker;
   agentActive?: boolean;
@@ -124,8 +126,14 @@ export type TerminalSnapshot = {
   };
 };
 
+export type PendingMessage = {
+  id: string;
+  text: string;
+  status: "sending" | "queued";
+};
 export type PromptAction = { generation: string; type: "prompt"; text: string };
 export type AbortAction = { generation: string; type: "abort" };
+export type ForceAction = { generation: string; type: "force" };
 export type ModelAction = {
   generation: string;
   type: "model";
@@ -165,6 +173,7 @@ export type CommandResponse = {
 export type SlotAction =
   | PromptAction
   | AbortAction
+  | ForceAction
   | ModelAction
   | EffortAction
   | CommandAction
