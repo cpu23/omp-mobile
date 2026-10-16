@@ -1480,7 +1480,7 @@ pre,
 }
 
 #effort-open {
-  color: var(--session-accent, var(--accent));
+  color: var(--thinking-color, var(--effort-accent));
 }
 
 #ctx-label,
@@ -2178,8 +2178,7 @@ pre,
   touch-action: none;
 }
 
-.effort-range:focus-visible,
-#effort-open:focus-visible {
+.effort-range:focus-visible {
   outline-color: var(--session-accent, var(--accent));
 }
 
