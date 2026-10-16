@@ -1274,6 +1274,8 @@ pre,
   max-width: 920px;
   margin: 0 auto;
   overflow: auto;
+  pointer-events: auto;
+  overscroll-behavior: contain;
   padding: 8px 11px;
   border: 1px solid var(--line);
   border-left: 2px solid var(--session-accent, var(--accent));
