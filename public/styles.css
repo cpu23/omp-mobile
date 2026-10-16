@@ -311,11 +311,15 @@ textarea:focus-visible {
 
 #sidebar-sessions {
   position: relative;
+}
+
+#sidebar-sessions .slot-list {
   padding-bottom: 62px;
 }
 
 #sidebar-settings-open {
   position: absolute;
+  z-index: 1;
   right: 4px;
   bottom: 4px;
   width: 44px;

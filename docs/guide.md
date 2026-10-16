@@ -36,6 +36,7 @@ Working sessions show a spinner beside a shimmering sidebar title, without a sep
 Live tool and Thinking indicators, the composer model label, and the effort slider's value and fill use the active session's accent.
 The effort button retains its effort-level color. The slider offers explicit effort levels only, excluding `inherit`.
 Use the floating circular gear button at the bottom of the sidebar for terminal view, reasoning visibility, notifications and access-token settings.
+The gear overlays the session list; bottom scroll padding lets the last card move clear of it.
 Use the back-arrow icon (or Escape) to return to sessions; these controls no longer occupy the sessions footer or top bar.
 Connected sessions have no status label; offline and unread indicators remain visible.
 The chat viewport shrinks above the software keyboard and composer. When already near the bottom,
