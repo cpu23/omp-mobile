@@ -360,7 +360,6 @@ async function api<T extends ApiResult = ApiResult>(
     credentials: "same-origin",
   });
   if (response.status === 401) {
-    document.querySelector("#token-open")?.classList.remove("hidden");
     throw Object.assign(new Error("Authentication required"), {
       auth: true,
       status: 401,
@@ -381,7 +380,6 @@ async function api<T extends ApiResult = ApiResult>(
       status: response.status,
     }) as ApiError;
   }
-  document.querySelector("#token-open")?.classList.add("hidden");
   return (response.status === 204 ? null : await response.json()) as T;
 }
 
@@ -1033,13 +1031,29 @@ function applyTheme(theme: ClientTheme | null): void {
 }
 function renderShell(): void {
   app.innerHTML = `<div class="app-shell">
-    <header class="topbar"><button class="icon-btn menu-btn" id="menu-open" type="button" aria-label="Open sessions" aria-controls="sidebar" aria-expanded="false">${ICONS.menu}</button><div class="top-title-wrap"><span class="top-title" id="top-title">Connecting…</span></div><button class="icon-btn hidden" id="token-open" aria-label="Set access token" title="Set access token">${ICONS.key}</button></header>
-    <main class="main"><aside class="sidebar" id="sidebar" aria-label="Sessions"><div class="sidebar-head"><span>Sessions</span></div><button class="sidebar-action" id="new-session" type="button" aria-label="Start a new session">${ICONS.plus}<span>New session</span></button><button class="sidebar-action" id="pin-open">Folders & pins</button><div class="sidebar-search"><input id="session-search" type="search" placeholder="Search sessions…" aria-label="Search sessions" autocomplete="off" spellcheck="false"></div><div class="slot-list" id="slot-list"></div><div class="sidebar-foot"><button class="sidebar-action" id="raw-toggle" type="button" aria-label="Show raw terminal" aria-pressed="false">${ICONS.terminal}<span>Terminal view</span></button><button class="sidebar-action" id="reasoning-toggle" type="button" aria-label="Toggle reasoning" aria-pressed="true">${ICONS.sparkles}<span>Reasoning</span><span id="reasoning-state">On</span></button><button class="sidebar-action" id="notifications-enable" type="button" aria-label="Enable notifications" title="Enable notifications">${ICONS.bellDefault}<span>Notifications</span></button></div></aside><button class="sidebar-backdrop" id="sidebar-close" type="button" aria-label="Close sessions"></button>
+    <header class="topbar"><button class="icon-btn menu-btn" id="menu-open" type="button" aria-label="Open sessions" aria-controls="sidebar" aria-expanded="false">${ICONS.menu}</button><div class="top-title-wrap"><span class="top-title" id="top-title">Connecting…</span></div></header>
+    <main class="main"><aside class="sidebar" id="sidebar" aria-label="Sessions">
+      <div id="sidebar-sessions" class="sidebar-view">
+        <div class="sidebar-head"><span>Sessions</span><button class="icon-btn" id="sidebar-settings-open" type="button" aria-controls="sidebar-settings" aria-expanded="false">Settings</button></div>
+        <button class="sidebar-action" id="new-session" type="button" aria-label="Start a new session">${ICONS.plus}<span>New session</span></button>
+        <button class="sidebar-action" id="pin-open">Folders & pins</button>
+        <div class="sidebar-search"><input id="session-search" type="search" placeholder="Search sessions…" aria-label="Search sessions" autocomplete="off" spellcheck="false"></div>
+        <div class="slot-list" id="slot-list"></div>
+      </div>
+      <section id="sidebar-settings" class="sidebar-view" aria-label="Settings" hidden>
+        <div class="sidebar-head"><button class="icon-btn" id="sidebar-settings-back" type="button">← Back</button><span>Settings</span></div>
+        <button class="sidebar-action" id="raw-toggle" type="button" aria-label="Show raw terminal" aria-pressed="false">${ICONS.terminal}<span>Terminal view</span></button>
+        <button class="sidebar-action" id="reasoning-toggle" type="button" aria-label="Toggle reasoning" aria-pressed="true">${ICONS.sparkles}<span>Reasoning</span><span id="reasoning-state">On</span></button>
+        <button class="sidebar-action" id="notifications-enable" type="button" aria-label="Enable notifications" title="Enable notifications">${ICONS.bellDefault}<span>Notifications</span></button>
+        <button class="sidebar-action" id="token-open" type="button">${ICONS.key}<span>Access token</span></button>
+      </section>
+    </aside><button class="sidebar-backdrop" id="sidebar-close" type="button" aria-label="Close sessions"></button>
     <section class="workspace"><div class="capabilities hidden" id="capabilities"></div><div class="transcript" id="transcript" tabindex="0" aria-label="Session transcript"></div><pre class="raw-view hidden" id="raw-view" tabindex="0" aria-label="Raw terminal output"></pre><button class="scroll-fab hidden" id="scroll-bottom" type="button" aria-label="Scroll to bottom">${ICONS.arrowDown}</button></section></main>
     <div class="composer-dock"><form class="composer" id="composer"><div class="command-menu hidden" id="command-menu" role="listbox" aria-label="Slash commands"></div><div class="composer-ctx"></div><div class="composer-working hidden" id="composer-working"><span class="working-spinner">${SPINNER_FRAMES[0]}</span><span class="shimmer shimmer-accent">${shimmerMarkup("Working…")}</span></div><div class="composer-input"><textarea id="prompt" rows="1" placeholder="Message this session…" aria-label="Message this session" aria-autocomplete="list" aria-controls="command-menu" aria-expanded="false"></textarea></div><div class="composer-tools"><div class="composer-meta" id="composer-meta"><button type="button" class="ghost-btn" id="model-open">Model</button><button type="button" class="ghost-btn" id="effort-open">Effort</button><span id="ctx-label"></span><span id="cost-label"></span></div><button type="button" class="abort-btn hidden" id="abort">Stop</button><button type="submit" class="send-btn" id="send">Send</button></div></form>
   </div>`;
   const sidebar = requiredElement<HTMLElement>("#sidebar");
   const menu = requiredElement<HTMLButtonElement>("#menu-open");
+  bindSidebarSettings(sidebar);
   const closeSidebar = (): void => {
     closeSidebarDrawer();
     syncAnimation();
@@ -1383,6 +1397,28 @@ function updateSlots(): void {
   syncTopBar();
   syncAnimation();
 }
+function bindSidebarSettings(sidebar: HTMLElement): void {
+  const sessions = requiredElement<HTMLElement>("#sidebar-sessions", sidebar);
+  const settings = requiredElement<HTMLElement>("#sidebar-settings", sidebar);
+  const open = requiredElement<HTMLButtonElement>("#sidebar-settings-open", sidebar);
+  const back = requiredElement<HTMLButtonElement>("#sidebar-settings-back", sidebar);
+  const show = (visible: boolean): void => {
+    sessions.hidden = visible;
+    settings.hidden = !visible;
+    open.setAttribute("aria-expanded", String(visible));
+    (visible ? back : open).focus();
+    syncAnimation();
+  };
+  open.addEventListener("click", () => show(true));
+  back.addEventListener("click", () => show(false));
+  settings.addEventListener("keydown", (event) => {
+    if (event.key !== "Escape") return;
+    event.preventDefault();
+    event.stopPropagation();
+    show(false);
+  });
+}
+
 /** Horizontal drawer gestures leave native vertical scrolling alone. */
 function bindSidebarSwipe(chat: HTMLElement, direction: 1 | -1, activate: () => void): void {
   let start: { id: number; x: number; y: number } | null = null;
@@ -3758,7 +3794,6 @@ function makeModal(title: string, body: HTMLElement): HTMLDivElement {
   return overlay;
 }
 function openTokenModal(): void {
-  document.querySelector("#token-open")?.classList.remove("hidden");
   if (modal?.querySelector('[aria-label="Access token"]')) return;
   const body = document.createElement("form");
   body.innerHTML = `<p class="notice">Enter the access token configured for this gateway.</p><input type="password" autocomplete="current-password" placeholder="Access token" aria-label="Access token"><div class="modal-actions"><button type="button" class="ghost-btn modal-cancel">Cancel</button><button type="submit" class="send-btn">Save token</button></div>`;

@@ -33,8 +33,10 @@ extension API exposes queue availability but not desktop-origin queued text, so 
 Restart the affected session for this extension update to take effect.
 
 Working sessions show a spinner beside a shimmering sidebar title, without a separate “Working…” label.
-Live tool spinners/shimmers, the composer model label, and the effort slider's value and fill use the active session's accent.
+Live tool and Thinking indicators, the composer model label, and the effort slider's value and fill use the active session's accent.
 The effort button retains its effort-level color. The slider offers explicit effort levels only, excluding `inherit`.
+Open **Settings** in the sessions sidebar for terminal view, reasoning visibility, notifications and access-token entry.
+Use **Back** (or Escape) to return to sessions; these controls no longer occupy the sessions footer or top bar.
 Connected sessions have no status label; offline and unread indicators remain visible.
 The chat viewport shrinks above the software keyboard and composer. When already near the bottom,
 the latest messages stay in view as the keyboard opens or closes.
@@ -55,7 +57,7 @@ bun run start          # http://127.0.0.1:4173
 
 Start the daemon in `../omp-desktop` with `bun install && bun run start`. Either service may start first; they reconnect,
 and the daemon injects the extension into each session it spawns. Open the gateway URL and enter the token printed by
-`bun run setup --show`. The key icon reopens token entry after an API request returns `401`.
+`bun run setup --show`. **Settings → Access token** reopens token entry at any time.
 
 `bun run dev` runs watch mode; `bun run check` typechecks and `bun test` runs unit tests. With both sibling checkouts
 present, `bun run release:check` in `../omp-desktop` tests fresh installs, token setup/reuse and a shared-runtime start,
@@ -176,7 +178,7 @@ Extension (`extension.ts`; daemon sets values for each session):
 | --- | --- |
 | `omp-mobile failed to start: missing or invalid mobile token …` | Run `bun run setup` or set `OMP_MOBILE_TOKEN` / `OMP_MOBILE_TOKEN_FILE`. |
 | `OMP_MOBILE_TOKEN must be 16-512 characters` | Fix or unset the environment value. |
-| `access token required`, key icon, empty sidebar | Enter the token; the gateway is reachable but this browser is unauthenticated. |
+| `access token required`, empty sidebar | Open Settings → Access token; the gateway is reachable but this browser is unauthenticated. |
 | `access token rejected` after working earlier | Token changed: restart gateway, daemon and affected sessions. |
 | Empty sidebar / `desktop daemon unavailable` | Start daemon or set `OMP_MOBILE_DESKTOP_URL` to its loopback port. |
 | `extension unavailable` / no transcript or model | Align token and `OMP_MOBILE_IPC_DIR` between daemon and gateway; restart the session. |
