@@ -3225,7 +3225,7 @@ function renderActive(): void {
 
   const popover = document.querySelector<HTMLElement>("#effort-popover");
   if (popover && state) {
-    const values = state.efforts || [];
+    const values = (state.efforts || []).filter((value) => value !== "inherit");
     const range = popover.querySelector<HTMLInputElement>("#effort-range");
     const currentLabel = popover.querySelector<HTMLElement>("#effort-current");
     if (range && currentLabel && values.length && !effortSliderDragging) {
@@ -3886,7 +3886,7 @@ function toggleEffortPopover(): void {
   const targetId = activeId;
   const targetState = activeState;
   const targetGeneration = targetState?.generation;
-  const values = targetState?.efforts || [];
+  const values = (targetState?.efforts || []).filter((value) => value !== "inherit");
   if (!values.length) {
     showToast("No supported effort levels reported", true);
     return;
