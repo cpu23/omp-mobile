@@ -23,6 +23,15 @@ import {
   type SlotSummary,
   type TerminalSnapshot,
 } from "./shared";
+import {
+  buildMoveCompletion,
+  moveBasePath,
+  moveContextKey,
+  resolveMoveCandidate,
+  selectedMovePath,
+  type MoveCompletion,
+  type MoveListing,
+} from "./move-completion";
 
 type ClientModel = { provider?: string; id?: string; name?: string };
 type ClientContext = {
@@ -294,16 +303,6 @@ let lastTranscriptSnapshot: TranscriptRenderSnapshot | null = null;
 let lastEmptyTranscriptContent: string | null = null;
 let commandSelection = 0;
 let dismissedCommandDraft: string | null = null;
-type MoveSuggestion = { name: string; path: string };
-type MoveCompletion = {
-  /** Exact text after `/move` this data describes. */
-  draft: string;
-  /** Directory the typed text resolves to, when it is one. */
-  resolvedPath: string | null;
-  suggestions: MoveSuggestion[];
-  loading: boolean;
-  error: string | null;
-};
 let moveCompletion: MoveCompletion | null = null;
 let moveCompletionTimer = 0;
 let moveCompletionSerial = 0;
@@ -1198,7 +1197,12 @@ function renderShell(): void {
     const menuOpen = !menu.classList.contains("hidden");
     const moveValue = moveDraft(prompt.value);
     const isMove = moveValue !== null;
-    const moveSuggestions = isMove ? (moveCompletion?.suggestions ?? []) : [];
+    // Only a completion for the active session/cwd may drive keyboard
+    // selection: a stale one would fill a path from another directory.
+    const moveSuggestions =
+      isMove && moveCompletion?.context === activeMoveContext()
+        ? moveCompletion.suggestions
+        : [];
     const matches = isMove ? [] : matchingCommands(prompt.value);
     const optionCount = isMove ? moveSuggestions.length : matches.length;
     if (menuOpen && optionCount > 0) {
@@ -1546,8 +1550,6 @@ function closeSidebarDrawer(): void {
   document.body.classList.remove("sidebar-open");
 }
 const MOVE_PROMPT_RE = /^\/move(?:\s+([^\n]*))?$/;
-/** The desktop overlay renders at most 20 matches; keep mobile equally bounded. */
-const MOVE_SUGGESTION_LIMIT = 20;
 
 /** Text typed after `/move`, or null when the prompt is another command. */
 function moveDraft(value: string): string | null {
@@ -1555,54 +1557,14 @@ function moveDraft(value: string): string | null {
   return match ? (match[1] ?? "").trim() : null;
 }
 
-/** Session cwd is the base for relative `/move` paths, as in the desktop overlay. */
-function moveBasePath(): string | undefined {
-  const cwd = activeState?.cwd;
-  return typeof cwd === "string" && cwd.startsWith("/")
-    ? cwd.replace(/\\/g, "/")
-    : undefined;
-}
-
-function resolveMoveCandidate(input: string, base: string | undefined): string {
-  const normalized = input.replace(/\\/g, "/");
-  if (
-    !normalized ||
-    normalized.startsWith("/") ||
-    normalized.startsWith("~") ||
-    !base
-  )
-    return normalized;
-  return `${base.replace(/\/+$/, "")}/${normalized}`;
-}
-
 /**
- * Split typed text into the directory to list and the leaf fragment to match.
- * A trailing slash means "list this directory"; otherwise the fragment is
- * filtered inside its parent, matching the desktop /move overlay.
+ * Identity of the session/cwd the active `/move` completion belongs to.
+ * Runtime and cwd both participate: switching slots or changing the session
+ * working directory invalidates anything resolved against the old context.
  */
-function splitMoveCandidate(
-  candidate: string,
-  input: string,
-): { parent: string; partial: string; exact: boolean } {
-  if (!input) return { parent: candidate, partial: "", exact: true };
-  if (candidate === "~") return { parent: "~", partial: "", exact: true };
-  if (candidate.endsWith("/"))
-    return {
-      parent: candidate.replace(/\/+$/, "") || "/",
-      partial: "",
-      exact: true,
-    };
-  const slash = candidate.lastIndexOf("/");
-  if (slash === -1)
-    return { parent: "", partial: candidate, exact: false };
-  return {
-    parent: candidate.slice(0, slash) || "/",
-    partial: candidate.slice(slash + 1),
-    exact: false,
-  };
+function activeMoveContext(): string {
+  return moveContextKey(activeId, activeState?.cwd);
 }
-
-type MoveListing = { listing: DirectoryListing | null; error: string | null };
 
 async function fetchMoveListing(path?: string): Promise<MoveListing> {
   try {
@@ -1620,76 +1582,44 @@ async function fetchMoveListing(path?: string): Promise<MoveListing> {
   }
 }
 
-function directorySuggestions(listing: DirectoryListing): MoveSuggestion[] {
-  return listing.entries
-    .filter((entry) => (entry.kind ?? "directory") === "directory")
-    .map((entry) => ({ name: entry.name, path: entry.path }))
-    .sort((a, b) =>
-      a.name.localeCompare(b.name, undefined, { sensitivity: "base" }),
-    );
+/**
+ * Drop the cached completion and cancel its pending fetch. Always bumps the
+ * serial so a response already in flight can no longer land.
+ */
+function resetMoveCompletion(): void {
+  window.clearTimeout(moveCompletionTimer);
+  moveCompletionSerial += 1;
+  moveCompletion = null;
 }
 
-async function buildMoveCompletion(
-  draft: string,
-): Promise<Omit<MoveCompletion, "draft" | "loading">> {
-  const input = draft.trim().replace(/\\/g, "/");
-  const base = moveBasePath();
-  const candidate = resolveMoveCandidate(input, base);
-  const { parent, partial, exact } = splitMoveCandidate(candidate, input);
-  let fetched = await fetchMoveListing(parent || undefined);
-  // An empty `/move` should still offer choices when the session cwd sits
-  // outside OMP_MOBILE_ROOT: fall back to the workspace root.
-  if (!fetched.listing && !input && base)
-    fetched = await fetchMoveListing();
-  const listing = fetched.listing;
-  if (!listing)
-    return {
-      resolvedPath: null,
-      suggestions: [],
-      error: fetched.error ?? "Directory unavailable",
-    };
-
-  const directories = directorySuggestions(listing);
-  if (exact)
-    return {
-      resolvedPath: input ? listing.path : null,
-      suggestions: directories.slice(0, MOVE_SUGGESTION_LIMIT),
-      error: null,
-    };
-
-  const exactEntry = directories.find((entry) => entry.name === partial);
-  if (exactEntry) {
-    const child = await fetchMoveListing(exactEntry.path);
-    return {
-      resolvedPath: exactEntry.path,
-      suggestions: child.listing
-        ? directorySuggestions(child.listing).slice(0, MOVE_SUGGESTION_LIMIT)
-        : [],
-      error: child.listing ? null : child.error,
-    };
-  }
-
-  const query = partial.toLowerCase();
-  return {
-    resolvedPath: null,
-    suggestions: (query
-      ? directories.filter((entry) =>
-          entry.name.toLowerCase().includes(query),
-        )
-      : directories
-    ).slice(0, MOVE_SUGGESTION_LIMIT),
-    error: null,
-  };
+/**
+ * Drop a completion that no longer matches the active session/cwd, keeping a
+ * visible move picker live by re-rendering it against the new context.
+ */
+function invalidateMoveCompletion(): void {
+  const hadCompletion = moveCompletion !== null;
+  resetMoveCompletion();
+  if (hadCompletion) renderCommandMenu();
 }
 
 function queueMoveCompletion(draft: string): void {
   window.clearTimeout(moveCompletionTimer);
   const serial = ++moveCompletionSerial;
+  const context = activeMoveContext();
+  const base = moveBasePath(activeState?.cwd);
   moveCompletionTimer = window.setTimeout(() => {
-    void buildMoveCompletion(draft).then((result) => {
+    void buildMoveCompletion(draft, base, fetchMoveListing).then((result) => {
       if (serial !== moveCompletionSerial) return;
-      if (moveCompletion?.draft !== draft) return;
-      moveCompletion = { draft, ...result, loading: false };
+      // The session cwd can change while a listing is in flight (a slot
+      // switch, resume, or `cd` reported by the next state refresh). Such a
+      // response belongs to another context and must never be shown or sent.
+      if (activeMoveContext() !== context) {
+        if (moveCompletion?.context === context) invalidateMoveCompletion();
+        return;
+      }
+      if (moveCompletion?.context !== context || moveCompletion.draft !== draft)
+        return;
+      moveCompletion = { context, draft, ...result, loading: false };
       renderCommandMenu();
     });
   }, 120);
@@ -1705,18 +1635,6 @@ function applyMoveSelection(path: string): void {
   resizePrompt();
   renderCommandMenu();
   prompt.focus();
-}
-
-/**
- * The path a move submission should use: an exact typed directory first, then
- * the highlighted suggestion (desktop's Enter behavior), then the raw text for
- * server-side validation and diagnostics.
- */
-function selectedMovePath(rawPath: string): string {
-  const completion = moveCompletion;
-  if (!completion || completion.draft !== rawPath) return rawPath;
-  if (completion.resolvedPath) return completion.resolvedPath;
-  return completion.suggestions[commandSelection]?.path ?? rawPath;
 }
 
 function hideCommandMenu(
@@ -1738,8 +1656,14 @@ function renderMoveMenu(
     hideCommandMenu(menu, prompt);
     return;
   }
-  if (!moveCompletion || moveCompletion.draft !== draft) {
+  const context = activeMoveContext();
+  if (
+    !moveCompletion ||
+    moveCompletion.context !== context ||
+    moveCompletion.draft !== draft
+  ) {
     moveCompletion = {
+      context,
       draft,
       resolvedPath: null,
       suggestions: [],
@@ -1932,9 +1856,7 @@ function selectSlot(id: SlotId): void {
   closeSidebarDrawer();
   dismissedCommandDraft = null;
   dismissedMoveDraft = null;
-  window.clearTimeout(moveCompletionTimer);
-  moveCompletion = null;
-  moveCompletionSerial += 1;
+  resetMoveCompletion();
   commandSelection = 0;
   if (id === activeId && activeState) {
     window.setTimeout(() => {
@@ -3934,6 +3856,10 @@ function reconcileActiveSlot(): void {
   if (activeId && slots.some((slot) => slot.id === activeId)) return;
   const prompt = document.querySelector<HTMLTextAreaElement>("#prompt");
   if (prompt && activeId) drafts.set(activeId, prompt.value);
+  // Falling back to another runtime (or none) changes the session identity:
+  // any `/move` listing belongs to the runtime that just disappeared.
+  dismissedMoveDraft = null;
+  resetMoveCompletion();
   activeId = slots[0]?.id ?? "";
   activeState = activeId ? cache.get(activeId) ?? null : null;
   stateError = null;
@@ -3998,9 +3924,14 @@ async function loadState(): Promise<void> {
       `/api/slots/${encodeURIComponent(targetId)}/state`,
     );
     if (request !== stateRequest || targetId !== activeId) return;
+    const previousContext = activeMoveContext();
     activeState = result;
     stateError = null;
     cache.set(targetId, result);
+    // A session can change working directory (resume, `/move`, or a `cd` in
+    // the desktop terminal); completions resolved against the old cwd must
+    // not survive into the new one.
+    if (activeMoveContext() !== previousContext) invalidateMoveCompletion();
     updateSlots();
     renderActive();
     window.setTimeout(() => {
@@ -4008,8 +3939,10 @@ async function loadState(): Promise<void> {
     }, 0);
   } catch (error: unknown) {
     if (request !== stateRequest || targetId !== activeId) return;
+    const previousContext = activeMoveContext();
     activeState = null;
     stateError = hasAuth(error) ? "access token rejected" : errorMessage(error);
+    if (activeMoveContext() !== previousContext) invalidateMoveCompletion();
     updateSlots();
     renderActive();
     if (hasAuth(error)) openTokenModal();
@@ -4293,9 +4226,17 @@ function sendPrompt(): void {
   const moveMatch = text.match(/^\/move(?:\s+(.*))?$/);
   if (moveMatch) {
     const rawPath = (moveMatch[1] || "").trim();
+    // `selectedMovePath` only trusts a completion from the current
+    // session/cwd; a stale one leaves the typed text, which then resolves
+    // against the live cwd rather than another directory.
     const chosenPath = resolveMoveCandidate(
-      selectedMovePath(rawPath),
-      moveBasePath(),
+      selectedMovePath(
+        moveCompletion,
+        activeMoveContext(),
+        rawPath,
+        commandSelection,
+      ),
+      moveBasePath(activeState?.cwd),
     );
     if (!chosenPath) {
       showToast("Specify a directory path for /move", true);

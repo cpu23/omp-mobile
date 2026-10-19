@@ -32,12 +32,14 @@ interrupts the current run so OMP drains the pending queue, matching desktop's e
 extension API exposes queue availability but not desktop-origin queued text, so those items appear as a generic notice.
 Restart the affected session for this extension update to take effect.
 
-Typing `/move` in the composer opens a directory picker instead of sending the command. Choices are listed as you type: absolute paths are used as-is, relative paths resolve from the session's working directory, `~` expands to the gateway user's home (still confined to `OMP_MOBILE_ROOT`), and a trailing slash (or selecting a folder) lists its subdirectories. Tapping a folder fills `/move <path>`; use the send button (or Enter) to move. Up/Down and Tab work with hardware keyboards, and Escape dismisses the list without affecting other slash commands.
+Typing `/move` in the composer opens a directory picker instead of sending the command. Choices are listed as you type: absolute paths are used as-is, relative paths resolve from the session's working directory, `~` expands to the gateway user's home (still confined to `OMP_MOBILE_ROOT`), and a trailing slash (or selecting a folder) lists its subdirectories. Tapping a folder fills `/move <path>`; use the send button (or Enter) to move. Up/Down and Tab work with hardware keyboards, and Escape dismisses the list without affecting other slash commands. Every listing is tied to the session and working directory it was resolved against: switching sessions, resuming another transcript, or a session whose cwd changed (`cd` in the desktop terminal, or a completed move) discards the cached picker, and a listing that arrives after such a change is ignored, so a destination from another working directory is never offered or submitted.
 
 While a session works, the composer shows the host's descriptive tool intent (for example “Trading installed graphics configuration”)
 with the spinner and shimmer, falling back to “Working…” only when the host exposes no intent for the current turn.
 Above the composer, a compact activity dock lists the session's todo phases and tasks as they update, including pending,
-in-progress, completed, abandoned and blocked rows with blocker notes. Subagent and background-job counts sit on an
+in-progress, completed, abandoned and blocked rows with blocker notes. The dock follows both todo sources in the branch:
+`todo` tool results and the user todo edits the host records as `user_todo_edit` custom entries, so a list changed from
+the desktop terminal (or cleared back to empty) shows the same way. Subagent and background-job counts sit on an
 expandable row: expanding it shows desktop-style per-agent rows (id, agent type, status, spawn description, current
 activity, tool/request/token/context/cost/duration/model, retry notes and terminal errors) and running or recently
 finished, failed or cancelled background jobs. `task` tool cards in the transcript carry the same subagent count and rows, so they

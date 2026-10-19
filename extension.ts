@@ -1024,7 +1024,19 @@ function taskActivityFromDetails(
   };
 }
 
-function collectBranchActivity(branch: unknown): {
+/**
+ * Host custom entry that records a user-authored todo edit. The host persists
+ * these in the branch as `{type: "custom", customType, data: {phases}}`
+ * instead of `todo` tool results, and its own reader
+ * (`getLatestTodoPhasesFromEntries`) treats both kinds as todo snapshots.
+ */
+const USER_TODO_EDIT_CUSTOM_TYPE = "user_todo_edit";
+
+/**
+ * Read the latest todo snapshot and task results from one branch. Exported for
+ * the branch-activity tests; the extension has no other caller.
+ */
+export function collectBranchActivity(branch: unknown): {
   todos: ActivityTodoPhase[];
   tasks: Map<string, TaskActivity>;
 } {
@@ -1034,6 +1046,21 @@ function collectBranchActivity(branch: unknown): {
   for (const entry of branch) {
     if (!entry || typeof entry !== "object") continue;
     const item = entry as Record<string, unknown>;
+    // User todo edits are custom entries, not tool results, but they take part
+    // in the same branch-ordered snapshot: an empty `phases` array clears the
+    // list just like a `todo` result does.
+    if (item.type === "custom") {
+      if (item.customType === USER_TODO_EDIT_CUSTOM_TYPE) {
+        const data = item.data;
+        const phases = normalizeTodoPhases(
+          data && typeof data === "object" && !Array.isArray(data)
+            ? (data as Record<string, unknown>).phases
+            : undefined,
+        );
+        if (phases) todos = phases;
+      }
+      continue;
+    }
     if (
       item.type !== "message" ||
       !item.message ||
