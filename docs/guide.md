@@ -32,6 +32,21 @@ interrupts the current run so OMP drains the pending queue, matching desktop's e
 extension API exposes queue availability but not desktop-origin queued text, so those items appear as a generic notice.
 Restart the affected session for this extension update to take effect.
 
+Typing `/move` in the composer opens a directory picker instead of sending the command. Choices are listed as you type: absolute paths are used as-is, relative paths resolve from the session's working directory, `~` expands to the gateway user's home (still confined to `OMP_MOBILE_ROOT`), and a trailing slash (or selecting a folder) lists its subdirectories. Tapping a folder fills `/move <path>`; use the send button (or Enter) to move. Up/Down and Tab work with hardware keyboards, and Escape dismisses the list without affecting other slash commands.
+
+While a session works, the composer shows the host's descriptive tool intent (for example “Trading installed graphics configuration”)
+with the spinner and shimmer, falling back to “Working…” only when the host exposes no intent for the current turn.
+Above the composer, a compact activity dock lists the session's todo phases and tasks as they update, including pending,
+in-progress, completed, abandoned and blocked rows with blocker notes. Subagent and background-job counts sit on an
+expandable row: expanding it shows desktop-style per-agent rows (id, agent type, status, spawn description, current
+activity, tool/request/token/context/cost/duration/model, retry notes and terminal errors) and running or recently
+finished, failed or cancelled background jobs. `task` tool cards in the transcript carry the same subagent count and rows, so they
+are distinct from ordinary wait/tool calls. Activity is rebuilt for the selected runtime and generation on every refresh;
+switching sessions drops expanded details and never carries another session's agents, jobs or todos. Todo, subagent and
+job rows are display-only — approvals, cancellation and further coordination remain on the desktop.
+Subagent rows use the host's task results and process-global agent registry; a host build without the registry export
+still shows persisted task results, but detached progress may lag until the next refresh.
+
 Working sessions show a spinner beside a shimmering sidebar title, without a separate “Working…” label.
 Live tool and Thinking indicators, the composer model label, and the effort slider's value and fill use the active session's accent.
 The effort button retains its effort-level color. The slider offers explicit effort levels only, excluding `inherit`.
@@ -125,12 +140,12 @@ transcripts. Acknowledging a completion is per runtime; tapping its notification
 | `GET /api/slots` | Live runtimes (`id`, title, cwd, status, `connected` and optional session file). |
 | `POST /api/slots` | Start in optional `cwd` under `OMP_MOBILE_ROOT`, or resume a saved session with `{resume: <path>}`. |
 | `DELETE /api/slots/:id` | Stop a daemon runtime. |
-| `GET /api/slots/:id/state` | Structured session state (model, effort, transcript, capabilities). |
+| `GET /api/slots/:id/state` | Structured session state (model, effort, transcript, capabilities, `activity`: current working intent, todos, subagents and background jobs). |
 | `POST /api/slots/:id/action` | Prompt, abort, model, effort, command or move; generation-guarded. |
 | `GET /api/slots/:id/terminal` | Read-only terminal snapshot. |
 | `GET /api/sessions` | Saved OMP sessions (id, path, cwd, title, update time and cost). |
 | `/api/notifications*` | Push configuration, status, subscriptions and per-runtime acknowledgement. |
-| `/api/directories`, `/api/pins` | Folder explorer and pinned working directories. |
+| `/api/directories`, `/api/pins` | Folder explorer, `/move` destination completion, and pinned working directories. |
 
 All API routes require the bearer token; mutations additionally require `Origin`.
 
@@ -145,7 +160,7 @@ Gateway (`server.ts`):
 | `OMP_MOBILE_PORT` | `4173` | Gateway port; always binds to `127.0.0.1`. |
 | `OMP_MOBILE_DESKTOP_URL` | `http://127.0.0.1:4180` | Daemon URL; must be a loopback HTTP origin without credentials or path. |
 | `OMP_MOBILE_IPC_DIR` | `~/.local/state/omp-mobile` | Per-runtime sockets and notification state. |
-| `OMP_MOBILE_ROOT` | `$HOME` | Folder browser, pins and new-session working-directory root; dot-directories are excluded. |
+| `OMP_MOBILE_ROOT` | `$HOME` | Folder browser, `/move` destinations, pins and new-session working-directory root; dot-directories are excluded. |
 | `OMP_DESKTOP_SESSIONS_DIR` | `~/.omp/agent/sessions` | Allowed resume-path root; saved-session listing comes from the daemon. |
 | `OMP_MOBILE_ORIGINS` | unset | Comma-separated additional allowed origins. |
 

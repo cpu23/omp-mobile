@@ -1,5 +1,7 @@
 import {
   isSlotId,
+  type ActivityJob,
+  type ActivitySubagent,
   type CapabilityMap,
   type CommandResponse,
   type CompletionMarker,
@@ -9,6 +11,7 @@ import {
   type MoveResponse,
   type OmpMessage,
   type PinsResponse,
+  type SessionActivity,
   type SessionSummary,
   type SessionsResponse,
   type SlotAction,
@@ -65,6 +68,7 @@ type ChatPart =
       output?: string;
       ask?: AskDisplay;
       isError?: boolean;
+      task?: { agents: ActivitySubagent[]; asyncState?: string };
     };
 type ChatMessage = {
   role: string;
@@ -290,6 +294,24 @@ let lastTranscriptSnapshot: TranscriptRenderSnapshot | null = null;
 let lastEmptyTranscriptContent: string | null = null;
 let commandSelection = 0;
 let dismissedCommandDraft: string | null = null;
+type MoveSuggestion = { name: string; path: string };
+type MoveCompletion = {
+  /** Exact text after `/move` this data describes. */
+  draft: string;
+  /** Directory the typed text resolves to, when it is one. */
+  resolvedPath: string | null;
+  suggestions: MoveSuggestion[];
+  loading: boolean;
+  error: string | null;
+};
+let moveCompletion: MoveCompletion | null = null;
+let moveCompletionTimer = 0;
+let moveCompletionSerial = 0;
+let dismissedMoveDraft: string | null = null;
+/** Expanded activity details, retained only for the session that opened them. */
+let activityExpanded = false;
+let activitySlot: SlotId | null = null;
+let lastComposerWorkingText = "";
 let unreadBySlot = new Map<SlotId, CompletionMarker[]>();
 let notificationConfig: NotificationConfig | null = null;
 let serviceWorkerRegistration: ServiceWorkerRegistration | null = null;
@@ -1049,7 +1071,7 @@ function renderShell(): void {
       </section>
     </aside><button class="sidebar-backdrop" id="sidebar-close" type="button" aria-label="Close sessions"></button>
     <section class="workspace"><div class="capabilities hidden" id="capabilities"></div><div class="transcript" id="transcript" tabindex="0" aria-label="Session transcript"></div><pre class="raw-view hidden" id="raw-view" tabindex="0" aria-label="Raw terminal output"></pre><button class="scroll-fab hidden" id="scroll-bottom" type="button" aria-label="Scroll to bottom">${ICONS.arrowDown}</button></section></main>
-    <div class="composer-dock"><form class="composer" id="composer"><div class="command-menu hidden" id="command-menu" role="listbox" aria-label="Slash commands"></div><div class="composer-ctx"></div><div class="composer-working hidden" id="composer-working"><span class="working-spinner">${SPINNER_FRAMES[0]}</span><span class="shimmer shimmer-accent">${shimmerMarkup("Working…")}</span></div><div class="composer-input"><textarea id="prompt" rows="1" placeholder="Message this session…" aria-label="Message this session" aria-autocomplete="list" aria-controls="command-menu" aria-expanded="false"></textarea></div><div class="composer-tools"><div class="composer-meta" id="composer-meta"><button type="button" class="ghost-btn" id="model-open">Model</button><button type="button" class="ghost-btn" id="effort-open">Effort</button><span id="ctx-label"></span><span id="cost-label"></span></div><button type="button" class="abort-btn hidden" id="abort">Stop</button><button type="submit" class="send-btn" id="send">Send</button></div></form>
+    <div class="composer-dock"><section class="activity-dock hidden" id="activity-dock" aria-label="Session activity"><div class="activity-todos" id="activity-todos"></div><button type="button" class="activity-summary" id="activity-toggle" aria-expanded="false" aria-controls="activity-details"><span class="activity-chips" id="activity-chips"></span><span class="activity-toggle-label" id="activity-toggle-label">Details</span></button><div class="activity-details hidden" id="activity-details"></div></section><form class="composer" id="composer"><div class="command-menu hidden" id="command-menu" role="listbox" aria-label="Slash commands"></div><div class="composer-ctx"></div><div class="composer-working hidden" id="composer-working" role="status" aria-live="polite"><span class="working-spinner" aria-hidden="true">${SPINNER_FRAMES[0]}</span><span class="shimmer shimmer-accent" id="composer-working-text">${shimmerMarkup("Working…")}</span></div><div class="composer-input"><textarea id="prompt" rows="1" placeholder="Message this session…" aria-label="Message this session" aria-autocomplete="list" aria-controls="command-menu" aria-expanded="false"></textarea></div><div class="composer-tools"><div class="composer-meta" id="composer-meta"><button type="button" class="ghost-btn" id="model-open">Model</button><button type="button" class="ghost-btn" id="effort-open">Effort</button><span id="ctx-label"></span><span id="cost-label"></span></div><button type="button" class="abort-btn hidden" id="abort">Stop</button><button type="submit" class="send-btn" id="send">Send</button></div></form>
   </div>`;
   const sidebar = requiredElement<HTMLElement>("#sidebar");
   const menu = requiredElement<HTMLButtonElement>("#menu-open");
@@ -1072,6 +1094,15 @@ function renderShell(): void {
   requiredElement<HTMLButtonElement>("#sidebar-close").addEventListener(
     "click",
     closeSidebar,
+  );
+  requiredElement<HTMLButtonElement>("#activity-toggle").addEventListener(
+    "click",
+    () => {
+      activityExpanded = !activityExpanded;
+      activitySlot = activeId;
+      renderActivity(activeState);
+      syncAnimation();
+    },
   );
   requiredElement<HTMLButtonElement>("#pin-open").addEventListener(
     "click",
@@ -1157,40 +1188,63 @@ function renderShell(): void {
   prompt.addEventListener("input", () => {
     drafts.set(activeId, prompt.value);
     dismissedCommandDraft = null;
+    dismissedMoveDraft = null;
     commandSelection = 0;
     resizePrompt();
     renderCommandMenu();
   });
   prompt.addEventListener("keydown", (event: KeyboardEvent) => {
-    const matches = matchingCommands(prompt.value);
-    const menuOpen = !requiredElement<HTMLElement>("#command-menu").classList.contains(
-      "hidden",
-    );
-    if (menuOpen && matches.length > 0) {
+    const menu = requiredElement<HTMLElement>("#command-menu");
+    const menuOpen = !menu.classList.contains("hidden");
+    const moveValue = moveDraft(prompt.value);
+    const isMove = moveValue !== null;
+    const moveSuggestions = isMove ? (moveCompletion?.suggestions ?? []) : [];
+    const matches = isMove ? [] : matchingCommands(prompt.value);
+    const optionCount = isMove ? moveSuggestions.length : matches.length;
+    if (menuOpen && optionCount > 0) {
       if (event.key === "ArrowDown" || event.key === "ArrowUp") {
         event.preventDefault();
         const direction = event.key === "ArrowDown" ? 1 : -1;
         commandSelection =
-          (commandSelection + direction + matches.length) % matches.length;
+          (commandSelection + direction + optionCount) % optionCount;
         renderCommandMenu();
         return;
       }
-      if (
-        event.key === "Tab" ||
-        (event.key === "Enter" &&
-          !event.shiftKey &&
-          `/${matches[commandSelection]?.name}` !== prompt.value.trim())
-      ) {
+      if (event.key === "Tab") {
         event.preventDefault();
-        selectCommand(matches[commandSelection]);
+        if (isMove) {
+          const suggestion = moveSuggestions[commandSelection];
+          if (suggestion) applyMoveSelection(suggestion.path);
+        } else {
+          selectCommand(matches[commandSelection]);
+        }
         return;
       }
       if (event.key === "Escape") {
         event.preventDefault();
         dismissedCommandDraft = prompt.value;
+        dismissedMoveDraft = prompt.value;
         renderCommandMenu();
         return;
       }
+      // Enter for a move confirmation falls through to sendPrompt, which
+      // submits the typed directory or the highlighted suggestion.
+      if (
+        !isMove &&
+        event.key === "Enter" &&
+        !event.shiftKey &&
+        `/${matches[commandSelection]?.name}` !== prompt.value.trim()
+      ) {
+        event.preventDefault();
+        selectCommand(matches[commandSelection]);
+        return;
+      }
+    } else if (menuOpen && event.key === "Escape") {
+      event.preventDefault();
+      dismissedCommandDraft = prompt.value;
+      dismissedMoveDraft = prompt.value;
+      renderCommandMenu();
+      return;
     }
     if (event.key === "Enter" && !event.shiftKey && !event.isComposing) {
       event.preventDefault();
@@ -1491,6 +1545,260 @@ function closeSidebarDrawer(): void {
     ?.setAttribute("aria-expanded", "false");
   document.body.classList.remove("sidebar-open");
 }
+const MOVE_PROMPT_RE = /^\/move(?:\s+([^\n]*))?$/;
+/** The desktop overlay renders at most 20 matches; keep mobile equally bounded. */
+const MOVE_SUGGESTION_LIMIT = 20;
+
+/** Text typed after `/move`, or null when the prompt is another command. */
+function moveDraft(value: string): string | null {
+  const match = value.match(MOVE_PROMPT_RE);
+  return match ? (match[1] ?? "").trim() : null;
+}
+
+/** Session cwd is the base for relative `/move` paths, as in the desktop overlay. */
+function moveBasePath(): string | undefined {
+  const cwd = activeState?.cwd;
+  return typeof cwd === "string" && cwd.startsWith("/")
+    ? cwd.replace(/\\/g, "/")
+    : undefined;
+}
+
+function resolveMoveCandidate(input: string, base: string | undefined): string {
+  const normalized = input.replace(/\\/g, "/");
+  if (
+    !normalized ||
+    normalized.startsWith("/") ||
+    normalized.startsWith("~") ||
+    !base
+  )
+    return normalized;
+  return `${base.replace(/\/+$/, "")}/${normalized}`;
+}
+
+/**
+ * Split typed text into the directory to list and the leaf fragment to match.
+ * A trailing slash means "list this directory"; otherwise the fragment is
+ * filtered inside its parent, matching the desktop /move overlay.
+ */
+function splitMoveCandidate(
+  candidate: string,
+  input: string,
+): { parent: string; partial: string; exact: boolean } {
+  if (!input) return { parent: candidate, partial: "", exact: true };
+  if (candidate === "~") return { parent: "~", partial: "", exact: true };
+  if (candidate.endsWith("/"))
+    return {
+      parent: candidate.replace(/\/+$/, "") || "/",
+      partial: "",
+      exact: true,
+    };
+  const slash = candidate.lastIndexOf("/");
+  if (slash === -1)
+    return { parent: "", partial: candidate, exact: false };
+  return {
+    parent: candidate.slice(0, slash) || "/",
+    partial: candidate.slice(slash + 1),
+    exact: false,
+  };
+}
+
+type MoveListing = { listing: DirectoryListing | null; error: string | null };
+
+async function fetchMoveListing(path?: string): Promise<MoveListing> {
+  try {
+    return {
+      listing: await api<DirectoryResponse>(
+        path
+          ? `/api/directories?path=${encodeURIComponent(path)}`
+          : "/api/directories",
+      ),
+      error: null,
+    };
+  } catch (error: unknown) {
+    if (hasAuth(error)) openTokenModal();
+    return { listing: null, error: errorMessage(error) };
+  }
+}
+
+function directorySuggestions(listing: DirectoryListing): MoveSuggestion[] {
+  return listing.entries
+    .filter((entry) => (entry.kind ?? "directory") === "directory")
+    .map((entry) => ({ name: entry.name, path: entry.path }))
+    .sort((a, b) =>
+      a.name.localeCompare(b.name, undefined, { sensitivity: "base" }),
+    );
+}
+
+async function buildMoveCompletion(
+  draft: string,
+): Promise<Omit<MoveCompletion, "draft" | "loading">> {
+  const input = draft.trim().replace(/\\/g, "/");
+  const base = moveBasePath();
+  const candidate = resolveMoveCandidate(input, base);
+  const { parent, partial, exact } = splitMoveCandidate(candidate, input);
+  let fetched = await fetchMoveListing(parent || undefined);
+  // An empty `/move` should still offer choices when the session cwd sits
+  // outside OMP_MOBILE_ROOT: fall back to the workspace root.
+  if (!fetched.listing && !input && base)
+    fetched = await fetchMoveListing();
+  const listing = fetched.listing;
+  if (!listing)
+    return {
+      resolvedPath: null,
+      suggestions: [],
+      error: fetched.error ?? "Directory unavailable",
+    };
+
+  const directories = directorySuggestions(listing);
+  if (exact)
+    return {
+      resolvedPath: input ? listing.path : null,
+      suggestions: directories.slice(0, MOVE_SUGGESTION_LIMIT),
+      error: null,
+    };
+
+  const exactEntry = directories.find((entry) => entry.name === partial);
+  if (exactEntry) {
+    const child = await fetchMoveListing(exactEntry.path);
+    return {
+      resolvedPath: exactEntry.path,
+      suggestions: child.listing
+        ? directorySuggestions(child.listing).slice(0, MOVE_SUGGESTION_LIMIT)
+        : [],
+      error: child.listing ? null : child.error,
+    };
+  }
+
+  const query = partial.toLowerCase();
+  return {
+    resolvedPath: null,
+    suggestions: (query
+      ? directories.filter((entry) =>
+          entry.name.toLowerCase().includes(query),
+        )
+      : directories
+    ).slice(0, MOVE_SUGGESTION_LIMIT),
+    error: null,
+  };
+}
+
+function queueMoveCompletion(draft: string): void {
+  window.clearTimeout(moveCompletionTimer);
+  const serial = ++moveCompletionSerial;
+  moveCompletionTimer = window.setTimeout(() => {
+    void buildMoveCompletion(draft).then((result) => {
+      if (serial !== moveCompletionSerial) return;
+      if (moveCompletion?.draft !== draft) return;
+      moveCompletion = { draft, ...result, loading: false };
+      renderCommandMenu();
+    });
+  }, 120);
+}
+
+function applyMoveSelection(path: string): void {
+  const prompt = requiredElement<HTMLTextAreaElement>("#prompt");
+  prompt.value = `/move ${path}`;
+  drafts.set(activeId, prompt.value);
+  dismissedCommandDraft = null;
+  dismissedMoveDraft = null;
+  commandSelection = 0;
+  resizePrompt();
+  renderCommandMenu();
+  prompt.focus();
+}
+
+/**
+ * The path a move submission should use: an exact typed directory first, then
+ * the highlighted suggestion (desktop's Enter behavior), then the raw text for
+ * server-side validation and diagnostics.
+ */
+function selectedMovePath(rawPath: string): string {
+  const completion = moveCompletion;
+  if (!completion || completion.draft !== rawPath) return rawPath;
+  if (completion.resolvedPath) return completion.resolvedPath;
+  return completion.suggestions[commandSelection]?.path ?? rawPath;
+}
+
+function hideCommandMenu(
+  menu: HTMLElement,
+  prompt: HTMLTextAreaElement,
+): void {
+  menu.replaceChildren();
+  menu.classList.add("hidden");
+  prompt.setAttribute("aria-expanded", "false");
+  prompt.removeAttribute("aria-activedescendant");
+}
+
+function renderMoveMenu(
+  menu: HTMLElement,
+  prompt: HTMLTextAreaElement,
+  draft: string,
+): void {
+  if (dismissedMoveDraft === prompt.value) {
+    hideCommandMenu(menu, prompt);
+    return;
+  }
+  if (!moveCompletion || moveCompletion.draft !== draft) {
+    moveCompletion = {
+      draft,
+      resolvedPath: null,
+      suggestions: [],
+      loading: true,
+      error: null,
+    };
+    queueMoveCompletion(draft);
+  }
+  const completion = moveCompletion;
+  if (!completion) return;
+  const options = completion.suggestions;
+  if (options.length === 0) commandSelection = 0;
+  else commandSelection = Math.min(commandSelection, options.length - 1);
+
+  menu.setAttribute("aria-label", "Move destination directories");
+  const status = completion.loading
+    ? "Searching directories…"
+    : completion.error
+      ? completion.error
+      : draft
+        ? completion.resolvedPath
+          ? "No subdirectories. Send to move here."
+          : "No matching directories"
+        : "No subdirectories";
+  const rows = options
+    .map(
+      (suggestion, index) =>
+        `<button type="button" id="command-option-${index}" class="command-option directory-option${index === commandSelection ? " selected" : ""}" role="option" aria-selected="${index === commandSelection}" data-move-path="${esc(suggestion.path)}" aria-label="Fill ${esc(suggestion.path)}"><strong>${esc(suggestion.name)}/</strong><span>${esc(suggestion.path)}</span></button>`,
+    )
+    .join("");
+  menu.innerHTML =
+    (options.length
+      ? rows
+      : `<div class="command-status${completion.error ? " error" : ""}" role="presentation">${esc(status)}</div>`) +
+    `<div class="command-hint" role="presentation">Tap a folder to fill the path · Enter moves</div>`;
+  menu.classList.remove("hidden");
+  prompt.setAttribute("aria-expanded", "true");
+  if (options.length) {
+    prompt.setAttribute(
+      "aria-activedescendant",
+      `command-option-${commandSelection}`,
+    );
+    menu
+      .querySelector<HTMLElement>(`#command-option-${commandSelection}`)
+      ?.scrollIntoView({ block: "nearest" });
+  } else {
+    prompt.removeAttribute("aria-activedescendant");
+  }
+  menu
+    .querySelectorAll<HTMLButtonElement>("[data-move-path]")
+    .forEach((button) => {
+      button.addEventListener("pointerdown", (event) => event.preventDefault());
+      button.addEventListener("click", () => {
+        const path = button.dataset.movePath;
+        if (path) applyMoveSelection(path);
+      });
+    });
+}
+
 function matchingCommands(value: string): SlashCommand[] {
   const match = value.match(/^\/([^\s/]*)$/);
   if (!match || dismissedCommandDraft === value) return [];
@@ -1546,12 +1854,15 @@ function renderCommandMenu(): void {
   const menu = document.querySelector<HTMLElement>("#command-menu");
   const prompt = document.querySelector<HTMLTextAreaElement>("#prompt");
   if (!menu || !prompt) return;
+  const moveValue = moveDraft(prompt.value);
+  if (moveValue !== null) {
+    renderMoveMenu(menu, prompt, moveValue);
+    return;
+  }
+  menu.setAttribute("aria-label", "Slash commands");
   const matches = matchingCommands(prompt.value);
   if (matches.length === 0) {
-    menu.replaceChildren();
-    menu.classList.add("hidden");
-    prompt.setAttribute("aria-expanded", "false");
-    prompt.removeAttribute("aria-activedescendant");
+    hideCommandMenu(menu, prompt);
     return;
   }
   commandSelection = Math.min(commandSelection, matches.length - 1);
@@ -1620,6 +1931,10 @@ function selectSlot(id: SlotId): void {
   closeEffortPopover();
   closeSidebarDrawer();
   dismissedCommandDraft = null;
+  dismissedMoveDraft = null;
+  window.clearTimeout(moveCompletionTimer);
+  moveCompletion = null;
+  moveCompletionSerial += 1;
   commandSelection = 0;
   if (id === activeId && activeState) {
     window.setTimeout(() => {
@@ -2672,6 +2987,167 @@ function appendAskCard(
   parent.append(card);
 }
 
+const AGENT_STATUS_LABEL: Record<string, string> = {
+  pending: "queued",
+  running: "running",
+  completed: "done",
+  failed: "failed",
+  aborted: "aborted",
+};
+
+function formatActivityNumber(value: number): string {
+  if (value >= 1_000_000) return `${(value / 1_000_000).toFixed(1)}M`;
+  if (value >= 1_000) return `${(value / 1_000).toFixed(1)}k`;
+  return String(Math.round(value));
+}
+
+function formatActivityDuration(ms: number): string {
+  if (!Number.isFinite(ms) || ms < 0) return "";
+  if (ms < 1000) return "<1s";
+  const seconds = Math.round(ms / 1000);
+  if (seconds < 60) return `${seconds}s`;
+  const minutes = Math.floor(seconds / 60);
+  const rest = seconds % 60;
+  if (minutes < 60) return rest ? `${minutes}m ${rest}s` : `${minutes}m`;
+  const hours = Math.floor(minutes / 60);
+  return `${hours}h ${minutes % 60}m`;
+}
+
+type TaskRows = Extract<ChatPart, { kind: "tool" }>["task"];
+
+function sameTaskRows(a: TaskRows, b: TaskRows): boolean {
+  if (a === b) return true;
+  if (!a || !b || a.asyncState !== b.asyncState) return false;
+  if (a.agents.length !== b.agents.length) return false;
+  return JSON.stringify(a.agents) === JSON.stringify(b.agents);
+}
+
+/**
+ * Desktop-style agent rows shared by the activity drawer and `task` tool cards:
+ * identity + status, the spawn description/task, then live activity and usage.
+ */
+function appendAgentRows(parent: HTMLElement, agents: ActivitySubagent[]): void {
+  if (agents.length === 0) return;
+  const list = document.createElement("div");
+  list.className = "activity-agents";
+  for (const agent of agents) {
+    const row = document.createElement("div");
+    row.className = `activity-agent is-${agent.status}`;
+    const head = document.createElement("div");
+    head.className = "activity-agent-head";
+    const name = document.createElement("span");
+    name.className = "activity-agent-name";
+    name.textContent = agent.label || agent.id;
+    head.append(name);
+    if (agent.agent) {
+      const type = document.createElement("span");
+      type.className = "activity-agent-type";
+      type.textContent = agent.agent;
+      head.append(type);
+    }
+    if (agent.detached) {
+      const detached = document.createElement("span");
+      detached.className = "activity-agent-type";
+      detached.textContent = "background";
+      head.append(detached);
+    }
+    const state = document.createElement("span");
+    state.className = "activity-agent-state";
+    state.textContent = AGENT_STATUS_LABEL[agent.status] ?? agent.status;
+    head.append(state);
+    row.append(head);
+
+    const detail = agent.description || agent.task;
+    if (detail) {
+      const body = document.createElement("div");
+      body.className = "activity-agent-task";
+      body.textContent = detail;
+      row.append(body);
+    }
+
+    const meta = document.createElement("div");
+    meta.className = "activity-agent-meta";
+    const push = (text: string | undefined): void => {
+      if (!text) return;
+      const part = document.createElement("span");
+      part.textContent = text;
+      meta.append(part);
+    };
+    if (agent.currentTool) {
+      push(
+        agent.activity && agent.activity !== agent.currentTool
+          ? `${agent.currentTool}: ${agent.activity}`
+          : agent.currentTool,
+      );
+    } else {
+      push(agent.activity);
+    }
+    if (agent.toolCount) push(`${formatActivityNumber(agent.toolCount)} tools`);
+    if (agent.requests && agent.requests !== agent.toolCount)
+      push(`${formatActivityNumber(agent.requests)} req`);
+    if (agent.tokens) push(`${formatActivityNumber(agent.tokens)} tok`);
+    if (agent.contextTokens && agent.contextWindow)
+      push(
+        `${Math.round((agent.contextTokens / agent.contextWindow) * 100)}% ctx`,
+      );
+    if (agent.cost && agent.cost > 0) push(`$${agent.cost.toFixed(2)}`);
+    if (agent.durationMs !== undefined)
+      push(formatActivityDuration(agent.durationMs));
+    if (agent.model) push(agent.model);
+    if (meta.childElementCount > 0) row.append(meta);
+
+    if (agent.note) {
+      const note = document.createElement("div");
+      note.className = "activity-agent-note";
+      note.textContent = agent.note;
+      row.append(note);
+    }
+    if (agent.error) {
+      const error = document.createElement("div");
+      error.className = "activity-agent-error";
+      error.textContent = agent.error;
+      row.append(error);
+    }
+    list.append(row);
+  }
+  parent.append(list);
+}
+
+function appendJobRows(parent: HTMLElement, jobs: ActivityJob[], now: number): void {
+  if (jobs.length === 0) return;
+  const list = document.createElement("div");
+  list.className = "activity-jobs";
+  for (const job of jobs) {
+    const row = document.createElement("div");
+    row.className = `activity-job is-${job.status}`;
+    const head = document.createElement("div");
+    head.className = "activity-job-head";
+    const label = document.createElement("span");
+    label.className = "activity-job-name";
+    label.textContent = job.label;
+    head.append(label);
+    const type = document.createElement("span");
+    type.className = "activity-agent-type";
+    type.textContent = job.type;
+    head.append(type);
+    const state = document.createElement("span");
+    state.className = "activity-agent-state";
+    state.textContent = job.status;
+    head.append(state);
+    row.append(head);
+    const durationMs =
+      job.durationMs ?? (job.status === "running" ? now - job.startedAt : undefined);
+    if (durationMs !== undefined && durationMs >= 0) {
+      const meta = document.createElement("div");
+      meta.className = "activity-agent-meta";
+      meta.textContent = formatActivityDuration(durationMs);
+      row.append(meta);
+    }
+    list.append(row);
+  }
+  parent.append(list);
+}
+
 function sameTranscriptPart(a: ChatPart, b: ChatPart): boolean {
   if (a === b) return true;
   if (!a || !b || a.kind !== b.kind) return false;
@@ -2687,6 +3163,7 @@ function sameTranscriptPart(a: ChatPart, b: ChatPart): boolean {
       a.summary === b.summary &&
       a.output === b.output &&
       a.isError === b.isError &&
+      sameTaskRows(a.task, b.task) &&
       sameAskDisplay(a.ask, b.ask)
     );
   return false;
@@ -2905,6 +3382,8 @@ function renderMessages(messages: ClientMessage[], active = false): void {
         }
         const details = document.createElement("details");
         details.className = `part part-tool${part.isError ? " part-error" : ""}`;
+        const taskAgents = part.task?.agents ?? [];
+        if (taskAgents.length > 0) details.classList.add("part-task");
         const toolMsgKey = msgKey;
         const toolId = part.id || `${part.name}-${partIndex}`;
         const toolKey = `${activeId}:${activeState?.generation}:${toolMsgKey}:tool:${toolId}`;
@@ -2921,10 +3400,21 @@ function renderMessages(messages: ClientMessage[], active = false): void {
         let line = part.summary
           ? `→ ${part.name}(${part.summary})`
           : `→ ${part.name}()`;
+        if (taskAgents.length > 0) {
+          const running = taskAgents.filter(
+            (agent) => agent.status === "running" || agent.status === "pending",
+          ).length;
+          line += ` · ${taskAgents.length} subagent${taskAgents.length === 1 ? "" : "s"}`;
+          if (running > 0) line += ` (${running} running)`;
+        }
         if (line.length > 90) {
           line = line.slice(0, 87) + "…";
         }
-        const live = liveMessage && part.output === undefined;
+        const live =
+          (liveMessage && part.output === undefined) ||
+          taskAgents.some(
+            (agent) => agent.status === "running" || agent.status === "pending",
+          );
         if (live) {
           summary.classList.add("live");
           const glyph = document.createElement("span");
@@ -2938,6 +3428,13 @@ function renderMessages(messages: ClientMessage[], active = false): void {
           summary.textContent = line;
         }
         details.append(summary);
+
+        if (taskAgents.length > 0) {
+          const taskBody = document.createElement("div");
+          taskBody.className = "part-task-body";
+          appendAgentRows(taskBody, taskAgents);
+          details.append(taskBody);
+        }
 
         if (part.output != null && part.output !== "") {
           const pre = document.createElement("pre");
@@ -3050,6 +3547,142 @@ async function loadRawTerminal(): Promise<void> {
   }
 }
 
+const TODO_MARKER: Record<string, string> = {
+  pending: "○",
+  in_progress: "◐",
+  completed: "✓",
+  abandoned: "–",
+  blocked: "!",
+};
+const TODO_STATE_LABEL: Record<string, string> = {
+  pending: "pending",
+  in_progress: "in progress",
+  completed: "completed",
+  abandoned: "abandoned",
+  blocked: "blocked",
+};
+
+/**
+ * Compact activity surface above the composer, mirroring desktop's sticky HUD:
+ * the todo list is always visible; subagent/background-job counts expand into
+ * per-agent rows with task, current activity and usage.
+ */
+function renderActivity(state: ClientState | null): void {
+  const dock = document.querySelector<HTMLElement>("#activity-dock");
+  const todosEl = document.querySelector<HTMLElement>("#activity-todos");
+  const toggle = document.querySelector<HTMLButtonElement>("#activity-toggle");
+  const chips = document.querySelector<HTMLElement>("#activity-chips");
+  const label = document.querySelector<HTMLElement>("#activity-toggle-label");
+  const details = document.querySelector<HTMLElement>("#activity-details");
+  if (!dock || !todosEl || !toggle || !chips || !label || !details) return;
+
+  if (activitySlot !== activeId) {
+    activitySlot = activeId;
+    activityExpanded = false;
+  }
+  const activity: SessionActivity | undefined = state?.activity;
+  const todoPhases = (activity?.todos ?? []).filter(
+    (phase) => phase.tasks.length > 0,
+  );
+  const agents = activity?.subagents ?? [];
+  const jobs = activity?.jobs ?? [];
+  const runningAgents = agents.filter(
+    (agent) => agent.status === "running",
+  ).length;
+  const runningJobs = jobs.filter((job) => job.status === "running").length;
+  const hasTodos = todoPhases.length > 0;
+  const hasDetails = agents.length > 0 || jobs.length > 0;
+  const visible = hasTodos || hasDetails;
+  dock.classList.toggle("hidden", !visible);
+  if (!visible) {
+    details.classList.add("hidden");
+    return;
+  }
+
+  if (hasTodos) {
+    const todoRows = todoPhases
+      .map((phase) => {
+        const rows = phase.tasks
+          .map((todo) => {
+            const status = TODO_STATE_LABEL[todo.status] ?? todo.status;
+            return `<div class="activity-todo is-${esc(todo.status)}" aria-label="${esc(`${status}: ${todo.content}`)}"><span class="activity-todo-marker" aria-hidden="true">${esc(TODO_MARKER[todo.status] ?? "○")}</span><span class="activity-todo-text">${esc(todo.content)}</span>${todo.blocker ? `<span class="activity-todo-blocker">${esc(todo.blocker)}</span>` : ""}</div>`;
+          })
+          .join("");
+        return `<div class="activity-todo-phase">${esc(phase.name)}</div>${rows}`;
+      })
+      .join("");
+    const tasks = todoPhases.flatMap((phase) => phase.tasks);
+    const finished = tasks.filter(
+      (todo) => todo.status === "completed" || todo.status === "abandoned",
+    ).length;
+    todosEl.innerHTML = `<div class="activity-section-head">Todos<span>${finished}/${tasks.length} done</span></div>${todoRows}`;
+    todosEl.classList.remove("hidden");
+  } else {
+    todosEl.innerHTML = "";
+    todosEl.classList.add("hidden");
+  }
+
+  const chipParts: string[] = [];
+  if (agents.length > 0) {
+    chipParts.push(
+      `<span class="activity-chip">${runningAgents} running · ${agents.length} subagent${agents.length === 1 ? "" : "s"}</span>`,
+    );
+  }
+  if (jobs.length > 0) {
+    chipParts.push(
+      `<span class="activity-chip">${runningJobs} running · ${jobs.length} job${jobs.length === 1 ? "" : "s"}</span>`,
+    );
+  }
+  chips.innerHTML = chipParts.join("");
+  toggle.classList.toggle("hidden", !hasDetails);
+  toggle.setAttribute("aria-expanded", activityExpanded ? "true" : "false");
+  label.textContent = activityExpanded ? "Hide" : "Details";
+  if (!hasDetails || !activityExpanded) {
+    details.classList.add("hidden");
+    details.innerHTML = "";
+    return;
+  }
+
+  details.innerHTML = "";
+  if (agents.length > 0) {
+    const section = document.createElement("div");
+    section.className = "activity-section";
+    const heading = document.createElement("div");
+    heading.className = "activity-section-head";
+    heading.innerHTML = `Subagents<span>${runningAgents} running</span>`;
+    section.append(heading);
+    appendAgentRows(section, agents);
+    details.append(section);
+  }
+  if (jobs.length > 0) {
+    const section = document.createElement("div");
+    section.className = "activity-section";
+    const heading = document.createElement("div");
+    heading.className = "activity-section-head";
+    heading.innerHTML = `Background jobs<span>${runningJobs} running</span>`;
+    section.append(heading);
+    appendJobRows(section, jobs, Date.now());
+    details.append(section);
+  }
+  details.classList.remove("hidden");
+}
+
+/** Use the host's descriptive tool intent; the generic label is a fallback. */
+function renderComposerWorking(active: boolean, state: ClientState | null): void {
+  const box = document.querySelector<HTMLElement>("#composer-working");
+  const holder = document.querySelector<HTMLElement>("#composer-working-text");
+  if (!box || !holder) return;
+  box.classList.toggle("hidden", !active);
+  if (!active) return;
+  const text = state?.activity?.working?.trim() || "Working…";
+  box.title = text;
+  if (text !== lastComposerWorkingText) {
+    holder.innerHTML = shimmerMarkup(text);
+    lastComposerWorkingText = text;
+    syncAnimation();
+  }
+}
+
 function renderActive(): void {
   const slot = slotById(activeId);
   const state = activeState;
@@ -3128,10 +3761,8 @@ function renderActive(): void {
     "aria-label",
     forceReady ? "Force queued messages now" : "Send message",
   );
-  requiredElement<HTMLElement>("#composer-working").classList.toggle(
-    "hidden",
-    !active,
-  );
+  renderComposerWorking(active, state);
+  renderActivity(state);
   const caps = requiredElement<HTMLDivElement>("#capabilities");
   let notice = "";
   if ((state?.pendingApproval ?? 0) > 0) {
@@ -3613,6 +4244,7 @@ function handleSendSuccess(targetId: SlotId, draftAtSend: string): void {
     drafts.set(targetId, "");
     resizePrompt();
     dismissedCommandDraft = null;
+    dismissedMoveDraft = null;
     renderCommandMenu();
   }
 }
@@ -3658,10 +4290,14 @@ function sendPrompt(): void {
     return;
   }
 
-  const moveMatch = text.match(/^\/move(?:\s+(.+))?$/);
+  const moveMatch = text.match(/^\/move(?:\s+(.*))?$/);
   if (moveMatch) {
     const rawPath = (moveMatch[1] || "").trim();
-    if (!rawPath) {
+    const chosenPath = resolveMoveCandidate(
+      selectedMovePath(rawPath),
+      moveBasePath(),
+    );
+    if (!chosenPath) {
       showToast("Specify a directory path for /move", true);
       return;
     }
@@ -3676,7 +4312,7 @@ function sendPrompt(): void {
       return;
     }
     void sendAction(
-      { type: "move", path: rawPath, confirmed: true },
+      { type: "move", path: chosenPath, confirmed: true },
       targetId,
       targetState,
     ).then((sent) => {
@@ -4079,7 +4715,11 @@ function selectDirectory(dirPath: string): void {
   const command = `/move ${dirPath}`;
   prompt.value = command;
   drafts.set(activeId, command);
+  dismissedCommandDraft = null;
+  dismissedMoveDraft = null;
+  commandSelection = 0;
   resizePrompt();
+  renderCommandMenu();
   closeModal();
   prompt.focus();
 }

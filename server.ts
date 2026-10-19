@@ -17,10 +17,15 @@ import { Terminal as HeadlessTerminal } from "@xterm/headless";
 import {
   API_VERSION,
   isSlotId,
+  type ActivityAgentStatus,
+  type ActivityJob,
+  type ActivitySubagent,
+  type ActivityTodoPhase,
   type CapabilityMap,
   type DirectoryListing,
   type CommandResponse,
   type MoveResponse,
+  type SessionActivity,
   type SessionSummary,
   type SlotAction,
   type SlotState,
@@ -958,6 +963,181 @@ async function terminalAction(id: string, request: Request): Promise<Response> {
   return json({ ok: true, generation: body.generation });
 }
 
+function activityText(value: unknown, max: number): string | undefined {
+  if (typeof value !== "string") return undefined;
+  const text = value.replace(/\s+/g, " ").trim();
+  return text ? text.slice(0, max) : undefined;
+}
+
+function finiteNumber(
+  value: unknown,
+  min = 0,
+  max = 1e15,
+): number | undefined {
+  return typeof value === "number" &&
+    Number.isFinite(value) &&
+    value >= min &&
+    value <= max
+    ? value
+    : undefined;
+}
+
+/**
+ * Bound and validate the extension's activity projection before it crosses the
+ * gateway. The extension already caps arrays and strings, but the gateway is
+ * the trust boundary for anything a browser renders.
+ */
+function normaliseActivity(value: unknown): SessionActivity | undefined {
+  if (!value || typeof value !== "object" || Array.isArray(value))
+    return undefined;
+  const raw = value as Record<string, unknown>;
+
+  const todos: ActivityTodoPhase[] = [];
+  if (Array.isArray(raw.todos)) {
+    for (const rawPhase of raw.todos.slice(0, 12)) {
+      if (!rawPhase || typeof rawPhase !== "object" || Array.isArray(rawPhase))
+        continue;
+      const phase = rawPhase as Record<string, unknown>;
+      const name = activityText(phase.name, 120);
+      if (!name || !Array.isArray(phase.tasks)) continue;
+      const tasks = phase.tasks.slice(0, 40).flatMap<ActivityTodoPhase["tasks"][number]>((rawTask) => {
+        if (!rawTask || typeof rawTask !== "object" || Array.isArray(rawTask))
+          return [];
+        const task = rawTask as Record<string, unknown>;
+        const content = activityText(task.content, 400);
+        const status = task.status;
+        if (
+          !content ||
+          (status !== "pending" &&
+            status !== "in_progress" &&
+            status !== "completed" &&
+            status !== "abandoned" &&
+            status !== "blocked")
+        )
+          return [];
+        const blocker = activityText(task.blocker, 200);
+        return [{ content, status, ...(blocker ? { blocker } : {}) }];
+      });
+      todos.push({ name, tasks });
+    }
+  }
+
+  const subagents: ActivitySubagent[] = [];
+  if (Array.isArray(raw.subagents)) {
+    for (const rawAgent of raw.subagents.slice(0, 16)) {
+      if (!rawAgent || typeof rawAgent !== "object" || Array.isArray(rawAgent))
+        continue;
+      const agent = rawAgent as Record<string, unknown>;
+      const id = activityText(agent.id, 160);
+      const status = agent.status;
+      if (
+        !id ||
+        (status !== "pending" &&
+          status !== "running" &&
+          status !== "completed" &&
+          status !== "failed" &&
+          status !== "aborted")
+      )
+        continue;
+      const subagent: ActivitySubagent = {
+        id,
+        status: status as ActivityAgentStatus,
+      };
+      const label = activityText(agent.label, 160);
+      const type = activityText(agent.agent, 80);
+      const description = activityText(agent.description, 200);
+      const task = activityText(agent.task, 600);
+      const activity = activityText(agent.activity, 300);
+      const currentTool = activityText(agent.currentTool, 120);
+      const model = activityText(agent.model, 160);
+      const error = activityText(agent.error, 400);
+      const note = activityText(agent.note, 240);
+      if (label) subagent.label = label;
+      if (type) subagent.agent = type;
+      if (description) subagent.description = description;
+      if (task) subagent.task = task;
+      if (activity) subagent.activity = activity;
+      if (currentTool) subagent.currentTool = currentTool;
+      if (model) subagent.model = model;
+      if (error) subagent.error = error;
+      if (note) subagent.note = note;
+      if (agent.detached === true) subagent.detached = true;
+      const startedAt = finiteNumber(agent.startedAt);
+      const updatedAt = finiteNumber(agent.updatedAt);
+      const durationMs = finiteNumber(agent.durationMs);
+      const toolCount = finiteNumber(agent.toolCount);
+      const requests = finiteNumber(agent.requests);
+      const tokens = finiteNumber(agent.tokens);
+      const cost = finiteNumber(agent.cost, 0, 1e9);
+      const contextTokens = finiteNumber(agent.contextTokens);
+      const contextWindow = finiteNumber(agent.contextWindow);
+      if (startedAt !== undefined) subagent.startedAt = startedAt;
+      if (updatedAt !== undefined) subagent.updatedAt = updatedAt;
+      if (durationMs !== undefined) subagent.durationMs = durationMs;
+      if (toolCount !== undefined) subagent.toolCount = toolCount;
+      if (requests !== undefined) subagent.requests = requests;
+      if (tokens !== undefined) subagent.tokens = tokens;
+      if (cost !== undefined) subagent.cost = cost;
+      if (contextTokens !== undefined) subagent.contextTokens = contextTokens;
+      if (contextWindow !== undefined) subagent.contextWindow = contextWindow;
+      subagents.push(subagent);
+    }
+  }
+
+  const jobs: ActivityJob[] = [];
+  if (Array.isArray(raw.jobs)) {
+    for (const rawJob of raw.jobs.slice(0, 16)) {
+      if (!rawJob || typeof rawJob !== "object" || Array.isArray(rawJob))
+        continue;
+      const job = rawJob as Record<string, unknown>;
+      const id = activityText(job.id, 120);
+      const label = activityText(job.label, 200);
+      const status = job.status;
+      if (
+        !id ||
+        !label ||
+        (status !== "running" &&
+          status !== "completed" &&
+          status !== "failed" &&
+          status !== "cancelled")
+      )
+        continue;
+      const startedAt = finiteNumber(job.startedAt);
+      if (startedAt === undefined) continue;
+      jobs.push({
+        id,
+        type: job.type === "bash" ? "bash" : job.type === "task" ? "task" : "other",
+        label,
+        status,
+        startedAt,
+        ...(finiteNumber(job.durationMs) !== undefined
+          ? { durationMs: finiteNumber(job.durationMs) }
+          : {}),
+      });
+    }
+  }
+
+  const working = activityText(raw.working, 300);
+  const workingTool = activityText(raw.workingTool, 120);
+  const since = finiteNumber(raw.since);
+  if (
+    !working &&
+    !workingTool &&
+    todos.length === 0 &&
+    subagents.length === 0 &&
+    jobs.length === 0
+  )
+    return undefined;
+  return {
+    ...(working ? { working } : {}),
+    ...(workingTool ? { workingTool } : {}),
+    ...(since !== undefined ? { since } : {}),
+    todos,
+    subagents,
+    jobs,
+  };
+}
+
 function normaliseState(raw: Record<string, unknown>): SlotState | undefined {
   const generationValue = raw.generation ?? raw.sessionGeneration;
   if (generationValue === undefined || generationValue === null)
@@ -1052,6 +1232,7 @@ function normaliseState(raw: Record<string, unknown>): SlotState | undefined {
     raw.editor && typeof raw.editor === "object"
       ? (raw.editor as Record<string, unknown>)
       : undefined;
+  const activity = normaliseActivity(raw.activity);
   return {
     apiVersion: API_VERSION,
     generation: String(generationValue),
@@ -1065,6 +1246,7 @@ function normaliseState(raw: Record<string, unknown>): SlotState | undefined {
     ...(typeof raw.agentActive === "boolean"
       ? { agentActive: raw.agentActive }
       : {}),
+    ...(activity ? { activity } : {}),
     theme: raw.theme ?? null,
     commands,
     messages,
@@ -1222,9 +1404,10 @@ async function slotAction(slot: string, request: Request): Promise<Response> {
         400,
         "move requires explicit confirmation and a path without controls",
       );
-    const inputPath = body.path.startsWith("/")
-      ? body.path
-      : join(WORKSPACE_ROOT, body.path);
+    const requestedPath = expandHomePath(body.path);
+    const inputPath = requestedPath.startsWith("/")
+      ? requestedPath
+      : join(WORKSPACE_ROOT, requestedPath);
     const normalizedPath = await realPathWithin(resolve(inputPath));
     if (!normalizedPath)
       return errorResponse(
@@ -1331,9 +1514,19 @@ async function slotAction(slot: string, request: Request): Promise<Response> {
 /* Filesystem, static assets, notifications                                   */
 /* -------------------------------------------------------------------------- */
 
+/**
+ * Desktop's `/move` accepts `~` and `~/…`. Expand it here, then enforce the
+ * same workspace confinement as every other browsable path.
+ */
+function expandHomePath(input: string): string {
+  if (input === "~") return HOME;
+  return input.startsWith("~/") ? join(HOME, input.slice(2)) : input;
+}
+
 async function directoryListing(request: Request): Promise<Response> {
-  const requested =
-    new URL(request.url).searchParams.get("path") ?? WORKSPACE_ROOT;
+  const requested = expandHomePath(
+    new URL(request.url).searchParams.get("path") ?? WORKSPACE_ROOT,
+  );
   const candidate = resolve(
     requested.startsWith("/") ? requested : join(WORKSPACE_ROOT, requested),
   );
