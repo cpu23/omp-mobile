@@ -103,6 +103,7 @@ type MobileState = {
   editor: { available: boolean; empty: boolean | null; reason?: string };
   completion?: CompletionMarker;
   agentActive: boolean;
+  activity: SessionActivity;
   hasPendingMessages: boolean;
   pendingMessages: PendingMobileMessage[];
   title?: string;
@@ -160,6 +161,8 @@ type ChatPart =
       output?: string;
       ask?: AskDisplay;
       isError?: boolean;
+      /** Desktop-style subagent rows for `task` tool calls. */
+      task?: TaskActivity;
     };
 
 type ChatMessage = {
@@ -168,6 +171,102 @@ type ChatMessage = {
   timestamp: string | null;
   parts: ChatPart[];
 };
+
+type ActivityTodoStatus =
+  | "pending"
+  | "in_progress"
+  | "completed"
+  | "abandoned"
+  | "blocked";
+type ActivityTodo = {
+  content: string;
+  status: ActivityTodoStatus;
+  blocker?: string;
+};
+type ActivityTodoPhase = { name: string; tasks: ActivityTodo[] };
+type ActivityAgentStatus =
+  | "pending"
+  | "running"
+  | "completed"
+  | "failed"
+  | "aborted";
+type ActivitySubagent = {
+  id: string;
+  label?: string;
+  agent?: string;
+  status: ActivityAgentStatus;
+  description?: string;
+  task?: string;
+  activity?: string;
+  currentTool?: string;
+  model?: string;
+  startedAt?: number;
+  updatedAt?: number;
+  durationMs?: number;
+  toolCount?: number;
+  requests?: number;
+  tokens?: number;
+  cost?: number;
+  contextTokens?: number;
+  contextWindow?: number;
+  error?: string;
+  note?: string;
+  detached?: boolean;
+};
+type ActivityJob = {
+  id: string;
+  type: "bash" | "task" | "other";
+  label: string;
+  status: "running" | "completed" | "failed" | "cancelled";
+  startedAt: number;
+  durationMs?: number;
+};
+type SessionActivity = {
+  working?: string;
+  workingTool?: string;
+  since?: number;
+  todos: ActivityTodoPhase[];
+  subagents: ActivitySubagent[];
+  jobs: ActivityJob[];
+};
+/** Internal transcript annotation: which task tool call spawned which agents. */
+type TaskActivity = {
+  agents: ActivitySubagent[];
+  asyncState?: "running" | "completed" | "failed";
+};
+/** Minimal shape of the host's process-global subagent registry. */
+type HostAgentRef = {
+  id: string;
+  displayName: string;
+  kind: string;
+  parentId?: string;
+  status: string;
+  activity?: string;
+  createdAt: number;
+  lastActivity: number;
+  sessionFile: string | null;
+  session?: { sessionId?: string } | null;
+  history?: {
+    modelRole?: string;
+    resolvedModel?: string;
+    metrics?: {
+      tokens?: number;
+      requests?: number;
+      tools?: number;
+      cost?: number;
+      durationMs?: number;
+    };
+  };
+};
+type HostAgentRegistry = { list(): HostAgentRef[] };
+type HostJobItem = {
+  id: string;
+  type: string;
+  status: string;
+  label: string;
+  startTime: number;
+};
+type HostJobSnapshot = { running: HostJobItem[]; recent: HostJobItem[] };
 type MobileServer = { stop(closeActiveConnections?: boolean): void };
 
 /**
@@ -615,6 +714,376 @@ function parseToolArguments(value: unknown): Record<string, unknown> | undefined
   }
 }
 
+const ACTIVITY_TEXT_MAX = 600;
+const ACTIVITY_TODO_MAX = 40;
+const ACTIVITY_PHASES_MAX = 12;
+const ACTIVITY_AGENTS_MAX = 12;
+const ACTIVITY_JOBS_MAX = 12;
+
+function asFiniteNumber(value: unknown): number | undefined {
+  return typeof value === "number" && Number.isFinite(value) ? value : undefined;
+}
+
+function activityText(value: unknown, max = ACTIVITY_TEXT_MAX): string | undefined {
+  const text = asString(value);
+  if (!text) return undefined;
+  const flat = text.replace(/\r?\n/g, " ").replace(/\s+/g, " ").trim();
+  if (!flat) return undefined;
+  return flat.length <= max ? flat : `${flat.slice(0, max - 1)}…`;
+}
+
+function todoStatus(value: unknown): ActivityTodoStatus | undefined {
+  return value === "pending" ||
+    value === "in_progress" ||
+    value === "completed" ||
+    value === "abandoned" ||
+    value === "blocked"
+    ? value
+    : undefined;
+}
+
+/**
+ * Read a persisted todo snapshot from a `todo` tool result. The host stores the
+ * full phased list in `details.phases`; an empty array is valid and clears the
+ * list, so it must be returned rather than treated as "no snapshot".
+ */
+function normalizeTodoPhases(value: unknown): ActivityTodoPhase[] | undefined {
+  if (!Array.isArray(value)) return undefined;
+  const phases: ActivityTodoPhase[] = [];
+  for (const rawPhase of value.slice(0, ACTIVITY_PHASES_MAX)) {
+    if (!rawPhase || typeof rawPhase !== "object" || Array.isArray(rawPhase))
+      continue;
+    const phase = rawPhase as Record<string, unknown>;
+    const name = activityText(phase.name, 120);
+    if (!name || !Array.isArray(phase.tasks)) continue;
+    const tasks: ActivityTodo[] = [];
+    for (const rawTask of phase.tasks.slice(0, ACTIVITY_TODO_MAX)) {
+      if (!rawTask || typeof rawTask !== "object" || Array.isArray(rawTask))
+        continue;
+      const task = rawTask as Record<string, unknown>;
+      const content = activityText(task.content, 400);
+      const status = todoStatus(task.status);
+      if (!content || !status) continue;
+      const blocker = activityText(task.blocker, 200);
+      tasks.push({
+        content,
+        status,
+        ...(blocker ? { blocker } : {}),
+      });
+    }
+    phases.push({ name, tasks });
+  }
+  return phases;
+}
+
+function agentStatus(value: unknown): ActivityAgentStatus | undefined {
+  return value === "pending" ||
+    value === "running" ||
+    value === "completed" ||
+    value === "failed" ||
+    value === "aborted"
+    ? value
+    : undefined;
+}
+
+function resultOutcome(result: Record<string, unknown>): ActivityAgentStatus {
+  if (result.aborted === true) return "aborted";
+  if (result.error !== undefined && result.error !== null) return "failed";
+  const exitCode = asFiniteNumber(result.exitCode);
+  if (exitCode !== undefined && exitCode !== 0) return "failed";
+  return "completed";
+}
+
+function resultCost(result: Record<string, unknown>): number | undefined {
+  const usage = result.usage;
+  if (!usage || typeof usage !== "object" || Array.isArray(usage))
+    return undefined;
+  const cost = (usage as Record<string, unknown>).cost;
+  if (!cost || typeof cost !== "object" || Array.isArray(cost))
+    return undefined;
+  return asFiniteNumber((cost as Record<string, unknown>).total);
+}
+
+/**
+ * Project a `task` tool result/update into desktop's AgentProgress rows. The
+ * host exposes the same `details.progress` snapshot its TUI renders, including
+ * per-agent status, assignment, latest intent, current tool, and usage.
+ */
+function taskActivityFromDetails(
+  details: unknown,
+  previous?: TaskActivity,
+): TaskActivity | undefined {
+  const value = parseToolArguments(details);
+  if (!value) return previous;
+  const rawProgress = Array.isArray(value.progress) ? value.progress : [];
+  const rawResults = Array.isArray(value.results) ? value.results : [];
+  const asyncState =
+    value.async && typeof value.async === "object"
+      ? asString((value.async as Record<string, unknown>).state)
+      : undefined;
+  const resultsById = new Map<string, Record<string, unknown>>();
+  const resultsByIndex = new Map<number, Record<string, unknown>>();
+  for (const raw of rawResults) {
+    if (!raw || typeof raw !== "object" || Array.isArray(raw)) continue;
+    const result = raw as Record<string, unknown>;
+    const id = asString(result.id) ?? asString(result.agentId);
+    if (id) resultsById.set(id, result);
+    const index = asFiniteNumber(result.index);
+    if (index !== undefined) resultsByIndex.set(index, result);
+  }
+  const merged = new Map<string, ActivitySubagent>();
+  for (const existing of previous?.agents ?? []) {
+    merged.set(existing.id, { ...existing });
+  }
+  rawProgress.forEach((raw, position) => {
+    if (!raw || typeof raw !== "object" || Array.isArray(raw)) return;
+    const progress = raw as Record<string, unknown>;
+    const index = asFiniteNumber(progress.index) ?? position;
+    const id =
+      asString(progress.id) ?? asString(progress.agentId) ?? `task-${index}`;
+    const result = resultsById.get(id) ?? resultsByIndex.get(index);
+    const status = result
+      ? resultOutcome(result)
+      : (agentStatus(progress.status) ?? "running");
+    const retryState =
+      progress.retryState &&
+      typeof progress.retryState === "object" &&
+      !Array.isArray(progress.retryState)
+        ? (progress.retryState as Record<string, unknown>)
+        : undefined;
+    const retryFailure =
+      progress.retryFailure &&
+      typeof progress.retryFailure === "object" &&
+      !Array.isArray(progress.retryFailure)
+        ? (progress.retryFailure as Record<string, unknown>)
+        : undefined;
+    const attempt = asFiniteNumber(retryState?.attempt);
+    const maxAttempts = asFiniteNumber(retryState?.maxAttempts);
+    const retryMessage = activityText(
+      retryState?.errorMessage ?? retryFailure?.errorMessage,
+      240,
+    );
+    const note =
+      status === "running" && retryState && attempt !== undefined
+        ? `retrying ${attempt}/${maxAttempts ?? "?"}${retryMessage ? `: ${retryMessage}` : ""}`
+        : retryFailure && (status === "failed" || status === "aborted")
+          ? `retry gave up${retryMessage ? `: ${retryMessage}` : ""}`
+          : undefined;
+    const previousAgent = merged.get(id);
+    const description = activityText(
+      progress.description ?? result?.description,
+      200,
+    );
+    const task = activityText(
+      progress.assignment ??
+        progress.task ??
+        result?.assignment ??
+        result?.task,
+      ACTIVITY_TEXT_MAX,
+    );
+    const currentTool = activityText(
+      progress.currentTool ?? result?.toolName,
+      120,
+    );
+    const activity = activityText(
+      progress.lastIntent ?? progress.currentToolArgs ?? currentTool,
+      300,
+    );
+    const error = activityText(
+      result?.error ?? result?.abortReason ?? retryFailure?.errorMessage,
+      400,
+    );
+    const agent: ActivitySubagent = {
+      id,
+      status,
+      ...(previousAgent?.label ? { label: previousAgent.label } : {}),
+      ...(asString(progress.agent) ?? asString(result?.agent)
+        ? { agent: asString(progress.agent) ?? asString(result?.agent) }
+        : {}),
+      ...(description ? { description } : {}),
+      ...(task ? { task } : previousAgent?.task ? { task: previousAgent.task } : {}),
+      ...(activity ? { activity } : previousAgent?.activity ? { activity: previousAgent.activity } : {}),
+      ...(currentTool
+        ? { currentTool }
+        : previousAgent?.currentTool
+          ? { currentTool: previousAgent.currentTool }
+          : {}),
+      ...(asString(result?.resolvedModel) ?? asString(progress.resolvedModel)
+        ? {
+            model:
+              asString(result?.resolvedModel) ??
+              asString(progress.resolvedModel),
+          }
+        : previousAgent?.model
+          ? { model: previousAgent.model }
+          : {}),
+      ...(previousAgent?.startedAt !== undefined
+        ? { startedAt: previousAgent.startedAt }
+        : {}),
+      ...(asFiniteNumber(progress.durationMs) !== undefined
+        ? { durationMs: asFiniteNumber(progress.durationMs) }
+        : result && asFiniteNumber(result.durationMs) !== undefined
+          ? { durationMs: asFiniteNumber(result.durationMs) }
+          : previousAgent?.durationMs !== undefined
+            ? { durationMs: previousAgent.durationMs }
+            : {}),
+      ...(asFiniteNumber(progress.toolCount) !== undefined
+        ? { toolCount: asFiniteNumber(progress.toolCount) }
+        : previousAgent?.toolCount !== undefined
+          ? { toolCount: previousAgent.toolCount }
+          : {}),
+      ...(asFiniteNumber(progress.requests) !== undefined
+        ? { requests: asFiniteNumber(progress.requests) }
+        : previousAgent?.requests !== undefined
+          ? { requests: previousAgent.requests }
+          : {}),
+      ...(asFiniteNumber(progress.tokens) !== undefined
+        ? { tokens: asFiniteNumber(progress.tokens) }
+        : asFiniteNumber(result?.tokens) !== undefined
+          ? { tokens: asFiniteNumber(result?.tokens) }
+          : previousAgent?.tokens !== undefined
+            ? { tokens: previousAgent.tokens }
+            : {}),
+      ...(asFiniteNumber(progress.cost) !== undefined
+        ? { cost: asFiniteNumber(progress.cost) }
+        : resultCost(result ?? {}) !== undefined
+          ? { cost: resultCost(result ?? {}) }
+          : previousAgent?.cost !== undefined
+            ? { cost: previousAgent.cost }
+            : {}),
+      ...(asFiniteNumber(progress.contextTokens) !== undefined
+        ? { contextTokens: asFiniteNumber(progress.contextTokens) }
+        : previousAgent?.contextTokens !== undefined
+          ? { contextTokens: previousAgent.contextTokens }
+          : {}),
+      ...(asFiniteNumber(progress.contextWindow) !== undefined
+        ? { contextWindow: asFiniteNumber(progress.contextWindow) }
+        : previousAgent?.contextWindow !== undefined
+          ? { contextWindow: previousAgent.contextWindow }
+          : {}),
+      ...(error ? { error } : previousAgent?.error ? { error: previousAgent.error } : {}),
+      ...(note ? { note } : previousAgent?.note ? { note: previousAgent.note } : {}),
+    };
+    if (asyncState === "running" && (status === "running" || status === "pending"))
+      agent.detached = true;
+    merged.set(id, agent);
+  });
+  // Completed blocking spawns can appear only in `results` when a mixed call
+  // returns before the progress snapshot is refreshed.
+  rawResults.forEach((raw) => {
+    if (!raw || typeof raw !== "object" || Array.isArray(raw)) return;
+    const result = raw as Record<string, unknown>;
+    const id = asString(result.id) ?? asString(result.agentId);
+    if (!id || merged.has(id)) return;
+    const status = resultOutcome(result);
+    merged.set(id, {
+      id,
+      status,
+      ...(asString(result.agent) ? { agent: asString(result.agent) } : {}),
+      ...(activityText(result.description, 200)
+        ? { description: activityText(result.description, 200) }
+        : {}),
+      ...(activityText(result.assignment ?? result.task, ACTIVITY_TEXT_MAX)
+        ? {
+            task: activityText(
+              result.assignment ?? result.task,
+              ACTIVITY_TEXT_MAX,
+            ),
+          }
+        : {}),
+      ...(activityText(result.error ?? result.abortReason, 400)
+        ? { error: activityText(result.error ?? result.abortReason, 400) }
+        : {}),
+      ...(asFiniteNumber(result.durationMs) !== undefined
+        ? { durationMs: asFiniteNumber(result.durationMs) }
+        : {}),
+      ...(asFiniteNumber(result.requests) !== undefined
+        ? { requests: asFiniteNumber(result.requests) }
+        : {}),
+      ...(asFiniteNumber(result.tokens) !== undefined
+        ? { tokens: asFiniteNumber(result.tokens) }
+        : {}),
+      ...(resultCost(result) !== undefined ? { cost: resultCost(result) } : {}),
+      ...(asFiniteNumber(result.contextTokens) !== undefined
+        ? { contextTokens: asFiniteNumber(result.contextTokens) }
+        : {}),
+      ...(asFiniteNumber(result.contextWindow) !== undefined
+        ? { contextWindow: asFiniteNumber(result.contextWindow) }
+        : {}),
+      ...(asString(result.resolvedModel) ? { model: asString(result.resolvedModel) } : {}),
+    });
+  });
+  if (merged.size === 0 && !asyncState) return previous;
+  return {
+    agents: [...merged.values()],
+    ...(asyncState === "running" ||
+    asyncState === "completed" ||
+    asyncState === "failed"
+      ? { asyncState }
+      : {}),
+  };
+}
+
+/**
+ * Host custom entry that records a user-authored todo edit. The host persists
+ * these in the branch as `{type: "custom", customType, data: {phases}}`
+ * instead of `todo` tool results, and its own reader
+ * (`getLatestTodoPhasesFromEntries`) treats both kinds as todo snapshots.
+ */
+const USER_TODO_EDIT_CUSTOM_TYPE = "user_todo_edit";
+
+/**
+ * Read the latest todo snapshot and task results from one branch. Exported for
+ * the branch-activity tests; the extension has no other caller.
+ */
+export function collectBranchActivity(branch: unknown): {
+  todos: ActivityTodoPhase[];
+  tasks: Map<string, TaskActivity>;
+} {
+  const tasks = new Map<string, TaskActivity>();
+  let todos: ActivityTodoPhase[] = [];
+  if (!Array.isArray(branch)) return { todos, tasks };
+  for (const entry of branch) {
+    if (!entry || typeof entry !== "object") continue;
+    const item = entry as Record<string, unknown>;
+    // User todo edits are custom entries, not tool results, but they take part
+    // in the same branch-ordered snapshot: an empty `phases` array clears the
+    // list just like a `todo` result does.
+    if (item.type === "custom") {
+      if (item.customType === USER_TODO_EDIT_CUSTOM_TYPE) {
+        const data = item.data;
+        const phases = normalizeTodoPhases(
+          data && typeof data === "object" && !Array.isArray(data)
+            ? (data as Record<string, unknown>).phases
+            : undefined,
+        );
+        if (phases) todos = phases;
+      }
+      continue;
+    }
+    if (
+      item.type !== "message" ||
+      !item.message ||
+      typeof item.message !== "object"
+    )
+      continue;
+    const raw = item.message as Record<string, unknown>;
+    const toolCallId = asString(raw.toolCallId) ?? asString(raw.id);
+    const toolName = asString(raw.toolName) ?? asString(raw.name);
+    const details = parseToolArguments(raw.details);
+    const isError = raw.isError === true;
+    if (toolName === "todo" && !isError) {
+      const phases = normalizeTodoPhases(details?.phases);
+      if (phases) todos = phases;
+    }
+    if (toolName === "task") {
+      const activity = taskActivityFromDetails(details);
+      if (activity && toolCallId) tasks.set(toolCallId, activity);
+    }
+  }
+  return { todos, tasks };
+}
+
 function normalizeAskQuestion(value: unknown): AskQuestion | undefined {
   if (!value || typeof value !== "object" || Array.isArray(value))
     return undefined;
@@ -751,7 +1220,10 @@ function askDisplay(
   };
 }
 
-function transcript(branch: unknown): ChatMessage[] {
+function transcript(
+  branch: unknown,
+  taskActivity: Map<string, TaskActivity> = new Map(),
+): ChatMessage[] {
   if (!Array.isArray(branch)) return [];
 
   const toolCalls = new Map<
@@ -862,6 +1334,9 @@ function transcript(branch: unknown): ChatMessage[] {
           (raw.details as Record<string, unknown>)?.error === true);
 
       const ask = askDisplay(name, args, raw.details, true);
+      const task =
+        taskActivity.get(toolCallId) ??
+        taskActivityFromDetails(raw.details);
       const part: ChatPart = {
         kind: "tool",
         id: toolCallId,
@@ -870,6 +1345,7 @@ function transcript(branch: unknown): ChatMessage[] {
         ...(output !== undefined ? { output } : {}),
         ...(ask ? { ask } : {}),
         ...(isError ? { isError: true } : {}),
+        ...(task && task.agents.length > 0 ? { task } : {}),
       };
 
       messages.push({
@@ -953,12 +1429,14 @@ function transcript(branch: unknown): ChatMessage[] {
               );
               const summary = formatToolCallSummary(name, args);
               const ask = askDisplay(name, args, undefined, false);
+              const task = taskActivity.get(id);
               parts.push({
                 kind: "tool",
                 id,
                 name,
                 summary,
                 ...(ask ? { ask } : {}),
+                ...(task && task.agents.length > 0 ? { task } : {}),
               });
             }
           }
@@ -1105,12 +1583,25 @@ export default function registerMobileRemote(pi: ExtensionAPI): void {
   }> = [];
   let ownsSocket = false;
   let stopped = false;
+  /** Last model-authored tool intent, the text OMP's own loader shows. */
+  let workingIntent: string | undefined;
+  let workingSince: number | undefined;
+  const runningTools = new Map<string, string>();
+  const liveTaskDetails = new Map<string, unknown>();
+
+  function resetWorkingState(): void {
+    workingIntent = undefined;
+    workingSince = undefined;
+    runningTools.clear();
+    liveTaskDetails.clear();
+  }
 
   function resetCompletion(): void {
     agentActive = false;
     turnNumber = 0;
     completion = undefined;
     streamingMessage = undefined;
+    resetWorkingState();
   }
 
   function loggerError(message: string, error?: unknown): void {
@@ -1218,6 +1709,7 @@ export default function registerMobileRemote(pi: ExtensionAPI): void {
     if (agentActive) return;
     agentActive = true;
     turnNumber += 1;
+    resetWorkingState();
   }
 
   function observeAgentEnd(ctx: ExtensionContext): void {
@@ -1225,6 +1717,7 @@ export default function registerMobileRemote(pi: ExtensionAPI): void {
     if (!agentActive) return;
     agentActive = false;
     streamingMessage = undefined;
+    resetWorkingState();
     const completedAt = Date.now();
     completion = {
       identity: `${generation}:${turnNumber}`,
@@ -1294,6 +1787,227 @@ export default function registerMobileRemote(pi: ExtensionAPI): void {
     };
   }
 
+  /**
+   * The host exposes `AgentRegistry` from its SDK module (`pi.pi`). Access it
+   * reflectively: older hosts without the export still get transcript-derived
+   * subagent rows, and a missing registry can never break state.
+   */
+  function hostAgentRegistry(): HostAgentRegistry | undefined {
+    try {
+      const module = pi.pi as unknown as {
+        AgentRegistry?: { global?: () => unknown };
+      };
+      const global = module.AgentRegistry?.global;
+      if (typeof global !== "function") return undefined;
+      const registry = global.call(module.AgentRegistry);
+      return registry &&
+        typeof (registry as HostAgentRegistry).list === "function"
+        ? (registry as HostAgentRegistry)
+        : undefined;
+    } catch {
+      return undefined;
+    }
+  }
+
+  /**
+   * Merge persisted task results, live tool updates, the agent registry, and
+   * async jobs into one generation-scoped activity snapshot. The registry is
+   * filtered through this session's main agent id so another runtime in the
+   * same process can never leak subagents onto this phone.
+   */
+  function buildActivity(
+    ctx: ExtensionContext,
+    branch: unknown,
+    now: number,
+  ): { activity: SessionActivity; tasks: Map<string, TaskActivity> } {
+    const collected = collectBranchActivity(branch);
+    for (const [toolCallId, details] of liveTaskDetails) {
+      const live = taskActivityFromDetails(details, collected.tasks.get(toolCallId));
+      if (live) collected.tasks.set(toolCallId, live);
+    }
+    const agentsById = new Map<string, ActivitySubagent>();
+    for (const task of collected.tasks.values()) {
+      for (const agent of task.agents) {
+        const previous = agentsById.get(agent.id);
+        agentsById.set(
+          agent.id,
+          previous ? { ...previous, ...agent } : { ...agent },
+        );
+      }
+    }
+
+    const registry = hostAgentRegistry();
+    if (registry) {
+      let refs: HostAgentRef[] = [];
+      try {
+        refs = registry.list();
+      } catch {
+        refs = [];
+      }
+      const refsById = new Map(refs.map((ref) => [ref.id, ref]));
+      const sessionFile = ctx.sessionManager.getSessionFile() ?? null;
+      const sessionId = ctx.sessionManager.getSessionId();
+      const mains = refs.filter((ref) => ref.kind === "main");
+      const ownMain =
+        mains.find(
+          (ref) =>
+            (sessionFile !== null && ref.sessionFile === sessionFile) ||
+            ref.session?.sessionId === sessionId,
+        ) ?? (mains.length === 1 ? mains[0] : undefined);
+      const allowed = new Set(agentsById.keys());
+      const belongsToSession = (ref: HostAgentRef): boolean => {
+        if (allowed.has(ref.id)) return true;
+        const seen = new Set<string>();
+        let current: HostAgentRef | undefined = ref;
+        while (current?.parentId && !seen.has(current.parentId)) {
+          seen.add(current.parentId);
+          if (current.parentId === ownMain?.id) return true;
+          if (allowed.has(current.parentId)) return true;
+          current = refsById.get(current.parentId);
+        }
+        return false;
+      };
+      for (const ref of refs) {
+        if (ref.kind !== "sub" || !belongsToSession(ref)) continue;
+        allowed.add(ref.id);
+        const base = agentsById.get(ref.id);
+        const metrics = ref.history?.metrics;
+        const status: ActivityAgentStatus =
+          ref.status === "running"
+            ? "running"
+            : ref.status === "aborted"
+              ? "aborted"
+              : (base?.status === "failed" || base?.status === "aborted") &&
+                  base
+                ? base.status
+                : "completed";
+        const durationMs =
+          status === "running"
+            ? Math.max(0, now - ref.createdAt)
+            : base?.durationMs ??
+              metrics?.durationMs ??
+              Math.max(0, ref.lastActivity - ref.createdAt);
+        agentsById.set(ref.id, {
+          ...(base ?? {}),
+          id: ref.id,
+          label: activityText(ref.displayName, 160) ?? base?.label ?? ref.id,
+          status,
+          activity: ref.activity ?? base?.activity,
+          startedAt: base?.startedAt ?? ref.createdAt,
+          updatedAt: ref.lastActivity,
+          durationMs,
+          ...(metrics?.tools !== undefined && base?.toolCount === undefined
+            ? { toolCount: metrics.tools }
+            : {}),
+          ...(metrics?.requests !== undefined && base?.requests === undefined
+            ? { requests: metrics.requests }
+            : {}),
+          ...(metrics?.tokens !== undefined && base?.tokens === undefined
+            ? { tokens: metrics.tokens }
+            : {}),
+          ...(metrics?.cost !== undefined && base?.cost === undefined
+            ? { cost: metrics.cost }
+            : {}),
+          ...(ref.history?.resolvedModel && !base?.model
+            ? { model: ref.history.resolvedModel }
+            : ref.history?.modelRole && !base?.model
+              ? { model: ref.history.modelRole }
+              : {}),
+        });
+      }
+    }
+
+    const jobs: ActivityJob[] = [];
+    let snapshot: HostJobSnapshot | null | undefined;
+    try {
+      snapshot = ctx.getAsyncJobSnapshot() as
+        | HostJobSnapshot
+        | null;
+    } catch {
+      snapshot = undefined;
+    }
+    if (snapshot) {
+      const seen = new Set<string>();
+      for (const item of [...snapshot.running, ...snapshot.recent]) {
+        if (!item || typeof item.id !== "string" || !item.id) continue;
+        if (item.type === "task") {
+          const agent = agentsById.get(item.id);
+          if (agent) {
+            if (item.status === "failed") agent.status = "failed";
+            else if (item.status === "cancelled") agent.status = "aborted";
+            else if (item.status === "completed" && agent.status !== "failed" && agent.status !== "aborted")
+              agent.status = "completed";
+            else if (item.status === "running" && agent.status === "pending")
+              agent.status = "running";
+            continue;
+          }
+        }
+        if (seen.has(item.id)) continue;
+        seen.add(item.id);
+        const status =
+          item.status === "running" ||
+          item.status === "completed" ||
+          item.status === "failed" ||
+          item.status === "cancelled"
+            ? item.status
+            : undefined;
+        if (!status) continue;
+        jobs.push({
+          id: item.id,
+          type: item.type === "bash" ? "bash" : item.type === "task" ? "task" : "other",
+          label: activityText(item.label, 200) ?? item.id,
+          status,
+          startedAt:
+            typeof item.startTime === "number" && Number.isFinite(item.startTime)
+              ? item.startTime
+              : now,
+          ...(status === "running" && Number.isFinite(item.startTime)
+            ? { durationMs: Math.max(0, now - item.startTime) }
+            : {}),
+        });
+      }
+    }
+
+    const rank: Record<ActivityAgentStatus, number> = {
+      running: 0,
+      pending: 1,
+      failed: 2,
+      aborted: 2,
+      completed: 3,
+    };
+    // Project the merged registry/job state back onto transcript task cards so a
+    // `task` row and the drawer always agree on running/completed/error.
+    for (const task of collected.tasks.values()) {
+      task.agents = task.agents.map(
+        (agent) => agentsById.get(agent.id) ?? agent,
+      );
+    }
+    const subagents = [...agentsById.values()]
+      .sort(
+        (a, b) =>
+          rank[a.status] - rank[b.status] ||
+          (b.updatedAt ?? b.startedAt ?? 0) - (a.updatedAt ?? a.startedAt ?? 0),
+      )
+      .slice(0, ACTIVITY_AGENTS_MAX);
+    jobs.sort(
+      (a, b) =>
+        Number(b.status === "running") - Number(a.status === "running") ||
+        b.startedAt - a.startedAt,
+    );
+    const activity: SessionActivity = {
+      todos: collected.todos,
+      subagents,
+      jobs: jobs.slice(0, ACTIVITY_JOBS_MAX),
+    };
+    if (agentActive) {
+      if (workingIntent) activity.working = workingIntent;
+      if (workingSince !== undefined) activity.since = workingSince;
+      const tool = [...runningTools.values()].at(-1);
+      if (tool) activity.workingTool = tool;
+    }
+    return { activity, tasks: collected.tasks };
+  }
+
   function snapshot(ctx: ExtensionContext): MobileState {
     observeSession(ctx);
     const model = ctx.models.current?.() ?? ctx.model;
@@ -1302,6 +2016,7 @@ export default function registerMobileRemote(pi: ExtensionAPI): void {
     const summary = latestSummary(branch);
     const hasPendingMessages = ctx.hasPendingMessages();
     const now = Date.now();
+    const activitySnapshot = buildActivity(ctx, branch, now);
     pendingMobileMessages = pendingMobileMessages.filter(
       (message) => hasPendingMessages || now - message.submittedAt < 5000,
     );
@@ -1343,6 +2058,7 @@ export default function registerMobileRemote(pi: ExtensionAPI): void {
               },
             ]
           : branch,
+        activitySnapshot.tasks,
       ),
       capabilities: capabilities(ctx),
       cwd: ctx.sessionManager.getCwd(),
@@ -1352,6 +2068,7 @@ export default function registerMobileRemote(pi: ExtensionAPI): void {
       editor: editorGuard(ctx),
       ...(completion ? { completion } : {}),
       agentActive,
+      activity: activitySnapshot.activity,
     };
     const title = ctx.sessionManager.getSessionName();
     if (title) state.title = safeString(title);
@@ -1737,6 +2454,33 @@ export default function registerMobileRemote(pi: ExtensionAPI): void {
   });
   pi.on("tool_approval_resolved", (event) => {
     pendingApprovals.delete(event.toolCallId);
+  });
+  pi.on("tool_execution_start", (event, ctx) => {
+    observeSession(ctx);
+    runningTools.set(event.toolCallId, event.toolName);
+    const intent = asString(event.intent)?.trim();
+    if (intent && intent !== workingIntent) {
+      workingIntent = truncateText(intent, 300);
+      workingSince = Date.now();
+    }
+  });
+  pi.on("tool_execution_update", (event, ctx) => {
+    observeSession(ctx);
+    if (event.toolName !== "task") return;
+    const partial = parseToolArguments(event.partialResult);
+    const details =
+      parseToolArguments(partial?.details) ??
+      (Array.isArray(partial?.progress) ? partial : undefined);
+    if (details) liveTaskDetails.set(event.toolCallId, details);
+  });
+  pi.on("tool_execution_end", (event, ctx) => {
+    observeSession(ctx);
+    runningTools.delete(event.toolCallId);
+    if (event.toolName !== "task") return;
+    const result = parseToolArguments(event.result);
+    const details = parseToolArguments(result?.details);
+    if (details) liveTaskDetails.set(event.toolCallId, details);
+    else liveTaskDetails.delete(event.toolCallId);
   });
   pi.on("message_start", (event, ctx) => {
     observeSession(ctx);

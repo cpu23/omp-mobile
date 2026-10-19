@@ -78,6 +78,100 @@ export type CompletionMarker = {
   completedAt: number;
 };
 
+/**
+ * Live activity projected from the host's public extension surface: the
+ * descriptive tool-call intent that drives OMP's "Working…" loader, the
+ * session todo list, detached/blocking subagents, and async background jobs.
+ *
+ * Everything here is scoped to one runtime and one generation. The extension
+ * rebuilds it from the current session branch and agent registry on each
+ * request, so switching sessions can never show another runtime's activity.
+ */
+export type ActivityTodoStatus =
+  | "pending"
+  | "in_progress"
+  | "completed"
+  | "abandoned"
+  | "blocked";
+
+export type ActivityTodo = {
+  content: string;
+  status: ActivityTodoStatus;
+  blocker?: string;
+};
+
+export type ActivityTodoPhase = {
+  name: string;
+  tasks: ActivityTodo[];
+};
+
+/** Host task-progress status, including queued (`pending`) spawns. */
+export type ActivityAgentStatus =
+  | "pending"
+  | "running"
+  | "completed"
+  | "failed"
+  | "aborted";
+
+export type ActivitySubagent = {
+  id: string;
+  /** Registry display name when known, otherwise the task id. */
+  label?: string;
+  /** Agent type such as `task` or `scout`. */
+  agent?: string;
+  status: ActivityAgentStatus;
+  /** Explicit spawn description (`name`/description), the desktop row title. */
+  description?: string;
+  /** The assignment text shown by desktop's task rows. */
+  task?: string;
+  /** Latest activity gist or tool intent. */
+  activity?: string;
+  currentTool?: string;
+  model?: string;
+  startedAt?: number;
+  updatedAt?: number;
+  durationMs?: number;
+  toolCount?: number;
+  requests?: number;
+  tokens?: number;
+  cost?: number;
+  contextTokens?: number;
+  contextWindow?: number;
+  /** Terminal error (failed/aborted rows). */
+  error?: string;
+  /** Retry or rate-limit note, when the host reports one. */
+  note?: string;
+  /** True for detached background spawns. */
+  detached?: boolean;
+};
+
+export type ActivityJobStatus =
+  | "running"
+  | "completed"
+  | "failed"
+  | "cancelled";
+
+export type ActivityJob = {
+  id: string;
+  type: "bash" | "task" | "other";
+  label: string;
+  status: ActivityJobStatus;
+  startedAt: number;
+  durationMs?: number;
+};
+
+export type SessionActivity = {
+  /** Descriptive current intent from the host's tool-call event. */
+  working?: string;
+  /** Tool currently executing, when the host reported one. */
+  workingTool?: string;
+  /** When the current working intent started, epoch ms. */
+  since?: number;
+  todos: ActivityTodoPhase[];
+  subagents: ActivitySubagent[];
+  jobs: ActivityJob[];
+};
+
 export type SlotState = {
   apiVersion: typeof API_VERSION;
   generation: string;
@@ -101,6 +195,7 @@ export type SlotState = {
   editor?: { available: boolean; empty: boolean | null };
   completion?: CompletionMarker;
   agentActive?: boolean;
+  activity?: SessionActivity;
   connected?: boolean;
   error?: string;
 };

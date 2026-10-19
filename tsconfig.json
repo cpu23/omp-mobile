@@ -13,6 +13,7 @@
     "server.ts",
     "shared.ts",
     "client.ts",
+    "move-completion.ts",
     "extension.ts",
     "notifications.ts"
   ]
