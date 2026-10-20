@@ -1067,6 +1067,13 @@ function renderShell(): void {
         <button class="sidebar-action" id="reasoning-toggle" type="button" aria-label="Toggle reasoning" aria-pressed="true">${ICONS.sparkles}<span>Reasoning</span><span id="reasoning-state">On</span></button>
         <button class="sidebar-action" id="notifications-enable" type="button" aria-label="Enable notifications" title="Enable notifications">${ICONS.bellDefault}<span>Notifications</span></button>
         <button class="sidebar-action" id="token-open" type="button">${ICONS.key}<span>Access token</span></button>
+        <form id="session-limit-form" class="session-limit">
+          <label for="session-limit-input">Max sessions</label>
+          <input id="session-limit-input" type="number" min="1" step="1" required inputmode="numeric" disabled aria-describedby="session-limit-status">
+          <button class="sidebar-action" id="session-limit-save" type="submit" disabled>Save session limit</button>
+          <p id="session-limit-status" role="status" aria-live="polite"></p>
+          <button class="sidebar-action" id="session-limit-restart" type="button" hidden>Restart daemon to apply</button>
+        </form>
       </section>
     </aside><button class="sidebar-backdrop" id="sidebar-close" type="button" aria-label="Close sessions"></button>
     <section class="workspace"><div class="capabilities hidden" id="capabilities"></div><div class="transcript" id="transcript" tabindex="0" aria-label="Session transcript"></div><pre class="raw-view hidden" id="raw-view" tabindex="0" aria-label="Raw terminal output"></pre><button class="scroll-fab hidden" id="scroll-bottom" type="button" aria-label="Scroll to bottom">${ICONS.arrowDown}</button></section></main>
@@ -1460,12 +1467,75 @@ function bindSidebarSettings(sidebar: HTMLElement): void {
   const settings = requiredElement<HTMLElement>("#sidebar-settings", sidebar);
   const open = requiredElement<HTMLButtonElement>("#sidebar-settings-open", sidebar);
   const back = requiredElement<HTMLButtonElement>("#sidebar-settings-back", sidebar);
+  const form = requiredElement<HTMLFormElement>("#session-limit-form", sidebar);
+  const input = requiredElement<HTMLInputElement>("#session-limit-input", sidebar);
+  const save = requiredElement<HTMLButtonElement>("#session-limit-save", sidebar);
+  const restart = requiredElement<HTMLButtonElement>("#session-limit-restart", sidebar);
+  const status = requiredElement<HTMLElement>("#session-limit-status", sidebar);
+  let busy = false;
+  let loaded = false;
+  type RuntimeSettings = {
+    maxRuntimes: number;
+    effectiveMaxRuntimes: number;
+    restartRequired: boolean;
+  };
+  const update = async (method: "GET" | "PUT" | "POST"): Promise<void> => {
+    if (busy) return;
+    busy = true;
+    input.disabled = save.disabled = restart.disabled = true;
+    status.textContent = method === "POST" ? "Restarting daemon…" : "Loading session limit…";
+    try {
+      if (method === "POST") await api("/api/restart", { method: "POST" });
+      let current: RuntimeSettings | undefined;
+      const deadline = Date.now() + 60_000;
+      do {
+        try {
+          current = await api<RuntimeSettings>("/api/settings", {
+            method: method === "PUT" ? "PUT" : "GET",
+            ...(method === "PUT" ? { body: JSON.stringify({ maxRuntimes: Number(input.value) }) } : {}),
+          });
+          if (!Number.isSafeInteger(current.maxRuntimes) || current.maxRuntimes < 1 ||
+              !Number.isSafeInteger(current.effectiveMaxRuntimes) || current.effectiveMaxRuntimes < 1 ||
+              typeof current.restartRequired !== "boolean")
+            throw new Error("Invalid daemon settings response");
+          if (method !== "POST" || !current.restartRequired) break;
+        } catch (error) {
+          if (method !== "POST" || hasAuth(error)) throw error;
+        }
+        const { promise, resolve } = Promise.withResolvers<void>();
+        setTimeout(resolve, 1000);
+        await promise;
+      } while (Date.now() < deadline);
+      if (!current || (method === "POST" && current.restartRequired))
+        throw new Error("Daemon restart not confirmed. Reopen Settings to check its status.");
+      input.value = String(current.maxRuntimes);
+      loaded = true;
+      restart.hidden = !current.restartRequired;
+      status.textContent = `Max sessions ${current.maxRuntimes}; in effect now ${current.effectiveMaxRuntimes}.` +
+        (current.restartRequired ? " Restart required to apply. This briefly disconnects desktop and mobile sessions." : "");
+    } catch (error) {
+      status.textContent = error instanceof Error ? error.message : String(error);
+    } finally {
+      busy = false;
+      input.disabled = save.disabled = !loaded;
+      restart.disabled = false;
+    }
+  };
+  form.addEventListener("submit", (event) => {
+    event.preventDefault();
+    if (form.reportValidity()) void update("PUT");
+  });
+  restart.addEventListener("click", () => {
+    if (confirm("Restart the shared daemon? Desktop and mobile sessions will briefly disconnect."))
+      void update("POST");
+  });
   const show = (visible: boolean): void => {
     sessions.hidden = visible;
     settings.hidden = !visible;
     open.setAttribute("aria-expanded", String(visible));
     (visible ? back : open).focus();
     syncAnimation();
+    if (visible) void update("GET");
   };
   open.addEventListener("click", () => show(true));
   back.addEventListener("click", () => show(false));

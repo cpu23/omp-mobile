@@ -52,7 +52,8 @@ still shows persisted task results, but detached progress may lag until the next
 Working sessions show a spinner beside a shimmering sidebar title, without a separate “Working…” label.
 Live tool and Thinking indicators, the composer model label, and the effort slider's value and fill use the active session's accent.
 The effort button retains its effort-level color. The slider offers explicit effort levels only, excluding `inherit`.
-Use the floating circular gear button at the bottom of the sidebar for terminal view, reasoning visibility, notifications and access-token settings.
+Use the floating circular gear button at the bottom of the sidebar for terminal view, reasoning visibility, notifications, access-token settings and **Max sessions**.
+**Max sessions** edits the desktop daemon's persisted limit, shared by mobile and desktop (default: 16). Enter a positive whole number and select **Save session limit**. The panel shows both the saved and currently enforced limits. When they differ, select **Restart daemon to apply** and confirm; this briefly disconnects both clients while sessions resume. Saving below the number of live sessions is rejected by the daemon; stop sessions first or choose a higher limit. This requires a desktop daemon supporting `/api/settings` and `/api/restart`.
 The gear overlays the session list; bottom scroll padding lets the last card move clear of it.
 Use the back-arrow icon (or Escape) to return to sessions; these controls no longer occupy the sessions footer or top bar.
 Connected sessions have no status label; offline and unread indicators remain visible.

@@ -1780,6 +1780,41 @@ async function handle(request: Request): Promise<Response> {
     return withCors(await notificationsApi(request), request);
   }
 
+  if (
+    (url.pathname === "/api/settings" &&
+      (request.method === "GET" || request.method === "PUT")) ||
+    (url.pathname === "/api/restart" && request.method === "POST")
+  ) {
+    let body: string | undefined;
+    if (request.method === "PUT") {
+      try {
+        body = JSON.stringify(parseJson(await readBody(request)));
+      } catch {
+        return withCors(errorResponse(400, "invalid settings body"), request);
+      }
+    }
+    const response = await desktopRequest(url.pathname, {
+      method: request.method,
+      ...(body === undefined ? {} : {
+        headers: { "content-type": "application/json" },
+        body,
+      }),
+    });
+    if (!response)
+      return withCors(errorResponse(503, "desktop daemon unavailable"), request);
+    if (!response.ok)
+      return withCors(errorResponse(response.status, await response.text()), request);
+    if (url.pathname === "/api/restart")
+      return withCors(json({ ok: true }, response.status), request);
+    return withCors(new Response(response.body, {
+      status: response.status,
+      headers: {
+        "content-type": response.headers.get("content-type") ?? "application/json",
+        "cache-control": "no-store",
+      },
+    }), request);
+  }
+
   if (url.pathname === "/api/slots") {
     if (request.method === "GET") return withCors(await slotsResponse(), request);
     if (request.method === "POST")

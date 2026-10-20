@@ -374,6 +374,31 @@ textarea:focus-visible {
   background: var(--panel-raised);
 }
 
+.session-limit {
+  display: grid;
+  gap: 10px;
+  margin-top: 12px;
+  padding-top: 16px;
+  border-top: 1px solid var(--line);
+  font: 12px var(--mono);
+  color: var(--muted);
+}
+
+.session-limit input {
+  width: 100%;
+  min-height: 44px;
+  padding: 8px 10px;
+  border: 1px solid var(--line);
+  border-radius: 8px;
+  background: var(--panel-raised);
+  color: var(--text);
+  font: inherit;
+}
+
+.session-limit p { margin: 0 0 8px; line-height: 1.5; }
+.session-limit button { min-height: 44px; margin: 0; }
+.session-limit button[hidden] { display: none; }
+
 .sidebar-action svg {
   width: 16px;
   height: 16px;
