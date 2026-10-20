@@ -1763,7 +1763,6 @@ pre,
 }
 
 .composer textarea,
-.composer .composer-input,
 #prompt {
   display: block;
   resize: none;
@@ -1780,10 +1779,59 @@ pre,
   line-height: 1.45;
 }
 
-.composer textarea::placeholder,
-.composer .composer-input::placeholder,
-#prompt::placeholder {
+#prompt {
+  overflow-x: hidden;
+  overflow-y: auto;
+  overflow-wrap: anywhere;
+  white-space: pre-wrap;
+  word-break: break-word;
+}
+
+#prompt.is-empty::before {
+  content: attr(data-placeholder);
   color: var(--dim);
+  pointer-events: none;
+}
+
+.composer textarea::placeholder {
+  color: var(--dim);
+}
+
+.send-btn:not(#send) {
+  border: 0;
+  background: var(--session-accent, var(--muted));
+  color: var(--dark);
+  min-height: 28px;
+  height: 28px;
+  padding: 0 12px;
+  border-radius: 6px;
+  font: 700 11px var(--mono);
+  cursor: pointer;
+  transition: filter 0.15s ease, opacity 0.15s ease;
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  flex: 0 0 auto;
+}
+
+#send {
+  border: 0;
+  background: var(--session-accent, var(--muted));
+  color: var(--dark);
+  min-height: 44px;
+  width: 44px;
+  height: 44px;
+  padding: 0;
+  border-radius: 50%;
+  font: 700 11px var(--mono);
+  cursor: pointer;
+  transition:
+    filter 0.15s ease,
+    opacity 0.15s ease;
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  flex: 0 0 auto;
 }
 
 .composer-tools {
@@ -1872,24 +1920,6 @@ pre,
   outline-offset: 1px;
 }
 
-.send-btn {
-  border: 0;
-  background: var(--session-accent, var(--muted));
-  color: var(--dark);
-  min-height: 28px;
-  height: 28px;
-  padding: 0 12px;
-  border-radius: 6px;
-  font: 700 11px var(--mono);
-  cursor: pointer;
-  transition:
-    filter 0.15s ease,
-    opacity 0.15s ease;
-  display: inline-flex;
-  align-items: center;
-  justify-content: center;
-  flex: 0 0 auto;
-}
 
 .send-btn:hover {
   filter: brightness(1.12);

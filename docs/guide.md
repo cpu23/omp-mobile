@@ -32,7 +32,7 @@ after updating the extension so they receive the new interaction bridge.
 While OMP is busy, Mobile sends ordinary text through the steering path and shows its queued text until OMP starts it.
 If the same Send action is tapped again before its first submission resolves, Mobile coalesces the duplicate and, when
 the session was busy, forces the queue only after the first submission succeeds. Once OMP reports pending messages and
-the session is active, an empty composer changes **Send** to **Force**; tapping it (or submitting empty Enter)
+the session is active, an empty composer changes the circular upward-arrow **Send** button to a lightning-bolt **Force** icon; tapping it (or submitting empty Enter)
 interrupts the current run so OMP drains the pending queue, matching desktop's empty-Enter behavior. OMP's public
 extension API may expose queue availability without desktop-origin text; those items show only **Queued**. A single queue card prefers host queue text when available, otherwise mobile-submitted text, with **Submitting** before confirmation. It does not repeat help or API-limitation notices.
 Restart the affected session for this extension update to take effect.
@@ -93,9 +93,11 @@ native resolver. Each known-dialog action is scoped to the current interaction a
 Images open for inspection. Mermaid diagrams, sanitized static SVG, KaTeX math and chartable numeric tables render
 locally with source/zoom controls. Rendering dependencies and math fonts are served by the gateway, not a CDN.
 Unsafe SVG scripts, event handlers, external references, foreign HTML and active CSS are removed. Attach up to eight
-PNG/JPEG/WebP/GIF images from the composer; browser previews can be removed before sending. The browser resizes images
-when needed; the API permits at most 3 MiB of combined base64 image data and a 4 MiB action body. Failed sends retain
-attachments so they can be retried.
+PNG/JPEG/WebP/GIF images with the composer's **＋** upload button, or paste copied images directly into the message field.
+The editor accepts native image paste rather than requesting separate clipboard-read permission; mobile keyboard/browser support
+still determines whether an image is offered. Pasted text stays plain text, and previews can be removed before sending.
+The browser resizes images when needed; the API permits at most 3 MiB of combined base64 image data and a 4 MiB action body.
+Failed sends retain attachments so they can be retried.
 
 The initial snapshot contains the latest 80 visible entries. **Load older messages** pages back through the branch.
 Clipped messages and omitted inline images expose **Load full message and images**. Full messages use immutable,
