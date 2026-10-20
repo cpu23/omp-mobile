@@ -1508,7 +1508,9 @@ function bindSidebarSettings(sidebar: HTMLElement): void {
     if (busy) return;
     busy = true;
     input.disabled = save.disabled = restart.disabled = true;
-    status.textContent = method === "POST" ? "Restarting daemon…" : "Loading session limit…";
+    status.textContent = method === "POST"
+      ? "Restarting the shared daemon stops running work in desktop and mobile. Sessions reopen from saved transcripts; execution does not continue. Wait until work finishes before restarting."
+      : "Loading session limit…";
     try {
       if (method === "POST") await api("/api/restart", { method: "POST" });
       let current: RuntimeSettings | undefined;
@@ -1537,7 +1539,11 @@ function bindSidebarSettings(sidebar: HTMLElement): void {
       loaded = true;
       restart.hidden = !current.restartRequired;
       status.textContent = `Max sessions ${current.maxRuntimes}; in effect now ${current.effectiveMaxRuntimes}.` +
-        (current.restartRequired ? " Restart required to apply. This briefly disconnects desktop and mobile sessions." : "");
+        (current.restartRequired
+          ? " Restart required to apply. Restarting the shared daemon stops running work in desktop and mobile. Sessions reopen from saved transcripts, but their previous execution does not continue. Wait until work finishes before restarting."
+          : method === "POST"
+            ? " The shared daemon restarted: running work in desktop and mobile stopped. Sessions reopened from saved transcripts; execution did not continue. Wait until work finishes before restarting."
+            : "");
     } catch (error) {
       status.textContent = error instanceof Error ? error.message : String(error);
     } finally {
@@ -1551,7 +1557,7 @@ function bindSidebarSettings(sidebar: HTMLElement): void {
     if (form.reportValidity()) void update("PUT");
   });
   restart.addEventListener("click", () => {
-    if (confirm("Restart the shared daemon? Desktop and mobile sessions will briefly disconnect."))
+    if (confirm("Restart the shared daemon? This stops running work in desktop and mobile. Sessions reopen from their saved transcripts; execution does not continue. Wait until work finishes before restarting."))
       void update("POST");
   });
   const show = (visible: boolean): void => {
