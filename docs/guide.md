@@ -29,7 +29,7 @@ If the same Send action is tapped again before its first submission resolves, Mo
 the session was busy, forces the queue only after the first submission succeeds. Once OMP reports pending messages and
 the session is active, an empty composer changes **Send** to **Force**; tapping it (or submitting empty Enter)
 interrupts the current run so OMP drains the pending queue, matching desktop's empty-Enter behavior. OMP's public
-extension API exposes queue availability but not desktop-origin queued text, so those items appear as a generic notice.
+extension API exposes queue availability but not desktop-origin queued text, so those items show only the **Pending messages** heading. The queue card shows available message text without repeated help or limitation notices.
 Restart the affected session for this extension update to take effect.
 
 Typing `/move` in the composer opens a directory picker instead of sending the command. Choices are listed as you type: absolute paths are used as-is, relative paths resolve from the session's working directory, `~` expands to the gateway user's home (still confined to `OMP_MOBILE_ROOT`), and a trailing slash (or selecting a folder) lists its subdirectories. Tapping a folder fills `/move <path>`; use the send button (or Enter) to move. Up/Down and Tab work with hardware keyboards, and Escape dismisses the list without affecting other slash commands. Every listing is tied to the session and working directory it was resolved against: switching sessions, resuming another transcript, or a session whose cwd changed (`cd` in the desktop terminal, or a completed move) discards the cached picker, and a listing that arrives after such a change is ignored, so a destination from another working directory is never offered or submitted.
@@ -58,6 +58,7 @@ Use the floating circular gear button at the bottom of the sidebar for terminal 
 **Max sessions** edits the desktop daemon's persisted limit, shared by mobile and desktop (default: 16). Enter a positive whole number and select **Save session limit**. The panel shows both the saved and currently enforced limits. When they differ, select **Restart daemon to apply** and confirm. Restarting the shared daemon stops running work in both desktop and mobile; sessions reopen from their saved transcripts, but execution does not continue. Wait until work finishes before restarting. Saving below the number of live sessions is rejected by the daemon; stop sessions first or choose a higher limit. This requires a desktop daemon supporting `/api/settings` and `/api/restart`.
 The gear overlays the session list; bottom scroll padding lets the last card move clear of it.
 Use the back-arrow icon (or Escape) to return to sessions; these controls no longer occupy the sessions footer or top bar.
+Dialogs overlay the sidebar without closing it, so stopping a session or cancelling its confirmation leaves the session list open.
 Connected sessions have no status label; offline and unread indicators remain visible.
 The chat viewport shrinks above the software keyboard and composer. When already near the bottom,
 the latest messages stay in view as the keyboard opens or closes.
