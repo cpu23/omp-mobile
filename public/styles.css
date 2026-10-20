@@ -1606,17 +1606,6 @@ pre,
   overflow-wrap: anywhere;
 }
 
-.pending-unavailable,
-.pending-help,
-.pending-limitation {
-  margin: 4px 0 0;
-  color: var(--muted);
-}
-
-.pending-limitation {
-  color: var(--dim);
-  font-size: 10px;
-}
 .composer {
   pointer-events: auto;
   max-width: 920px;

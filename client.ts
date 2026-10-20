@@ -3758,11 +3758,6 @@ function renderActive(): void {
   const hasPendingMessages = state?.hasPendingMessages === true;
   if (hasPendingMessages || pendingMessages.length > 0) {
     const queueState = hasPendingMessages ? "Pending messages" : "Submitting";
-    const help = hasPendingMessages
-      ? active
-        ? "Tap Send again with an empty composer to interrupt this run and deliver the queue now."
-        : "OMP will deliver the queue when the session resumes."
-      : "Submitting to OMP…";
     const messageItems = pendingMessages.length
       ? `<ol>${pendingMessages
           .map(
@@ -3770,10 +3765,8 @@ function renderActive(): void {
               `<li>${esc(message.text.replace(/\r?\n/g, " ↵ "))}</li>`,
           )
           .join("")}</ol>`
-      : hasPendingMessages
-        ? `<p class="pending-unavailable">Message text is unavailable for items queued outside mobile.</p>`
-        : "";
-    pendingContainer.innerHTML = `<div class="pending-card"><div class="pending-heading">${queueState}</div>${messageItems}<div class="pending-help">${help}</div>${hasPendingMessages ? `<div class="pending-limitation">OMP exposes queue availability, but not desktop-origin message text.</div>` : ""}</div>`;
+      : "";
+    pendingContainer.innerHTML = `<div class="pending-card"><div class="pending-heading">${queueState}</div>${messageItems}</div>`;
     pendingContainer.classList.remove("hidden");
   } else {
     pendingContainer.innerHTML = "";
@@ -4467,7 +4460,6 @@ function confirmModal(
 }
 function makeModal(title: string, body: HTMLElement): HTMLDivElement {
   closeModal();
-  closeSidebarDrawer();
   const overlay = document.createElement("div");
   overlay.className = "modal-backdrop";
   overlay.innerHTML = `<section class="modal" role="dialog" aria-modal="true" aria-label="${esc(title)}"><div class="modal-head"><h2>${esc(title)}</h2><button class="icon-btn modal-close" aria-label="Close">×</button></div><div class="modal-body"></div></section>`;
