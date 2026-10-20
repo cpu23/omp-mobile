@@ -23,6 +23,16 @@ import {
   type SlotSummary,
   type TerminalSnapshot,
 } from "./shared";
+import type {
+  MobileAskDisplay,
+  MobileHistory,
+  MobileImage,
+  MobileInteraction,
+  MobileMessage,
+  MobilePart,
+  MobileRuntime,
+} from "./parity-types";
+import { appendRichContent } from "./rich-content";
 import {
   buildMoveCompletion,
   moveBasePath,
@@ -46,45 +56,12 @@ type ClientTheme = Record<string, unknown> & {
   tokens?: Record<string, string>;
 };
 type ClientCost = { total: number };
-type AskOption = { label: string; description?: string };
-type AskQuestion = {
-  id?: string;
-  question: string;
-  header?: string;
-  options: AskOption[];
-  multi: boolean;
-  recommended?: number;
-};
-type AskAnswer = {
-  selectedOptions: string[];
-  customInput?: string;
-  note?: string;
-  timedOut?: boolean;
-};
-type AskDisplay = {
-  status: "pending" | "completed" | "redirected";
-  questions: AskQuestion[];
-  answers?: Array<AskAnswer | null>;
-};
-type ChatPart =
-  | { kind: "text"; text: string }
-  | { kind: "thinking"; text: string }
-  | {
-      kind: "tool";
-      id: string;
-      name: string;
-      summary: string;
-      output?: string;
-      ask?: AskDisplay;
-      isError?: boolean;
-      task?: { agents: ActivitySubagent[]; asyncState?: string };
-    };
-type ChatMessage = {
-  role: string;
-  entryId: string;
-  timestamp: string | null;
-  parts: ChatPart[];
-};
+type AskOption = MobileAskDisplay["questions"][number]["options"][number];
+type AskQuestion = MobileAskDisplay["questions"][number];
+type AskAnswer = NonNullable<MobileAskDisplay["answers"]>[number];
+type AskDisplay = MobileAskDisplay;
+type ChatPart = MobilePart;
+type ChatMessage = MobileMessage;
 type ClientMessage = OmpMessage & {
   name?: string;
   tool?: string;
@@ -110,7 +87,19 @@ type ClientState = Omit<
   accent?: string | null;
   cost?: ClientCost | null;
 };
-type NotificationItem = { slot: SlotId; unread: CompletionMarker[] };
+type NotificationActionNeeded = {
+  identity: string;
+  kind: string;
+  title: string;
+  actionTitle: string;
+  createdAt: number;
+  unread: boolean;
+};
+type NotificationItem = {
+  slot: SlotId;
+  unread: CompletionMarker[];
+  actionNeeded?: NotificationActionNeeded;
+};
 type NotificationsResponse = { slots: NotificationItem[] };
 type NotificationConfig = { enabled: boolean; publicKey?: string };
 type DirectoryResponse = DirectoryListing;
@@ -269,6 +258,22 @@ const cache = new Map<SlotId, ClientState>();
  * runtime itself disappears.
  */
 const resumeAdoptedFiles = new Map<SlotId, string>();
+type HistoryCache = {
+  generation: string;
+  messages: MobileMessage[];
+  total: number;
+  shown: number;
+  hasMore: boolean;
+  loading: boolean;
+  error?: string;
+};
+const olderHistoryBySlot = new Map<SlotId, HistoryCache>();
+const fullMessageCache = new Map<string, MobileMessage>();
+const fullMessageRequests = new Set<string>();
+let attachedImages: MobileImage[] = [];
+const attachmentsBySlot = new Map<SlotId, MobileImage[]>();
+let terminalControlVisible = false;
+let terminalControlRequest = 0;
 let slots: SlotSummary[] = [];
 let sessions: SessionSummary[] = [];
 let sessionsError: string | null = null;
@@ -302,6 +307,8 @@ let transcriptNearBottom = true;
 let lastRenderedMessageCount = 0;
 let lastTranscriptSnapshot: TranscriptRenderSnapshot | null = null;
 let lastEmptyTranscriptContent: string | null = null;
+let historyLoadRequest = 0;
+let terminalSnapshotForControls: TerminalSnapshot | null = null;
 let commandSelection = 0;
 let dismissedCommandDraft: string | null = null;
 let moveCompletion: MoveCompletion | null = null;
@@ -313,6 +320,17 @@ let todosExpanded = false;
 let activitySlot: SlotId | null = null;
 let lastComposerWorkingText = "";
 let unreadBySlot = new Map<SlotId, CompletionMarker[]>();
+const actionNeededBySlot = new Map<SlotId, NotificationActionNeeded>();
+const interactionActionsInFlight = new Set<string>();
+const interactionFeedbackDrafts = new Map<string, string>();
+let terminalControlsTarget:
+  | { slotId: SlotId; generation: string; interactionId?: string }
+  | null = null;
+let attachmentRevision = 0;
+let renderedAttachmentRevision = -1;
+let lastRuntimeRenderKey = "";
+const imageSubmissionIds = new WeakMap<MobileImage, string>();
+let nextImageSubmissionId = 1;
 let notificationConfig: NotificationConfig | null = null;
 let serviceWorkerRegistration: ServiceWorkerRegistration | null = null;
 let notificationSubscribed = false;
@@ -587,10 +605,14 @@ function updateNotificationButton(): void {
 }
 
 function updateAppBadge(): void {
-  const count = [...unreadBySlot.values()].reduce(
+  const completionCount = [...unreadBySlot.values()].reduce(
     (total, unread) => total + unread.length,
     0,
   );
+  const actionCount = [...actionNeededBySlot.values()].filter(
+    (action) => action.unread,
+  ).length;
+  const count = completionCount + actionCount;
   const badgeNavigator = navigator as Navigator & {
     setAppBadge?: (value?: number) => Promise<void>;
     clearAppBadge?: () => Promise<void>;
@@ -620,7 +642,16 @@ async function loadNotifications(): Promise<void> {
   try {
     const result = await api<NotificationsResponse>("/api/notifications");
     unreadBySlot = normalizedUnread(result);
-    updateSlots();
+    actionNeededBySlot.clear();
+    for (const item of result.slots ?? []) {
+      if (
+        isSlotId(item.slot) &&
+        slots.some((slot) => slot.id === item.slot) &&
+        item.actionNeeded &&
+        typeof item.actionNeeded.identity === "string"
+      )
+        actionNeededBySlot.set(item.slot, item.actionNeeded);
+    }
     updateAppBadge();
     if (activeState && document.visibilityState === "visible")
       window.setTimeout(() => acknowledgeSlot(activeId), 0);
@@ -636,7 +667,8 @@ async function acknowledgeSlot(slot: SlotId): Promise<void> {
   )
     return;
   const unread = unreadBySlot.get(slot) || [];
-  if (!unread.length) return;
+  const actionNeeded = actionNeededBySlot.get(slot);
+  if (!unread.length && !actionNeeded?.unread) return;
   acknowledging.add(slot);
   try {
     for (const entry of unread)
@@ -644,12 +676,19 @@ async function acknowledgeSlot(slot: SlotId): Promise<void> {
         method: "POST",
         body: JSON.stringify({ slot, identity: entry.identity }),
       });
+    if (actionNeeded?.unread)
+      await api<void>("/api/notifications/ack", {
+        method: "POST",
+        body: JSON.stringify({ slot, identity: actionNeeded.identity }),
+      });
     const acknowledgedIds = new Set(unread.map((entry) => entry.identity));
     const remaining = (unreadBySlot.get(slot) || []).filter(
       (entry) => !acknowledgedIds.has(entry.identity),
     );
     if (remaining.length) unreadBySlot.set(slot, remaining);
     else unreadBySlot.delete(slot);
+    if (actionNeeded?.unread)
+      actionNeededBySlot.set(slot, { ...actionNeeded, unread: false });
     updateSlots();
     updateAppBadge();
   } catch (error: unknown) {
@@ -1077,8 +1116,8 @@ function renderShell(): void {
         </form>
       </section>
     </aside><button class="sidebar-backdrop" id="sidebar-close" type="button" aria-label="Close sessions"></button>
-    <section class="workspace"><div class="capabilities hidden" id="capabilities"></div><div class="transcript" id="transcript" tabindex="0" aria-label="Session transcript"></div><pre class="raw-view hidden" id="raw-view" tabindex="0" aria-label="Raw terminal output"></pre><button class="scroll-fab hidden" id="scroll-bottom" type="button" aria-label="Scroll to bottom">${ICONS.arrowDown}</button></section></main>
-    <div class="composer-dock"><section class="activity-dock hidden" id="activity-dock" aria-label="Session activity"><div id="activity-content" class="activity-content hidden"><div class="activity-todos" id="activity-todos"></div><div class="activity-details hidden" id="activity-details"></div></div></section><form class="composer" id="composer"><div class="command-menu hidden" id="command-menu" role="listbox" aria-label="Slash commands"></div><div class="composer-ctx"></div><div class="composer-working hidden" id="composer-working" role="status" aria-live="polite"><span class="working-spinner" aria-hidden="true">${SPINNER_FRAMES[0]}</span><span class="shimmer shimmer-accent" id="composer-working-text">${shimmerMarkup("Working…")}</span></div><div class="composer-input"><textarea id="prompt" rows="1" placeholder="Message this session…" aria-label="Message this session" aria-autocomplete="list" aria-controls="command-menu" aria-expanded="false"></textarea></div><div class="composer-tools"><div class="composer-meta" id="composer-meta"><button type="button" class="ghost-btn" id="model-open">Model</button><button type="button" class="ghost-btn" id="effort-open">Effort</button><span id="ctx-label"></span><span id="cost-label"></span></div><button type="button" class="abort-btn hidden" id="abort">Stop</button><button type="submit" class="send-btn" id="send">Send</button></div></form>
+    <section class="workspace"><div class="capabilities hidden" id="capabilities"></div><section class="runtime-area hidden" id="runtime-area" aria-live="polite"></section><div class="transcript" id="transcript" tabindex="0" aria-label="Session transcript"></div><pre class="raw-view hidden" id="raw-view" tabindex="0" aria-label="Raw terminal output"></pre><button class="scroll-fab hidden" id="scroll-bottom" type="button" aria-label="Scroll to bottom">${ICONS.arrowDown}</button></section></main>
+    <div class="composer-dock"><section class="activity-dock hidden" id="activity-dock" aria-label="Session activity"><div id="activity-content" class="activity-content hidden"><div class="activity-todos" id="activity-todos"></div><div class="activity-details hidden" id="activity-details"></div></div></section><form class="composer" id="composer"><div class="command-menu hidden" id="command-menu" role="listbox" aria-label="Slash commands"></div><div class="composer-ctx"></div><div class="composer-working hidden" id="composer-working" role="status" aria-live="polite"><span class="working-spinner" aria-hidden="true">${SPINNER_FRAMES[0]}</span><span class="shimmer shimmer-accent" id="composer-working-text">${shimmerMarkup("Working…")}</span></div><div class="composer-input"><textarea id="prompt" rows="1" placeholder="Message this session…" aria-label="Message this session" aria-autocomplete="list" aria-controls="command-menu" aria-expanded="false"></textarea></div><div class="attachment-tray hidden" id="attachment-tray" aria-label="Attached images"></div><div class="composer-tools"><input id="image-input" type="file" accept="image/png,image/jpeg,image/webp,image/gif" multiple hidden><button type="button" class="ghost-btn attach-btn" id="attach-images" aria-label="Attach images">＋ Image</button><div class="composer-meta" id="composer-meta"><button type="button" class="ghost-btn" id="model-open">Model</button><button type="button" class="ghost-btn" id="effort-open">Effort</button><span id="ctx-label"></span><span id="cost-label"></span></div><button type="button" class="abort-btn hidden" id="abort">Stop</button><button type="submit" class="send-btn" id="send">Send</button></div></form>
   </div>`;
   requiredElement<HTMLElement>("#activity-content").insertAdjacentHTML("beforebegin",
     `<button type="button" class="todo-pull-tab" id="todo-toggle" aria-expanded="false" aria-controls="activity-content"><span id="todo-toggle-label">Activity</span><svg width="12" height="12" viewBox="0 0 12 12" fill="none" stroke="currentColor" aria-hidden="true"><path d="m3 7 3-3 3 3"/></svg></button>`);
@@ -1216,6 +1255,25 @@ function renderShell(): void {
     },
   );
   const prompt = requiredElement<HTMLTextAreaElement>("#prompt");
+  const imageInput = requiredElement<HTMLInputElement>("#image-input");
+  requiredElement<HTMLButtonElement>("#attach-images").addEventListener(
+    "click",
+    () => imageInput.click(),
+  );
+  imageInput.addEventListener("change", () => {
+    const files = Array.from(imageInput.files ?? []);
+    imageInput.value = "";
+    void addImageFiles(files);
+  });
+  prompt.addEventListener("paste", (event: ClipboardEvent) => {
+    const files = Array.from(event.clipboardData?.items ?? [])
+      .filter((item) => item.kind === "file" && item.type.startsWith("image/"))
+      .map((item) => item.getAsFile())
+      .filter((file): file is File => file !== null);
+    if (!files.length) return;
+    event.preventDefault();
+    void addImageFiles(files);
+  });
   prompt.addEventListener("input", () => {
     drafts.set(activeId, prompt.value);
     dismissedCommandDraft = null;
@@ -1379,8 +1437,11 @@ function slotCardMarkup(slot: SlotSummary): string {
   const isBusy =
     connected && isAgentActive(slot.id === activeId ? activeState : null, slot);
   const unread = unreadBySlot.get(slot.id)?.length || 0;
+  const notificationAction = actionNeededBySlot.get(slot.id);
+  const interaction = slotState?.runtime?.interaction;
+  const needsAction = Boolean(interaction || notificationAction);
   const title = slotTitle(slot, slotState);
-  return `<div class="slot-card${slot.id === activeId ? " active" : ""}${!connected ? " offline" : ""}${isBusy ? " busy" : ""}" data-slot="${esc(slot.id)}" role="button" tabindex="0" aria-label="Open ${esc(title)}${isBusy ? " — Working" : ""}"><div class="slot-title">${isBusy ? `<span class="slot-working"><span class="working-spinner" aria-hidden="true">${SPINNER_FRAMES[0]}</span><span class="slot-title-text shimmer shimmer-accent">${shimmerMarkup(title)}</span></span>` : `<span>${esc(title)}</span>`}<span class="slot-badges">${!connected ? `<span class="slot-offline">offline</span>` : ""}${unread > 0 ? `<span class="slot-unread" aria-label="${unread} unread completion${unread === 1 ? "" : "s"}">${unread > 99 ? "99+" : unread}</span>` : ""}</span></div>${slot.summary && slot.summary.trim() ? `<div class="slot-summary">${esc(slot.summary)}</div>` : ""}<div class="slot-meta"><span class="slot-cwd" title="${esc(slot.cwd)}">${esc(compactPath(slot.cwd) || "Working directory unavailable")}</span><button type="button" class="slot-stop" data-stop="${esc(slot.id)}" aria-label="Stop ${esc(title)}" title="Stop this session">Stop</button></div></div>`;
+  return `<div class="slot-card${slot.id === activeId ? " active" : ""}${!connected ? " offline" : ""}${isBusy ? " busy" : ""}" data-slot="${esc(slot.id)}" role="button" tabindex="0" aria-label="Open ${esc(title)}${isBusy ? " — Working" : ""}${needsAction ? " — Action needed" : ""}"><div class="slot-title">${isBusy ? `<span class="slot-working"><span class="working-spinner" aria-hidden="true">${SPINNER_FRAMES[0]}</span><span class="slot-title-text shimmer shimmer-accent">${shimmerMarkup(title)}</span></span>` : `<span>${esc(title)}</span>`}<span class="slot-badges">${!connected ? `<span class="slot-offline">offline</span>` : ""}${needsAction ? `<span class="slot-action-needed" title="${esc(interaction?.title ?? notificationAction?.actionTitle ?? "Pending action")}">Action needed</span>` : ""}${unread > 0 ? `<span class="slot-unread" aria-label="${unread} unread completion${unread === 1 ? "" : "s"}">${unread > 99 ? "99+" : unread}</span>` : ""}</span></div>${slot.summary && slot.summary.trim() ? `<div class="slot-summary">${esc(slot.summary)}</div>` : ""}<div class="slot-meta"><span class="slot-cwd" title="${esc(slot.cwd)}">${esc(compactPath(slot.cwd) || "Working directory unavailable")}</span><button type="button" class="slot-stop" data-stop="${esc(slot.id)}" aria-label="Stop ${esc(title)}" title="Stop this session">Stop</button></div></div>`;
 }
 
 /**
@@ -1966,8 +2027,11 @@ function selectSlot(id: SlotId): void {
     return;
   }
   const oldPrompt = document.querySelector<HTMLTextAreaElement>("#prompt");
+  if (activeId) attachmentsBySlot.set(activeId, attachedImages);
   if (oldPrompt) drafts.set(activeId, oldPrompt.value);
   activeId = id;
+  attachedImages = attachmentsBySlot.get(id) ?? [];
+  attachmentRevision += 1;
   localStorage.setItem("omp-mobile-active-slot", id);
   activeState = cache.get(id) || null;
   if (oldPrompt) {
@@ -2013,10 +2077,6 @@ function asString(value: unknown): string | undefined {
   if (typeof value === "number" || typeof value === "boolean")
     return String(value);
   return undefined;
-}
-function truncateText(text: string, maxChars: number): string {
-  if (!text || text.length <= maxChars) return text;
-  return `${text.slice(0, maxChars)}\n… truncated`;
 }
 function oneLine(text: string, max = 90): string {
   const flat = text.replace(/\r?\n|\r/g, " ").trim();
@@ -2148,6 +2208,42 @@ const toolCallCache = new Map<
   string,
   { name: string; arguments?: Record<string, unknown> }
 >();
+function mobileImageFrom(value: unknown): MobileImage | undefined {
+  if (!value || typeof value !== "object") return undefined;
+  const image = value as Record<string, unknown>;
+  if (image.type !== "image") return undefined;
+  const mimeType = asString(image.mimeType) ?? asString(image.mime_type);
+  let data = asString(image.data) ?? asString(image.base64) ?? "";
+  const dataUrl = data.match(/^data:(image\/(?:png|jpeg|webp|gif));base64,(.*)$/is);
+  if (dataUrl) data = dataUrl[2] ?? "";
+  if (!mimeType || !/^image\/(?:png|jpeg|webp|gif)$/i.test(mimeType))
+    return undefined;
+  return {
+    type: "image",
+    mimeType,
+    data,
+    ...(typeof image.sourceId === "string" ? { sourceId: image.sourceId } : {}),
+  };
+}
+
+function serializableUnknown(value: unknown): string {
+  try {
+    return JSON.stringify(value, null, 2);
+  } catch {
+    return String(value);
+  }
+}
+
+function isMobileImage(value: unknown): value is MobileImage {
+  return (
+    !!value &&
+    typeof value === "object" &&
+    (value as MobileImage).type === "image" &&
+    typeof (value as MobileImage).mimeType === "string" &&
+    typeof (value as MobileImage).data === "string"
+  );
+}
+
 function projectParts(
   message: ClientMessage,
   toolCalls: Map<
@@ -2184,8 +2280,7 @@ function projectParts(
         message.result ??
         message.error,
     );
-    const output =
-      rawOutput !== undefined ? truncateText(rawOutput, 6000) : undefined;
+    const output = rawOutput !== undefined ? rawOutput : undefined;
     const isError =
       message.isError === true ||
       (message.error !== undefined &&
@@ -2195,6 +2290,13 @@ function projectParts(
         message.details !== null &&
         (message.details as Record<string, unknown>).error === true);
 
+    const rawImages = Array.isArray(message.images)
+      ? message.images.map(mobileImageFrom).filter(isMobileImage)
+      : [];
+    const rawAsk =
+      message.ask && typeof message.ask === "object"
+        ? (message.ask as AskDisplay)
+        : undefined;
     const part: ChatPart = {
       kind: "tool",
       id: toolCallId,
@@ -2202,6 +2304,12 @@ function projectParts(
       summary,
       ...(output !== undefined && output !== "" ? { output } : {}),
       ...(isError ? { isError: true } : {}),
+      ...(rawAsk ? { ask: rawAsk } : {}),
+      ...(rawImages.length ? { images: rawImages } : {}),
+      ...(message.details !== undefined || args
+        ? { details: message.details ?? args }
+        : {}),
+      ...(message.full === true ? { full: true } : {}),
     };
     parts.push(part);
     return parts;
@@ -2224,21 +2332,11 @@ function projectParts(
   const content = message.content ?? message.text;
 
   if (typeof content === "string") {
-    if (content.length > 0) {
-      parts.push({
-        kind: "text",
-        text: truncateText(content, 32000),
-      });
-    }
+    if (content.length > 0) parts.push({ kind: "text", text: content });
   } else if (Array.isArray(content)) {
     for (const block of content) {
       if (typeof block === "string") {
-        if (block.length > 0) {
-          parts.push({
-            kind: "text",
-            text: truncateText(block, 32000),
-          });
-        }
+        if (block.length > 0) parts.push({ kind: "text", text: block });
       } else if (block && typeof block === "object") {
         const b = block as Record<string, unknown>;
         const type = asString(b.type);
@@ -2254,12 +2352,7 @@ function projectParts(
           thinkingText !== undefined
         ) {
           const text = thinkingText ?? asString(b.text) ?? "";
-          if (text) {
-            parts.push({
-              kind: "thinking",
-              text: truncateText(text, 32000),
-            });
-          }
+          if (text) parts.push({ kind: "thinking", text });
         } else if (
           type === "toolCall" ||
           type === "tool_call" ||
@@ -2272,31 +2365,49 @@ function projectParts(
             asString(b.tool) ??
             "tool";
           const args = parseArgs(b.arguments ?? b.args ?? b.input);
-          if (id) {
-            toolCalls.set(id, { name, arguments: args });
-          }
+          if (id) toolCalls.set(id, { name, arguments: args });
+          const toolInput = extractContentText(
+            b.arguments ?? b.args ?? b.input,
+          );
+          if (toolInput)
+            parts.push({
+              kind: "tool",
+              id,
+              name,
+              summary: formatToolSummary(args),
+              details: b.arguments ?? b.args ?? b.input ?? toolInput,
+            });
         } else if (type === "image") {
+          const image = mobileImageFrom(b);
+          if (image) {
+            parts.push({
+              kind: "image",
+              image,
+              label: image.data ? "Image" : "Image — load full message",
+            });
+          } else {
+            parts.push({
+              kind: "text",
+              text: `[Image content unavailable: ${asString(b.mimeType) ?? "unknown format"}]`,
+            });
+          }
+        } else if (type === "text" || b.text !== undefined) {
+          const text = asString(b.text);
           parts.push({
             kind: "text",
-            text: "[image]",
+            text: text ?? extractContentText(b) ?? serializableUnknown(b),
           });
-        } else if (type === "text" || b.text !== undefined) {
-          const text = asString(b.text) ?? "";
-          if (text) {
-            parts.push({
-              kind: "text",
-              text: truncateText(text, 32000),
-            });
-          }
         } else {
-          const text = asString(b.text) ?? asString(b.content);
-          if (text) {
-            parts.push({
-              kind: "text",
-              text: truncateText(text, 32000),
-            });
-          }
+          const text = asString(b.content) ?? extractContentText(b);
+          parts.push({
+            kind: "text",
+            text:
+              text ??
+              `Unrecognized content block${type ? ` (${type})` : ""}:\n${serializableUnknown(b)}`,
+          });
         }
+      } else {
+        parts.push({ kind: "text", text: serializableUnknown(block) });
       }
     }
   } else if (content && typeof content === "object") {
@@ -2314,28 +2425,34 @@ function projectParts(
       thinkingText !== undefined
     ) {
       const text = thinkingText ?? asString(b.text) ?? "";
-      if (text) {
-        parts.push({
-          kind: "thinking",
-          text: truncateText(text, 32000),
-        });
-      }
+      if (text) parts.push({ kind: "thinking", text });
     } else if (type === "image") {
-      parts.push({
-        kind: "text",
-        text: "[image]",
-      });
-    } else {
-      const text = asString(b.text) ?? asString(b.content);
-      if (text) {
+      const image = mobileImageFrom(b);
+      if (image) {
+        parts.push({
+          kind: "image",
+          image,
+          label: image.data ? "Image" : "Image — load full message",
+        });
+      } else {
         parts.push({
           kind: "text",
-          text: truncateText(text, 32000),
+          text: `[Image content unavailable: ${asString(b.mimeType) ?? "unknown format"}]`,
         });
       }
+    } else {
+      parts.push({
+        kind: "text",
+        text:
+          asString(b.text) ??
+          asString(b.content) ??
+          extractContentText(b) ??
+          `Unrecognized content:\n${serializableUnknown(b)}`,
+      });
     }
+  } else if (content !== undefined) {
+    parts.push({ kind: "text", text: serializableUnknown(content) });
   }
-
   return parts;
 }
 function appendHexColor(parent: HTMLElement, hex: string): void {
@@ -2802,7 +2919,7 @@ function appendMarkdown(parent: HTMLElement, rawText: string): void {
 function appendFormatted(parent: HTMLElement, value: unknown): void {
   const text =
     typeof value === "string" ? value : (extractContentText(value) ?? "");
-  appendMarkdown(parent, text);
+  appendRichContent(parent, text, appendMarkdown);
 }
 function messageKind(
   message: ClientMessage,
@@ -2818,8 +2935,11 @@ function messageKind(
 }
 type PreparedTranscriptMessage = {
   msgKey: string;
+  entryId?: string;
   role: string;
+  timestamp: string | null;
   liveMessage: boolean;
+  needsFull: boolean;
   parts: ChatPart[];
   actions: Array<{ label: string; url: string | undefined }>;
 };
@@ -2827,68 +2947,10 @@ type TranscriptRenderSnapshot = {
   slotId: SlotId;
   generation: string | undefined;
   active: boolean;
+  historyState: string;
   messages: PreparedTranscriptMessage[];
 };
 
-function sameAskDisplay(
-  a: AskDisplay | undefined,
-  b: AskDisplay | undefined,
-): boolean {
-  if (a === b) return true;
-  if (
-    !a ||
-    !b ||
-    a.status !== b.status ||
-    a.questions.length !== b.questions.length ||
-    a.answers?.length !== b.answers?.length
-  )
-    return false;
-  for (let i = 0; i < a.questions.length; i += 1) {
-    const left = a.questions[i]!;
-    const right = b.questions[i]!;
-    if (
-      left.id !== right.id ||
-      left.question !== right.question ||
-      left.header !== right.header ||
-      left.multi !== right.multi ||
-      left.recommended !== right.recommended ||
-      left.options.length !== right.options.length
-    )
-      return false;
-    for (let j = 0; j < left.options.length; j += 1) {
-      const leftOption = left.options[j]!;
-      const rightOption = right.options[j]!;
-      if (
-        leftOption.label !== rightOption.label ||
-        leftOption.description !== rightOption.description
-      )
-        return false;
-    }
-  }
-  if (a.answers && b.answers) {
-    for (let i = 0; i < a.answers.length; i += 1) {
-      const left = a.answers[i];
-      const right = b.answers[i];
-      if (left === null || right === null) {
-        if (left !== right) return false;
-        continue;
-      }
-      if (
-        !left ||
-        !right ||
-        left.customInput !== right.customInput ||
-        left.note !== right.note ||
-        left.timedOut !== right.timedOut ||
-        left.selectedOptions.length !== right.selectedOptions.length
-      )
-        return false;
-      for (let j = 0; j < left.selectedOptions.length; j += 1) {
-        if (left.selectedOptions[j] !== right.selectedOptions[j]) return false;
-      }
-    }
-  }
-  return true;
-}
 
 function appendAskCard(
   parent: HTMLElement,
@@ -2906,14 +2968,25 @@ function appendAskCard(
   const status = document.createElement("p");
   status.className = "part-ask-status";
   if (part.isError) {
-    status.textContent = "Ask failed in the desktop terminal.";
+    status.textContent = "Ask failed in the session terminal.";
   } else if (ask.status === "pending") {
     status.textContent =
-      "Awaiting an answer in the desktop terminal. Mobile cannot submit ask answers.";
+      "Terminal-owned ask. Review the answer in the live terminal controls; these displayed options are read-only.";
+    const openTerminal = document.createElement("button");
+    openTerminal.type = "button";
+    openTerminal.className = "ghost-btn part-ask-terminal";
+    openTerminal.textContent = "Open live terminal controls";
+    openTerminal.addEventListener("click", () => {
+      const interaction = activeState?.runtime?.interaction;
+      void openTerminalControls(
+        interaction?.kind === "ask" ? interaction.id : undefined,
+      );
+    });
+    card.append(openTerminal);
   } else if (ask.status === "redirected") {
-    status.textContent = "Conversation continued from the desktop terminal.";
+    status.textContent = "Conversation continued from the session terminal.";
   } else {
-    status.textContent = "Answered in the desktop terminal.";
+    status.textContent = "Answered in the session terminal.";
   }
   card.append(status);
 
@@ -3036,14 +3109,6 @@ function formatActivityDuration(ms: number): string {
   return `${hours}h ${minutes % 60}m`;
 }
 
-type TaskRows = Extract<ChatPart, { kind: "tool" }>["task"];
-
-function sameTaskRows(a: TaskRows, b: TaskRows): boolean {
-  if (a === b) return true;
-  if (!a || !b || a.asyncState !== b.asyncState) return false;
-  if (a.agents.length !== b.agents.length) return false;
-  return JSON.stringify(a.agents) === JSON.stringify(b.agents);
-}
 
 /**
  * Desktop-style agent rows shared by the activity drawer and `task` tool cards:
@@ -3171,25 +3236,320 @@ function appendJobRows(parent: HTMLElement, jobs: ActivityJob[], now: number): v
   parent.append(list);
 }
 
-function sameTranscriptPart(a: ChatPart, b: ChatPart): boolean {
-  if (a === b) return true;
-  if (!a || !b || a.kind !== b.kind) return false;
-  if (
-    (a.kind === "text" || a.kind === "thinking") &&
-    (b.kind === "text" || b.kind === "thinking")
-  )
-    return a.text === b.text;
-  if (a.kind === "tool" && b.kind === "tool")
-    return (
-      a.id === b.id &&
-      a.name === b.name &&
-      a.summary === b.summary &&
-      a.output === b.output &&
-      a.isError === b.isError &&
-      sameTaskRows(a.task, b.task) &&
-      sameAskDisplay(a.ask, b.ask)
+function imageDataUrl(image: MobileImage): string | undefined {
+  if (!image.data) return undefined;
+  return `data:${image.mimeType};base64,${image.data}`;
+}
+
+function openImageViewer(image: MobileImage, label: string): void {
+  const body = document.createElement("figure");
+  body.className = "image-viewer";
+  const imageElement = document.createElement("img");
+  imageElement.src = imageDataUrl(image) ?? "";
+  imageElement.alt = label;
+  body.append(imageElement);
+  makeModal(label, body).classList.add("image-viewer-backdrop");
+}
+
+function appendMobileImage(
+  parent: HTMLElement,
+  image: MobileImage,
+  label: string,
+  entryId: string,
+): void {
+  const figure = document.createElement("figure");
+  figure.className = "part-image";
+  const src = imageDataUrl(image);
+  if (src) {
+    const open = document.createElement("button");
+    open.type = "button";
+    open.className = "part-image-open";
+    open.setAttribute("aria-label", `Open ${label}`);
+    const preview = document.createElement("img");
+    preview.src = src;
+    preview.alt = label;
+    preview.loading = "lazy";
+    open.append(preview);
+    open.addEventListener("click", () => openImageViewer(image, label));
+    figure.append(open);
+  } else {
+    const load = document.createElement("button");
+    load.type = "button";
+    load.className = "ghost-btn image-load";
+    load.textContent = "Load full image";
+    load.addEventListener("click", () => {
+      void loadFullMessage(image.sourceId || entryId);
+    });
+    figure.append(load);
+  }
+  const caption = document.createElement("figcaption");
+  caption.textContent = label;
+  figure.append(caption);
+  parent.append(figure);
+}
+
+function appendPartImages(
+  parent: HTMLElement,
+  images: MobileImage[],
+  messageId: string,
+  label: string,
+): void {
+  if (!images.length) return;
+  const group = document.createElement("div");
+  group.className = "part-image-group";
+  images.forEach((image, index) =>
+    appendMobileImage(group, image, `${label} ${index + 1}`, messageId),
+  );
+  parent.append(group);
+}
+
+function fullMessageKey(slotId: SlotId, generation: string, entryId: string): string {
+  return JSON.stringify([slotId, generation, entryId]);
+}
+function clearFullMessagesForSlot(slotId: SlotId): void {
+  const prefix = `${JSON.stringify([slotId]).slice(0, -1)},`;
+  for (const key of fullMessageCache.keys())
+    if (key.startsWith(prefix)) fullMessageCache.delete(key);
+  for (const key of fullMessageRequests)
+    if (key.startsWith(prefix)) fullMessageRequests.delete(key);
+}
+
+async function loadFullMessage(entryId: string): Promise<void> {
+  const slotId = activeId;
+  const generation = activeState?.generation;
+  if (!slotId || !generation) return;
+  const key = fullMessageKey(slotId, generation, entryId);
+  if (fullMessageCache.has(key) || fullMessageRequests.has(key)) return;
+  fullMessageRequests.add(key);
+  try {
+    const path =
+      `/api/slots/${encodeURIComponent(slotId)}/message?id=${encodeURIComponent(entryId)}`;
+    let offset = 0;
+    let transferId: string | undefined;
+    let message: MobileMessage | undefined;
+    let chunks: string[] = [];
+    let chunkLength = 0;
+    let chunkTotal: number | undefined;
+    let responseGeneration = generation;
+    for (;;) {
+      const requestPath =
+        transferId === undefined
+          ? `${path}&offset=0`
+          : `${path}&offset=${offset}&transferId=${encodeURIComponent(transferId)}`;
+      const response = await api<
+        | { generation: string; message: MobileMessage }
+        | {
+            generation: string;
+            transferId: string;
+            chunk: string;
+            nextOffset: number | null;
+            total: number;
+          }
+      >(requestPath);
+      responseGeneration = response.generation;
+      if (!("message" in response)) {
+        if (!response.transferId || (transferId && response.transferId !== transferId))
+          throw new Error("Full-message transfer identity changed between chunks.");
+        transferId = response.transferId;
+      }
+      if (responseGeneration !== generation)
+        throw new Error("The session changed while loading this message.");
+      if ("message" in response) {
+        message = response.message;
+        break;
+      }
+      if (
+        !Number.isSafeInteger(response.total) ||
+        response.total > 32 * 1024 * 1024 ||
+        response.total < 0 ||
+        typeof response.chunk !== "string" ||
+        response.chunk.length > 256 * 1024
+      )
+        throw new Error("Invalid full-message chunk response.");
+      if (chunkTotal !== undefined && response.total !== chunkTotal)
+        throw new Error("Full-message size changed between chunks.");
+      chunkTotal = response.total;
+      if (
+        !Number.isInteger(response.nextOffset) &&
+        response.nextOffset !== null
+      )
+        throw new Error("Invalid full-message chunk response.");
+      chunks.push(response.chunk);
+      chunkLength += response.chunk.length;
+      if (response.nextOffset === null) {
+        if (chunkLength !== response.total)
+          throw new Error("Full-message chunks were incomplete.");
+        break;
+      }
+      if (
+        response.nextOffset !== chunkLength ||
+        response.nextOffset <= offset ||
+        chunkLength > response.total
+      )
+        throw new Error("Full-message chunk response made no progress.");
+      offset = response.nextOffset;
+    }
+    if (!message && chunkLength > 0) {
+      const serialized = chunks.join("");
+      const parsed: unknown = JSON.parse(serialized);
+      if (
+        parsed &&
+        typeof parsed === "object" &&
+        "entryId" in parsed &&
+        parsed.entryId === entryId
+      )
+        message = parsed as MobileMessage;
+    }
+    if (!message) throw new Error("Full message response was incomplete.");
+    if (message.entryId !== entryId)
+      throw new Error("Full message response did not match the requested entry.");
+    if (
+      slotId !== activeId ||
+      generation !== activeState?.generation ||
+      responseGeneration !== generation
+    )
+      return;
+    fullMessageCache.set(key, message);
+    renderActive();
+  } catch (error: unknown) {
+    showToast(
+      hasAuth(error) ? "Access token rejected" : `Could not load full message: ${errorMessage(error)}`,
+      true,
     );
-  return false;
+    if (hasAuth(error)) openTokenModal();
+  } finally {
+    fullMessageRequests.delete(key);
+  }
+}
+
+function historyCacheFor(
+  slotId: SlotId,
+  state: ClientState,
+): HistoryCache {
+  const generation = state.generation;
+  let history = olderHistoryBySlot.get(slotId);
+  if (history && history.generation !== generation)
+    clearFullMessagesForSlot(slotId);
+  if (!history || history.generation !== generation) {
+    history = {
+      generation,
+      messages: [],
+      total: state.history?.total ?? state.messages.length,
+      shown: state.history?.shown ?? state.messages.length,
+      hasMore: state.history?.hasMore ?? false,
+      loading: false,
+    };
+    olderHistoryBySlot.set(slotId, history);
+  } else if (state.history) {
+    history.total = Math.max(history.total, state.history.total);
+    history.shown = Math.max(history.shown, state.history.shown);
+  }
+  return history;
+}
+
+function transcriptMessagesFor(
+  slotId: SlotId,
+  state: ClientState,
+): ClientMessage[] {
+  const history = historyCacheFor(slotId, state);
+  const seen = new Set<string>();
+  const messages: ClientMessage[] = [...history.messages, ...state.messages].filter((message) => {
+    const id = asString(message.entryId) ?? asString("id" in message ? message.id : undefined);
+    if (!id) return true;
+    if (seen.has(id)) return false;
+    seen.add(id);
+    return true;
+  });
+  return messages.map((message) => {
+    const entryId = asString(message.entryId) ?? asString(message.id) ?? "";
+    const full = fullMessageCache.get(
+      fullMessageKey(slotId, state.generation, entryId),
+    );
+    return full ? ({ ...message, ...full } as ClientMessage) : message;
+  });
+}
+
+async function loadOlderHistory(
+  slotId: SlotId,
+  state: ClientState,
+  history: HistoryCache,
+): Promise<void> {
+  if (history.loading || !history.hasMore) return;
+  const messages = [...history.messages, ...state.messages];
+  const before = asString(messages[0]?.entryId);
+  if (!before) {
+    history.error = "The oldest loaded message has no history identifier.";
+    renderActive();
+    return;
+  }
+  history.loading = true;
+  history.error = undefined;
+  const request = ++historyLoadRequest;
+  renderActive();
+  try {
+    const response = await api<{
+      generation: string;
+      messages: MobileMessage[];
+      history: MobileHistory;
+    }>(
+      `/api/slots/${encodeURIComponent(slotId)}/history?before=${encodeURIComponent(before)}&limit=80`,
+    );
+    if (
+      request !== historyLoadRequest ||
+      slotId !== activeId ||
+      response.generation !== state.generation
+    )
+      return;
+    const ids = new Set(history.messages.map((message) => message.entryId));
+    history.messages = [
+      ...response.messages.filter((message) => !ids.has(message.entryId)),
+      ...history.messages,
+    ];
+    history.total = response.history.total;
+    history.shown = Math.min(history.total, history.shown + response.messages.length);
+    history.hasMore = response.history.hasMore;
+  } catch (error: unknown) {
+    if (request !== historyLoadRequest) return;
+    history.error = hasAuth(error)
+      ? "Access token rejected."
+      : errorMessage(error);
+    if (hasAuth(error)) openTokenModal();
+  } finally {
+    if (request === historyLoadRequest) {
+      history.loading = false;
+      renderActive();
+    }
+  }
+}
+function appendPreformatted(
+  parent: HTMLElement,
+  className: string,
+  text: string,
+): void {
+  const pre = document.createElement("pre");
+  pre.className = className;
+  pre.textContent = text;
+  parent.append(pre);
+}
+
+function appendStructuredDetails(
+  parent: HTMLElement,
+  title: string,
+  value: unknown,
+): void {
+  if (value === undefined || value === null || value === "") return;
+  const details = document.createElement("details");
+  details.className = "part-structured-details";
+  const summary = document.createElement("summary");
+  summary.textContent = title;
+  details.append(summary);
+  const text = typeof value === "string" ? value : serializableUnknown(value);
+  appendPreformatted(details, "part-structured-output", text);
+  parent.append(details);
+}
+
+function sameTranscriptPart(a: ChatPart, b: ChatPart): boolean {
+  return a === b || JSON.stringify(a) === JSON.stringify(b);
 }
 
 function sameTranscriptSnapshot(
@@ -3200,6 +3560,7 @@ function sameTranscriptSnapshot(
     a.slotId !== b.slotId ||
     a.generation !== b.generation ||
     a.active !== b.active ||
+    a.historyState !== b.historyState ||
     a.messages.length !== b.messages.length
   )
     return false;
@@ -3208,8 +3569,10 @@ function sameTranscriptSnapshot(
     const right = b.messages[i]!;
     if (
       left.msgKey !== right.msgKey ||
-      left.role !== right.role ||
+      left.entryId !== right.entryId ||
+      left.timestamp !== right.timestamp ||
       left.liveMessage !== right.liveMessage ||
+      left.needsFull !== right.needsFull ||
       left.parts.length !== right.parts.length ||
       left.actions.length !== right.actions.length
     )
@@ -3235,7 +3598,11 @@ function sameTranscriptSnapshot(
   return true;
 }
 
-function renderMessages(messages: ClientMessage[], active = false): void {
+function renderMessages(
+  messages: ClientMessage[],
+  active = false,
+  history?: HistoryCache,
+): void {
   const transcript = document.querySelector<HTMLDivElement>("#transcript");
   if (!transcript) return;
   lastEmptyTranscriptContent = null;
@@ -3292,14 +3659,29 @@ function renderMessages(messages: ClientMessage[], active = false): void {
       label: action.label || action.title || "Open",
       url: typeof action.url === "string" ? action.url : undefined,
     }));
-    if (parts.length === 0 && actions.length === 0) return;
+    const needsFull =
+      message.full === false ||
+      parts.some(
+        (part) =>
+          (part.kind === "tool" && part.full === false) ||
+          (part.kind === "image" && Boolean(part.image.sourceId)),
+      );
+    if (parts.length === 0 && actions.length === 0 && !needsFull) return;
+    const kind = messageKind(message);
+    const role =
+      kind === "error" || kind === "tool" || kind === "thinking" || kind === "user"
+        ? kind
+        : asString(message.role) ?? kind;
     prepared.push({
       msgKey:
         asString(message.entryId) ??
         asString(message.id) ??
         `msg-${messageIndex}`,
-      role: message.role || messageKind(message),
+      entryId: asString(message.entryId) ?? asString(message.id),
+      role,
+      timestamp: asString(message.timestamp) ?? null,
       liveMessage: active && messageIndex === messages.length - 1,
+      needsFull,
       parts,
       actions,
     });
@@ -3308,6 +3690,15 @@ function renderMessages(messages: ClientMessage[], active = false): void {
     slotId: activeId,
     generation: activeState?.generation,
     active,
+    historyState: history
+      ? JSON.stringify([
+          history.total,
+          history.shown,
+          history.hasMore,
+          history.loading,
+          history.error,
+        ])
+      : "",
     messages: prepared,
   };
   if (
@@ -3335,17 +3726,74 @@ function renderMessages(messages: ClientMessage[], active = false): void {
   }
 
   transcript.innerHTML = "";
+  if (history && (history.hasMore || history.error || history.total > history.shown)) {
+    const controls = document.createElement("div");
+    controls.className = "history-controls";
+    const status = document.createElement("span");
+    status.className = "history-status";
+    status.textContent = history.error
+      ? `Older history unavailable: ${history.error}`
+      : `Showing ${history.shown} of ${history.total} messages`;
+    controls.append(status);
+    if (history.hasMore) {
+      const button = document.createElement("button");
+      button.type = "button";
+      button.className = "ghost-btn history-load";
+      button.disabled = history.loading;
+      button.textContent = history.loading
+        ? "Loading older messages…"
+        : history.error
+          ? "Retry loading older"
+          : "Load older messages";
+      button.addEventListener("click", () => {
+        if (activeState)
+          void loadOlderHistory(activeId, activeState, history);
+      });
+      controls.append(button);
+    } else if (history.total > history.shown && !history.error) {
+      status.textContent =
+        `Some older messages are not available (${history.shown} of ${history.total} loaded).`;
+    }
+    transcript.append(controls);
+  }
   if (messages.length === 0) {
+    if (!history?.hasMore) {
+      const empty = document.createElement("div");
+      empty.className = "transcript-empty";
+      empty.textContent = "No messages in this session yet.";
+      transcript.append(empty);
+    }
     lastRenderedMessageCount = 0;
     lastTranscriptSnapshot = snapshot;
     return;
   }
 
-  prepared.forEach(({ msgKey, role, liveMessage, parts, actions }) => {
-    const article = document.createElement("article");
-    article.className = `message ${role}`;
-    article.dataset.msgKey = msgKey;
-    parts.forEach((part, partIndex) => {
+  prepared.forEach(
+    ({ msgKey, entryId, role, timestamp, liveMessage, needsFull, parts, actions }) => {
+      const article = document.createElement("article");
+      article.className = `message ${role}`;
+      article.dataset.msgKey = msgKey;
+      if (timestamp || !["assistant", "user"].includes(role)) {
+        const head = document.createElement("div");
+        head.className = "message-head";
+        const roleLabel = document.createElement("span");
+        roleLabel.textContent = role;
+        head.append(roleLabel);
+        if (timestamp) {
+          const time = document.createElement("time");
+          time.dateTime = timestamp;
+          const parsed = Date.parse(timestamp);
+          time.textContent = Number.isFinite(parsed)
+            ? new Date(parsed).toLocaleTimeString([], {
+                hour: "numeric",
+                minute: "2-digit",
+              })
+            : timestamp;
+          head.append(time);
+        }
+        article.append(head);
+      }
+      parts.forEach((part, partIndex) => {
       if (!part || typeof part !== "object") return;
       if (part.kind === "text") {
         const partDiv = document.createElement("div");
@@ -3459,19 +3907,166 @@ function renderMessages(messages: ClientMessage[], active = false): void {
           details.append(taskBody);
         }
 
+        appendStructuredDetails(details, "Arguments and details", part.details);
         if (part.output != null && part.output !== "") {
-          const pre = document.createElement("pre");
-          pre.className = "part-output";
-          const rawOut =
-            typeof part.output === "string"
-              ? part.output
-              : (extractContentText(part.output) ?? "");
-          pre.textContent = truncateText(rawOut, 6000);
-          details.append(pre);
+          const rawOut = part.output;
+          const diffOutput =
+            /^(?:diff --git |@@ |--- |\+\+\+ )/m.test(rawOut);
+          appendPreformatted(
+            details,
+            `part-output${diffOutput ? " diff-output" : ""}`,
+            rawOut,
+          );
         }
+        appendPartImages(details, part.images ?? [], msgKey, "Tool image");
         article.append(details);
+      } else if (part.kind === "image") {
+        appendMobileImage(
+          article,
+          part.image,
+          part.label || "Image",
+          msgKey,
+        );
+      } else if (part.kind === "notice") {
+        const notice = document.createElement("section");
+        notice.className = `part part-notice tone-${part.tone}`;
+        const title = document.createElement("strong");
+        title.textContent = part.title;
+        notice.append(title);
+        if (part.body) {
+          const body = document.createElement("div");
+          body.className = "part-notice-body";
+          appendFormatted(body, part.body);
+          notice.append(body);
+        }
+        article.append(notice);
+      } else if (part.kind === "summary") {
+        const summary = document.createElement("section");
+        summary.className = "part part-summary";
+        const heading = document.createElement("h3");
+        heading.textContent = part.title;
+        summary.append(heading);
+        if (part.tokensBefore !== undefined) {
+          const tokens = document.createElement("span");
+          tokens.className = "part-summary-tokens";
+          tokens.textContent = `${formatActivityNumber(part.tokensBefore)} tokens before compaction`;
+          summary.append(tokens);
+        }
+        const body = document.createElement("div");
+        body.className = "part-summary-text";
+        appendFormatted(body, part.text);
+        summary.append(body);
+        article.append(summary);
+      } else if (part.kind === "custom") {
+        const custom = document.createElement("section");
+        custom.className = "part part-custom";
+        const heading = document.createElement("h3");
+        heading.textContent = part.title;
+        custom.append(heading);
+        const body = document.createElement("div");
+        body.className = "part-custom-text";
+        appendFormatted(body, part.text);
+        custom.append(body);
+        appendStructuredDetails(custom, "Details", part.details);
+        article.append(custom);
+      } else if (part.kind === "execution") {
+        const execution = document.createElement("section");
+        execution.className = "part part-execution";
+        const heading = document.createElement("div");
+        heading.className = "part-execution-heading";
+        heading.textContent = `${part.language} execution`;
+        const result = part.cancelled
+          ? "Cancelled"
+          : part.exitCode === undefined
+            ? ""
+            : `Exit code ${part.exitCode}`;
+        if (result) {
+          const status = document.createElement("span");
+          status.className = part.exitCode === 0 ? "execution-success" : "execution-error";
+          status.textContent = result;
+          heading.append(status);
+        }
+        if (part.truncated) {
+          const truncated = document.createElement("span");
+          truncated.className = "execution-truncated";
+          truncated.textContent = "Output was truncated by the host";
+          heading.append(truncated);
+        }
+        execution.append(heading);
+        appendPreformatted(
+          execution,
+          "part-execution-code",
+          part.code,
+        );
+        if (part.output)
+          appendPreformatted(
+            execution,
+            "part-execution-output",
+            part.output,
+          );
+        appendStructuredDetails(execution, "Execution details", part.details);
+        appendPartImages(execution, part.images ?? [], msgKey, "Execution image");
+        article.append(execution);
+      } else if (part.kind === "files") {
+        const files = document.createElement("section");
+        files.className = "part part-files";
+        const heading = document.createElement("h3");
+        heading.textContent = `${part.files.length} file${part.files.length === 1 ? "" : "s"}`;
+        files.append(heading);
+        for (const file of part.files) {
+          const item = document.createElement("details");
+          item.className = "part-file";
+          const path = document.createElement("summary");
+          path.textContent = file.path;
+          item.append(path);
+          if (file.text !== undefined)
+            appendPreformatted(item, "part-file-content", file.text);
+          files.append(item);
+        }
+        article.append(files);
+      } else if (part.kind === "usage") {
+        const usage = document.createElement("section");
+        usage.className = "part part-usage";
+        usage.textContent = part.text;
+        article.append(usage);
+      } else {
+        const unsupported = document.createElement("section");
+        unsupported.className = "part part-unsupported";
+        const heading = document.createElement("strong");
+        heading.textContent = "Unrecognized transcript content";
+        unsupported.append(heading);
+        appendPreformatted(
+          unsupported,
+          "part-unsupported-content",
+          serializableUnknown(part),
+        );
+        article.append(unsupported);
       }
     });
+      if (needsFull) {
+        if (!entryId) {
+          const note = document.createElement("p");
+          note.className = "full-message-unavailable";
+          note.textContent =
+            "Full content cannot be fetched because this message has no history identifier.";
+          article.append(note);
+        } else if (activeState?.generation) {
+          const key = fullMessageKey(activeId, activeState.generation, entryId);
+          if (!fullMessageCache.has(key)) {
+            const load = document.createElement("button");
+            load.type = "button";
+            load.className = "ghost-btn full-message-load";
+            load.disabled = fullMessageRequests.has(key);
+            load.textContent = load.disabled
+              ? "Loading full message…"
+              : "Load full message and images";
+            load.addEventListener("click", () => {
+              void loadFullMessage(entryId);
+            });
+            article.append(load);
+          }
+        }
+      }
 
     if (actions.length > 0) {
       const actionList = document.createElement("div");
@@ -3709,24 +4304,644 @@ function renderComposerWorking(active: boolean, state: ClientState | null): void
   }
 }
 
+function interactionActionKey(
+  slotId: SlotId,
+  generation: string,
+  interactionId: string,
+  choice: string,
+): string {
+  return JSON.stringify([slotId, generation, interactionId, choice]);
+}
+
+async function sendInteractionChoice(
+  interaction: MobileInteraction,
+  choice: string,
+  feedback: string,
+  role: string | undefined,
+): Promise<void> {
+  const targetId = activeId;
+  const targetState = activeState;
+  const generation = targetState?.generation;
+  if (!targetId || !generation || interaction.transport !== "native") return;
+  const key = interactionActionKey(targetId, generation, interaction.id, choice);
+  if (interactionActionsInFlight.has(key)) return;
+  interactionActionsInFlight.add(key);
+  renderRuntime(targetState);
+  try {
+    await api(`/api/slots/${encodeURIComponent(targetId)}/action`, {
+      method: "POST",
+      headers: { "X-OMP-Generation": generation },
+      body: JSON.stringify({
+        generation,
+        type: "interaction",
+        id: interaction.id,
+        choice,
+        ...(feedback ? { feedback } : {}),
+        ...(role ? { role } : {}),
+      }),
+    });
+    interactionFeedbackDrafts.delete(interaction.id);
+    window.setTimeout(() => {
+      if (activeId === targetId && activeState?.generation === generation)
+        void loadState();
+    }, 120);
+  } catch (error: unknown) {
+    showToast(
+      hasAuth(error) ? "Access token rejected" : errorMessage(error),
+      true,
+    );
+    if (hasAuth(error)) openTokenModal();
+  } finally {
+    interactionActionsInFlight.delete(key);
+    if (activeId === targetId) renderRuntime(activeState);
+  }
+}
+
+function renderRuntime(state: ClientState | null): void {
+  const area = document.querySelector<HTMLElement>("#runtime-area");
+  if (!area) return;
+  const runtime = state?.runtime;
+  const interaction = runtime?.interaction;
+  if (
+    terminalControlVisible &&
+    terminalControlsTarget?.interactionId &&
+    state &&
+    interaction?.id !== terminalControlsTarget.interactionId
+  )
+    closeModal();
+  const inFlight = interaction
+    ? [...interactionActionsInFlight].some((key) => {
+        try {
+          const parsed: unknown = JSON.parse(key);
+          return (
+            Array.isArray(parsed) &&
+            parsed[0] === activeId &&
+            parsed[1] === state?.generation &&
+            parsed[2] === interaction.id
+          );
+        } catch {
+          return false;
+        }
+      })
+    : false;
+  const renderKey = JSON.stringify([activeId, state?.generation, runtime, inFlight]);
+  if (renderKey === lastRuntimeRenderKey) return;
+  lastRuntimeRenderKey = renderKey;
+  area.innerHTML = "";
+  area.classList.toggle("hidden", !state);
+  if (!state) return;
+
+  for (const notice of runtime?.notices ?? []) {
+    const card = document.createElement("section");
+    card.className = `runtime-card runtime-notice tone-${notice.tone}`;
+    const title = document.createElement("strong");
+    title.textContent = notice.title;
+    card.append(title);
+    if (notice.body) {
+      const body = document.createElement("div");
+      body.className = "runtime-card-body";
+      appendFormatted(body, notice.body);
+      card.append(body);
+    }
+    const timestamp = document.createElement("time");
+    const date = new Date(notice.timestamp);
+    if (Number.isFinite(date.getTime())) {
+      timestamp.dateTime = date.toISOString();
+      timestamp.textContent = date.toLocaleTimeString([], {
+        hour: "numeric",
+        minute: "2-digit",
+      });
+    } else {
+      timestamp.textContent = String(notice.timestamp);
+    }
+    card.append(timestamp);
+    area.append(card);
+  }
+  if (runtime?.status?.active) {
+    const status = document.createElement("section");
+    status.className = `runtime-card runtime-status status-${runtime.status.kind}`;
+    const title = document.createElement("strong");
+    title.textContent = runtime.status.label;
+    status.append(title);
+    if (runtime.status.detail) {
+      const detail = document.createElement("div");
+      detail.className = "runtime-card-body";
+      appendFormatted(detail, runtime.status.detail);
+      status.append(detail);
+    }
+    area.append(status);
+  }
+  if (runtime?.goal) {
+    const goal = document.createElement("section");
+    goal.className = "runtime-card runtime-goal";
+    const heading = document.createElement("strong");
+    heading.textContent = "Goal";
+    goal.append(heading);
+    const text = document.createElement("div");
+    text.className = "runtime-card-body";
+    appendFormatted(text, runtime.goal.text);
+    goal.append(text);
+    if (runtime.goal.detail) {
+      const detail = document.createElement("div");
+      detail.className = "runtime-card-detail";
+      appendFormatted(detail, runtime.goal.detail);
+      goal.append(detail);
+    }
+    area.append(goal);
+  }
+  if (!interaction) return;
+
+  const card = document.createElement("section");
+  card.className = `runtime-card runtime-interaction interaction-${interaction.kind}`;
+  card.setAttribute("aria-label", `Pending ${interaction.kind}: ${interaction.title}`);
+  const title = document.createElement("strong");
+  title.className = "runtime-interaction-title";
+  title.textContent = interaction.title;
+  card.append(title);
+  if (interaction.body) {
+    const body = document.createElement("div");
+    body.className = "runtime-card-body";
+    appendFormatted(body, interaction.body);
+    card.append(body);
+  }
+  if (interaction.kind === "plan" && interaction.transport === "native") {
+    const feedback = document.createElement("textarea");
+    feedback.className = "interaction-feedback";
+    feedback.rows = 2;
+    feedback.placeholder = "Feedback";
+    feedback.setAttribute("aria-label", "Plan review feedback");
+    feedback.value = interactionFeedbackDrafts.get(interaction.id) ?? "";
+    feedback.disabled = inFlight;
+    feedback.addEventListener("input", () =>
+      interactionFeedbackDrafts.set(interaction.id, feedback.value),
+    );
+    card.append(feedback);
+    let roleSelect: HTMLSelectElement | undefined;
+    if (interaction.tiers?.length) {
+      roleSelect = document.createElement("select");
+      roleSelect.className = "interaction-tier";
+      roleSelect.setAttribute("aria-label", "Plan review model tier");
+      for (const tier of interaction.tiers) {
+        const option = document.createElement("option");
+        option.value = tier.role;
+        option.textContent =
+          tier.label ??
+          [tier.role, tier.provider, tier.model].filter(Boolean).join(" · ");
+        roleSelect.append(option);
+      }
+      roleSelect.disabled = inFlight;
+      card.append(roleSelect);
+    }
+    const choices = document.createElement("div");
+    choices.className = "interaction-choices";
+    for (const option of interaction.options ?? []) {
+      const button = document.createElement("button");
+      button.type = "button";
+      button.className = /approv|accept|continue/i.test(option.label)
+        ? "send-btn interaction-choice"
+        : "ghost-btn interaction-choice";
+      button.textContent = option.label;
+      button.disabled = Boolean(option.disabled) || inFlight;
+      button.addEventListener("click", () => {
+        const note = option.id === "refine" ? feedback.value.trim() : "";
+        if (option.id === "refine" && !note) {
+          showToast("Add feedback before requesting a plan refinement", true);
+          feedback.focus();
+          return;
+        }
+        const role =
+          ["execute", "compact", "keep"].includes(option.id)
+            ? roleSelect?.value
+            : undefined;
+        void sendInteractionChoice(interaction, option.id, note, role);
+      });
+      choices.append(button);
+    }
+    if (choices.childElementCount) card.append(choices);
+    if (!(interaction.options ?? []).some((option) => !option.disabled)) {
+      const terminal = document.createElement("button");
+      terminal.type = "button";
+      terminal.className = "send-btn interaction-terminal-open";
+      terminal.textContent = "Terminal";
+      terminal.addEventListener("click", () => {
+        void openTerminalControls();
+      });
+      card.append(terminal);
+    }
+  } else {
+    const ownership = document.createElement("p");
+    ownership.className = "interaction-ownership";
+    ownership.textContent = "Read-only";
+    card.append(ownership);
+    if (interaction.questions?.length) {
+      const questions = document.createElement("details");
+      questions.className = "interaction-questions";
+      const summary = document.createElement("summary");
+      summary.textContent = "Questions";
+      questions.append(summary);
+      const pre = document.createElement("pre");
+      pre.className = "interaction-question-data";
+      pre.textContent = serializableUnknown(interaction.questions);
+      questions.append(pre);
+      card.append(questions);
+    }
+    const controls = document.createElement("button");
+    controls.type = "button";
+    controls.className = "send-btn interaction-terminal-open";
+    controls.textContent = "Terminal";
+    controls.addEventListener("click", () => {
+      void openTerminalControls(interaction.id);
+    });
+    card.append(controls);
+  }
+  area.append(card);
+}
+
+function renderAttachments(): void {
+  const tray = document.querySelector<HTMLElement>("#attachment-tray");
+  if (!tray || renderedAttachmentRevision === attachmentRevision) return;
+  renderedAttachmentRevision = attachmentRevision;
+  tray.innerHTML = "";
+  tray.classList.toggle("hidden", attachedImages.length === 0);
+  attachedImages.forEach((image, index) => {
+    const item = document.createElement("figure");
+    item.className = "attachment-preview";
+    const preview = document.createElement("button");
+    preview.type = "button";
+    preview.className = "attachment-preview-open";
+    preview.setAttribute("aria-label", `Preview attached image ${index + 1}`);
+    const img = document.createElement("img");
+    img.src = imageDataUrl(image) ?? "";
+    img.alt = `Attached image ${index + 1}`;
+    preview.append(img);
+    preview.addEventListener("click", () =>
+      openImageViewer(image, `Attached image ${index + 1}`),
+    );
+    const remove = document.createElement("button");
+    remove.type = "button";
+    remove.className = "attachment-remove";
+    remove.textContent = "Remove";
+    remove.setAttribute("aria-label", `Remove attached image ${index + 1}`);
+    remove.addEventListener("click", () => {
+      attachedImages = attachedImages.filter((_, itemIndex) => itemIndex !== index);
+      if (activeId) attachmentsBySlot.set(activeId, attachedImages);
+      attachmentRevision += 1;
+      renderAttachments();
+    });
+    item.append(preview, remove);
+    tray.append(item);
+  });
+}
+function clearSubmittedImages(
+  targetId: SlotId,
+  submittedImages: MobileImage[],
+): void {
+  if (!submittedImages.length) return;
+  const submitted = new Set(submittedImages);
+  const images =
+    targetId === activeId
+      ? attachedImages
+      : (attachmentsBySlot.get(targetId) ?? []);
+  const remaining = images.filter((image) => !submitted.has(image));
+  if (remaining.length === images.length) return;
+  attachmentsBySlot.set(targetId, remaining);
+  if (targetId === activeId) {
+    attachedImages = remaining;
+    attachmentRevision += 1;
+    renderAttachments();
+  }
+}
+
+function rasterMimeFromBytes(bytes: Uint8Array): string | undefined {
+  if (
+    bytes.length >= 8 &&
+    bytes[0] === 0x89 &&
+    bytes[1] === 0x50 &&
+    bytes[2] === 0x4e &&
+    bytes[3] === 0x47 &&
+    bytes[4] === 0x0d &&
+    bytes[5] === 0x0a &&
+    bytes[6] === 0x1a &&
+    bytes[7] === 0x0a
+  )
+    return "image/png";
+  if (bytes[0] === 0xff && bytes[1] === 0xd8 && bytes[2] === 0xff)
+    return "image/jpeg";
+  const signature = new TextDecoder().decode(bytes.subarray(0, 12));
+  if (/^GIF8[79]a/.test(signature)) return "image/gif";
+  if (signature.startsWith("RIFF") && signature.slice(8, 12) === "WEBP")
+    return "image/webp";
+  return undefined;
+}
+
+function bytesToBase64(bytes: Uint8Array): string {
+  let binary = "";
+  for (let offset = 0; offset < bytes.length; offset += 0x8000)
+    binary += String.fromCharCode(...bytes.subarray(offset, offset + 0x8000));
+  return btoa(binary);
+}
+
+async function encodeRasterImage(
+  file: File,
+  maximumBase64Chars: number,
+): Promise<MobileImage> {
+  if (file.size > 24 * 1024 * 1024)
+    throw new Error(`${file.name} is larger than the 24 MiB source limit.`);
+  const sourceBytes = new Uint8Array(await file.arrayBuffer());
+  const sourceMime = rasterMimeFromBytes(sourceBytes);
+  if (!sourceMime)
+    throw new Error(
+      `${file.name} is not a supported PNG, JPEG, WebP, or GIF image.`,
+    );
+  let bitmap: ImageBitmap;
+  try {
+    bitmap = await createImageBitmap(
+      new Blob([sourceBytes], { type: sourceMime }),
+    );
+  } catch {
+    throw new Error(`${file.name} could not be decoded as a raster image.`);
+  }
+  try {
+    const scale = Math.min(1, 2048 / Math.max(bitmap.width, bitmap.height));
+    const canvas = document.createElement("canvas");
+    canvas.width = Math.max(1, Math.round(bitmap.width * scale));
+    canvas.height = Math.max(1, Math.round(bitmap.height * scale));
+    const context = canvas.getContext("2d");
+    if (!context) throw new Error("This browser cannot process image attachments.");
+    context.fillStyle = "#fff";
+    context.fillRect(0, 0, canvas.width, canvas.height);
+    context.drawImage(bitmap, 0, 0, canvas.width, canvas.height);
+    for (const quality of [0.86, 0.72, 0.58, 0.44, 0.32]) {
+      const blob = await new Promise<Blob | null>((resolve) =>
+        canvas.toBlob(resolve, "image/jpeg", quality),
+      );
+      if (!blob) throw new Error(`${file.name} could not be encoded.`);
+      const encoded = new Uint8Array(await blob.arrayBuffer());
+      if (rasterMimeFromBytes(encoded) !== "image/jpeg")
+        throw new Error(`${file.name} produced an invalid JPEG encoding.`);
+      const data = bytesToBase64(encoded);
+      if (data.length <= maximumBase64Chars)
+        return { type: "image", mimeType: "image/jpeg", data };
+    }
+    throw new Error(`${file.name} is too large after safe raster conversion.`);
+  } finally {
+    bitmap.close();
+  }
+}
+
+async function addImageFiles(files: File[]): Promise<void> {
+  if (!files.length) return;
+  if (attachedImages.length + files.length > 8) {
+    showToast("A prompt can contain at most 8 images", true);
+    return;
+  }
+  const maximumBase64Chars = 3 * 1024 * 1024;
+  let remaining =
+    maximumBase64Chars -
+    attachedImages.reduce((total, image) => total + image.data.length, 0);
+  const next: MobileImage[] = [];
+  try {
+    for (const file of files) {
+      const image = await encodeRasterImage(file, remaining);
+      next.push(image);
+      remaining -= image.data.length;
+    }
+    for (const image of next) {
+      imageSubmissionIds.set(image, String(nextImageSubmissionId));
+      nextImageSubmissionId += 1;
+    }
+    attachedImages = [...attachedImages, ...next];
+    attachmentRevision += 1;
+    if (activeId) attachmentsBySlot.set(activeId, attachedImages);
+    renderAttachments();
+  } catch (error: unknown) {
+    showToast(errorMessage(error), true);
+  }
+}
+
+
+async function refreshTerminalControls(): Promise<void> {
+  const target = terminalControlsTarget;
+  const screen = document.querySelector<HTMLElement>("#terminal-control-screen");
+  if (!terminalControlVisible || !target || !screen) return;
+  const request = ++terminalControlRequest;
+  try {
+    const snapshot = await api<TerminalSnapshot>(
+      `/api/slots/${encodeURIComponent(target.slotId)}/terminal`,
+    );
+    if (
+      request !== terminalControlRequest ||
+      target !== terminalControlsTarget ||
+      activeId !== target.slotId ||
+      activeState?.generation !== target.generation
+    )
+      return;
+    terminalSnapshotForControls = snapshot;
+    const followBottom =
+      screen.dataset.hasSnapshot !== "true" ||
+      screen.scrollHeight - screen.clientHeight - screen.scrollTop < 24;
+    screen.textContent = snapshot.screen;
+    screen.dataset.hasSnapshot = "true";
+    if (followBottom) screen.scrollTop = screen.scrollHeight;
+    screen.dataset.writeAvailable = String(snapshot.capabilities.write);
+    document
+      .querySelectorAll<HTMLButtonElement>(".terminal-key, #terminal-text-send")
+      .forEach((button) => {
+        button.disabled = !snapshot.capabilities.write;
+      });
+  } catch (error: unknown) {
+    if (request !== terminalControlRequest) return;
+    terminalSnapshotForControls = null;
+    screen.textContent = hasAuth(error)
+      ? "Access token rejected."
+      : `Live terminal unavailable: ${errorMessage(error)}`;
+    document
+      .querySelectorAll<HTMLButtonElement>(".terminal-key, #terminal-text-send")
+      .forEach((button) => {
+        button.disabled = true;
+      });
+    if (hasAuth(error)) openTokenModal();
+  }
+}
+
+async function sendTerminalControl(text: string): Promise<boolean> {
+  const target = terminalControlsTarget;
+  if (!target || !text) return false;
+  if (
+    activeId !== target.slotId ||
+    activeState?.generation !== target.generation
+  ) {
+    showToast("Session changed; reopen terminal controls before sending", true);
+    return false;
+  }
+  if (terminalSnapshotForControls?.capabilities.write !== true) {
+    showToast(
+      terminalSnapshotForControls
+        ? "The live terminal is read-only"
+        : "Live terminal controls are still loading",
+      true,
+    );
+    return false;
+  }
+  try {
+    await api(`/api/slots/${encodeURIComponent(target.slotId)}/terminal`, {
+      method: "POST",
+      headers: { "X-OMP-Generation": target.generation },
+      body: JSON.stringify({
+        generation: target.generation,
+        type: "write",
+        text,
+        confirmed: true,
+        ...(target.interactionId ? { interactionId: target.interactionId } : {}),
+      }),
+    });
+    await refreshTerminalControls();
+    void loadState();
+    return true;
+  } catch (error: unknown) {
+    showToast(
+      errorStatus(error) === 409
+        ? "This dialog changed or was resolved. Refresh the session before sending more keys."
+        : hasAuth(error)
+          ? "Access token rejected"
+          : errorMessage(error),
+      true,
+    );
+    if (hasAuth(error)) openTokenModal();
+    else if (errorStatus(error) === 409) void loadState();
+    return false;
+  }
+}
+
+function openTerminalControls(interactionId?: string): void {
+  const targetId = activeId;
+  const generation = activeState?.generation;
+  if (!targetId || !generation) {
+    showToast("Live terminal is not ready", true);
+    return;
+  }
+  if (
+    interactionId &&
+    activeState?.runtime?.interaction?.id !== interactionId
+  ) {
+    showToast("This dialog is no longer pending", true);
+    return;
+  }
+  terminalControlsTarget = {
+    slotId: targetId,
+    generation,
+    ...(interactionId ? { interactionId } : {}),
+  };
+  terminalSnapshotForControls = null;
+  const body = document.createElement("div");
+  body.className = "terminal-controls";
+  const notice = document.createElement("p");
+  notice.className = "terminal-controls-notice";
+  notice.textContent = interactionId
+    ? "Terminal-owned dialog: each button sends one deliberate key to the current live dialog. No approval or answer is automatic."
+    : "Live terminal navigation. Each press sends only the selected key or text; no key macros are sent.";
+  body.append(notice);
+  const screen = document.createElement("pre");
+  screen.id = "terminal-control-screen";
+  screen.className = "terminal-control-screen";
+  screen.textContent = "Loading live terminal…";
+  body.append(screen);
+  const keys = document.createElement("div");
+  keys.className = "terminal-keypad";
+  const keyControls: Array<{ label: string; value: string; name: string }> = [
+    { label: "↑", value: "\u001b[A", name: "Arrow up" },
+    { label: "←", value: "\u001b[D", name: "Arrow left" },
+    { label: "↓", value: "\u001b[B", name: "Arrow down" },
+    { label: "→", value: "\u001b[C", name: "Arrow right" },
+    { label: "Enter", value: "\r", name: "Enter" },
+    { label: "Esc", value: "\u001b", name: "Escape" },
+    { label: "Tab", value: "\t", name: "Tab" },
+    { label: "Space", value: " ", name: "Space" },
+  ];
+  for (const control of keyControls) {
+    const button = document.createElement("button");
+    button.type = "button";
+    button.className = "ghost-btn terminal-key";
+    button.textContent = control.label;
+    button.setAttribute("aria-label", `Send ${control.name}`);
+    button.addEventListener("click", () => {
+      void sendTerminalControl(control.value);
+    });
+    button.disabled = true;
+    keys.append(button);
+  }
+  body.append(keys);
+  const form = document.createElement("form");
+  form.className = "terminal-text-form";
+  const input = document.createElement("input");
+  input.type = "text";
+  input.id = "terminal-text-input";
+  input.autocomplete = "off";
+  input.setAttribute("aria-label", "Text to type in the live terminal");
+  input.placeholder = "Type text (Enter is a separate key)";
+  const sendText = document.createElement("button");
+  sendText.type = "submit";
+  sendText.id = "terminal-text-send";
+  sendText.className = "send-btn";
+  sendText.textContent = "Type text";
+  sendText.disabled = true;
+  form.append(input, sendText);
+  form.addEventListener("submit", (event) => {
+    event.preventDefault();
+    const value = input.value;
+    if (!value) return;
+    void sendTerminalControl(value).then((sent) => {
+      if (sent) input.value = "";
+    });
+  });
+  body.append(form);
+  const overlay = makeModal("Live terminal controls", body);
+  overlay.classList.add("terminal-controls-backdrop");
+  terminalControlVisible = true;
+  const refreshTimer = window.setInterval(() => {
+    void refreshTerminalControls();
+  }, 1500);
+  modalDismiss = () => {
+    window.clearInterval(refreshTimer);
+    terminalControlVisible = false;
+    terminalControlsTarget = null;
+    terminalSnapshotForControls = null;
+    terminalControlRequest += 1;
+  };
+  void refreshTerminalControls();
+}
+
 function renderActive(): void {
   const slot = slotById(activeId);
   const state = activeState;
   const active = isAgentActive(state, slot);
+  const pendingInteraction = Boolean(state?.runtime?.interaction);
+  renderRuntime(state);
+  renderAttachments();
   syncTopBar();
   const prompt = requiredElement<HTMLTextAreaElement>("#prompt");
-  prompt.placeholder = activeId
-    ? "Message this session…"
-    : "Start or select a session…";
+  prompt.placeholder = pendingInteraction
+    ? "Resolve the pending dialog in live terminal controls…"
+    : activeId
+      ? "Message this session…"
+      : "Start or select a session…";
+  prompt.disabled = pendingInteraction;
   if (document.activeElement !== prompt) {
     prompt.value = draftFor();
     resizePrompt();
   }
   renderCommandMenu();
+  document
+    .querySelector<HTMLElement>("#command-menu")
+    ?.classList.toggle("hidden", pendingInteraction);
   const transcript = requiredElement<HTMLDivElement>("#transcript");
   if (state) {
     applyTheme(state.theme);
-    renderMessages(state.messages, active);
+    renderMessages(
+      transcriptMessagesFor(activeId, state),
+      active,
+      historyCacheFor(activeId, state),
+    );
   } else {
     applyTheme(null);
     const emptyText = activeId
@@ -3754,10 +4969,12 @@ function renderActive(): void {
   }
   const pendingContainer =
     requiredElement<HTMLDivElement>("#pending-messages");
-  const pendingMessages = state?.pendingMessages ?? [];
+  const pendingMessages = state?.runtime?.queue?.length
+    ? state.runtime.queue
+    : state?.pendingMessages ?? [];
   const hasPendingMessages = state?.hasPendingMessages === true;
   if (hasPendingMessages || pendingMessages.length > 0) {
-    const queueState = hasPendingMessages ? "Pending messages" : "Submitting";
+    const queueState = hasPendingMessages || state?.runtime?.queue?.length ? "Queued" : "Submitting";
     const messageItems = pendingMessages.length
       ? `<ol>${pendingMessages
           .map(
@@ -3784,8 +5001,8 @@ function renderActive(): void {
   renderActivity(state);
   const caps = requiredElement<HTMLDivElement>("#capabilities");
   let notice = "";
-  if ((state?.pendingApproval ?? 0) > 0) {
-    notice = "Approvals are handled on the desktop";
+  if (pendingInteraction) {
+    notice = "";
   } else if (state?.capabilities.prompt === false) {
     notice = state.capabilities.promptReason
       ? `Prompt disabled: ${state.capabilities.promptReason}`
@@ -3861,12 +5078,12 @@ function renderActive(): void {
 
   const modelBtn = requiredElement<HTMLButtonElement>("#model-open");
   modelBtn.textContent = state?.model ? normalizeModel(state.model) : "Model";
-  modelBtn.disabled = !capability("model");
+  modelBtn.disabled = pendingInteraction || !capability("model");
 
   const effortBtn = requiredElement<HTMLButtonElement>("#effort-open");
   effortBtn.textContent =
     state?.effort != null ? String(state.effort) : "Effort";
-  effortBtn.disabled = !capability("effort");
+  effortBtn.disabled = pendingInteraction || !capability("effort");
 
   const ctxLabel = document.querySelector<HTMLElement>("#ctx-label");
   if (ctxLabel) {
@@ -3899,7 +5116,18 @@ function renderActive(): void {
   abortBtn.classList.toggle("hidden", !active || !capability("abort"));
 
   const sendBtn = requiredElement<HTMLButtonElement>("#send");
-  sendBtn.disabled = !capability("prompt") || !slot.connected;
+  sendBtn.disabled =
+    pendingInteraction || !capability("prompt") || !slot.connected;
+  const attachButton =
+    requiredElement<HTMLButtonElement>("#attach-images");
+  const imageInput = requiredElement<HTMLInputElement>("#image-input");
+  attachButton.disabled = pendingInteraction;
+  imageInput.disabled = pendingInteraction;
+  document
+    .querySelectorAll<HTMLButtonElement>(".attachment-remove")
+    .forEach((button) => {
+      button.disabled = pendingInteraction;
+    });
 
   const effort =
     typeof state?.effort === "string" ? state.effort.trim().toLowerCase() : "";
@@ -3939,18 +5167,35 @@ function renderActive(): void {
  * the selection disappears. Never leave a stale id driving actions.
  */
 function reconcileActiveSlot(): void {
+  const liveIds = new Set(slots.map((slot) => slot.id));
   for (const id of [...cache.keys()]) {
-    if (id !== activeId && !slots.some((slot) => slot.id === id))
+    if (!liveIds.has(id)) {
       cache.delete(id);
+      clearFullMessagesForSlot(id);
+      olderHistoryBySlot.delete(id);
+      attachmentsBySlot.delete(id);
+      actionNeededBySlot.delete(id);
+    }
   }
   for (const id of [...drafts.keys()]) {
-    if (id !== activeId && !slots.some((slot) => slot.id === id))
-      drafts.delete(id);
+    if (!liveIds.has(id)) drafts.delete(id);
+  }
+  for (const id of [...olderHistoryBySlot.keys()]) {
+    if (!liveIds.has(id)) {
+      olderHistoryBySlot.delete(id);
+      clearFullMessagesForSlot(id);
+    }
+  }
+  for (const id of [...attachmentsBySlot.keys()]) {
+    if (!liveIds.has(id)) attachmentsBySlot.delete(id);
+  }
+  for (const id of [...actionNeededBySlot.keys()]) {
+    if (!liveIds.has(id)) actionNeededBySlot.delete(id);
   }
   for (const id of [...unreadBySlot.keys()]) {
-    if (!slots.some((slot) => slot.id === id)) unreadBySlot.delete(id);
+    if (!liveIds.has(id)) unreadBySlot.delete(id);
   }
-  if (activeId && slots.some((slot) => slot.id === activeId)) {
+  if (activeId && liveIds.has(activeId)) {
     if (!initialStateRequested) {
       initialStateRequested = true;
       void loadState();
@@ -3958,12 +5203,16 @@ function reconcileActiveSlot(): void {
     return;
   }
   const prompt = document.querySelector<HTMLTextAreaElement>("#prompt");
-  if (prompt && activeId) drafts.set(activeId, prompt.value);
+  if (activeId && liveIds.has(activeId)) drafts.set(activeId, prompt?.value ?? "");
+  if (activeId && liveIds.has(activeId))
+    attachmentsBySlot.set(activeId, attachedImages);
   // Falling back to another runtime (or none) changes the session identity:
   // any `/move` listing belongs to the runtime that just disappeared.
   dismissedMoveDraft = null;
   resetMoveCompletion();
   activeId = slots[0]?.id ?? "";
+  attachedImages = activeId ? (attachmentsBySlot.get(activeId) ?? []) : [];
+  attachmentRevision += 1;
   activeState = activeId ? cache.get(activeId) ?? null : null;
   stateError = null;
   if (prompt) {
@@ -4122,6 +5371,79 @@ async function openHistorySession(path: string): Promise<void> {
   }
   await createSlot({ resume: path }, "Session resumed");
 }
+function openResumeSessionModal(): void {
+  const body = document.createElement("div");
+  body.className = "resume-picker";
+  const input = document.createElement("input");
+  input.type = "search";
+  input.className = "resume-picker-search";
+  input.placeholder = "Filter saved sessions";
+  input.setAttribute("aria-label", "Filter saved sessions");
+  const status = document.createElement("p");
+  status.className = "resume-picker-status";
+  const list = document.createElement("ul");
+  list.className = "resume-session-list";
+  const refresh = document.createElement("button");
+  refresh.type = "button";
+  refresh.className = "ghost-btn resume-picker-refresh";
+  refresh.textContent = "Refresh sessions";
+  body.append(input, status, list, refresh);
+  makeModal("Resume session", body).classList.add("picker-backdrop");
+  const draw = (): void => {
+    list.innerHTML = "";
+    if (sessionsLoading) {
+      status.textContent = "Loading saved sessions…";
+      return;
+    }
+    if (sessionsError) {
+      status.textContent = `Saved sessions unavailable: ${sessionsError}`;
+      return;
+    }
+    const query = input.value.trim().toLowerCase();
+    const matching = sessions.filter((session) =>
+      `${session.title} ${session.cwd} ${session.path}`
+        .toLowerCase()
+        .includes(query),
+    );
+    status.textContent = matching.length
+      ? `${matching.length} saved session${matching.length === 1 ? "" : "s"}`
+      : "No saved sessions match this filter.";
+    for (const session of matching) {
+      const item = document.createElement("li");
+      const button = document.createElement("button");
+      button.type = "button";
+      button.className = "resume-session-option";
+      const title = document.createElement("strong");
+      title.textContent = session.title || session.path;
+      const location = document.createElement("small");
+      location.textContent = session.cwd;
+      const time = document.createElement("time");
+      time.dateTime = session.updatedAt;
+      const updated = Date.parse(session.updatedAt);
+      time.textContent = Number.isFinite(updated)
+        ? `Updated ${new Date(updated).toLocaleString()}`
+        : session.updatedAt;
+      button.append(title, location, time);
+      button.addEventListener("click", () => {
+        closeModal();
+        void openHistorySession(session.path);
+      });
+      item.append(button);
+      list.append(item);
+    }
+  };
+  input.addEventListener("input", draw);
+  refresh.addEventListener("click", () => {
+    refresh.disabled = true;
+    void loadSessions().then(() => {
+      refresh.disabled = false;
+      draw();
+    });
+  });
+  draw();
+  void loadSessions().then(draw);
+  window.setTimeout(() => input.focus(), 20);
+}
 function updateSessionActions(): void {
   const button = document.querySelector<HTMLButtonElement>("#new-session");
   if (!button) return;
@@ -4180,6 +5502,10 @@ function forgetSlot(id: SlotId): void {
   cache.delete(id);
   drafts.delete(id);
   unreadBySlot.delete(id);
+  actionNeededBySlot.delete(id);
+  olderHistoryBySlot.delete(id);
+  attachmentsBySlot.delete(id);
+  clearFullMessagesForSlot(id);
   resumeAdoptedFiles.delete(id);
   if (activeId === id) {
     activeId = "";
@@ -4314,6 +5640,20 @@ function sendPrompt(): void {
   const targetId = activeId;
   const targetState = activeState;
   const draftAtSend = prompt.value;
+  const imagesToSend = [...attachedImages];
+  if (targetState?.runtime?.interaction) {
+    showToast(
+      targetState.runtime.interaction.transport === "native"
+        ? "Choose an interaction option before sending another prompt"
+        : "This dialog is controlled by the live terminal",
+      true,
+    );
+    return;
+  }
+  if (!text && imagesToSend.length) {
+    showToast("Add a prompt before sending attached images", true);
+    return;
+  }
   if (!text) {
     const recent = recentForceableSubmission;
     const pendingIsBusy =
@@ -4328,7 +5668,38 @@ function sendPrompt(): void {
       void forcePendingMessages(targetId, targetState);
     return;
   }
-
+  if (/^\/model\s*$/i.test(text)) {
+    if (imagesToSend.length) {
+      showToast("Remove attached images before opening /model", true);
+      return;
+    }
+    openModelModal();
+    if (capability("model")) handleSendSuccess(targetId, draftAtSend);
+    return;
+  }
+  if (/^\/resume\s*$/i.test(text)) {
+    if (imagesToSend.length) {
+      showToast("Remove attached images before opening /resume", true);
+      return;
+    }
+    openResumeSessionModal();
+    handleSendSuccess(targetId, draftAtSend);
+    return;
+  }
+  if (/^\/tree\s*$/i.test(text)) {
+    if (imagesToSend.length) {
+      showToast("Remove attached images before opening /tree", true);
+      return;
+    }
+    void openTerminalControls();
+    if (targetId && targetState?.generation)
+      handleSendSuccess(targetId, draftAtSend);
+    return;
+  }
+  if (imagesToSend.length && text.startsWith("/")) {
+    showToast("Remove attached images before running a slash command", true);
+    return;
+  }
   const moveMatch = text.match(/^\/move(?:\s+(.*))?$/);
   if (moveMatch) {
     const rawPath = (moveMatch[1] || "").trim();
@@ -4394,7 +5765,12 @@ function sendPrompt(): void {
     return;
   }
   const generation = targetState?.generation ?? "";
-  const submissionKey = JSON.stringify([targetId, generation, text]);
+  const submissionKey = JSON.stringify([
+    targetId,
+    generation,
+    text,
+    imagesToSend.map((image) => imageSubmissionIds.get(image) ?? ""),
+  ]);
   const inFlight = inFlightPromptSubmissions.get(submissionKey);
   if (inFlight) {
     if (inFlight.forceable) inFlight.forceRequested = true;
@@ -4408,10 +5784,14 @@ function sendPrompt(): void {
     forceRequested: false,
   };
   inFlightPromptSubmissions.set(submissionKey, submission);
-  void sendAction({ type: "prompt", text }, targetId, targetState)
+  const action = imagesToSend.length
+    ? { type: "prompt" as const, text, images: imagesToSend }
+    : { type: "prompt" as const, text };
+  void sendAction(action, targetId, targetState)
     .then(async (sent) => {
       if (!sent) return;
       handleSendSuccess(targetId, draftAtSend);
+      clearSubmittedImages(targetId, imagesToSend);
       if (submission.forceable) {
         recentForceableSubmission = {
           targetId,

@@ -13,8 +13,8 @@ sessions as [OMP Desktop](https://github.com/cpu23/omp-desktop); add it to your 
 
 ## Requirements
 
-- Linux or macOS host with Git, [Bun 1.3+](https://bun.sh) and [OMP 18.x](https://omp.sh) on `PATH`; run `omp` once
-  and complete provider setup.
+- Linux or macOS host with Git, [Bun 1.3.14+](https://bun.sh) and [OMP 18.x](https://omp.sh) on `PATH`; run `omp` once
+  and complete provider setup. Mobile's structured UI integration is verified against OMP 18.12.1.
 - Current phone browser. HTTPS is required for remote access and home-screen installation; [Tailscale](https://tailscale.com/download)
   is the simplest private connection.
 
@@ -49,6 +49,17 @@ Open Tailscale's HTTPS URL, enter the token and use **Add to Home Screen** in yo
 local; share only the Mobile gateway over HTTPS.
 
 ## Releases
+
+### Unreleased
+
+- Render rule/system-violation notices, provider failures, retry/fallback/compaction state, goals, custom messages,
+  execution output, summaries, file mentions and message usage.
+- Surface pending `ask`, approvals and terminal-owned dialogs with live phone controls; render native plan reviews
+  with refinement feedback and execution-tier choices when supplied by OMP.
+- Display images, Mermaid, sanitized SVG, math and table-derived charts; attach images from the composer.
+- Load older history and recover full output/images instead of silently truncating; notify when a session needs action.
+
+See [UI coverage and host limits](docs/guide.md#transcript-and-interaction-coverage) before upgrading live sessions.
 
 **v0.1.1 — Source release; no native binaries or app-store packages.** [GitHub release](https://github.com/cpu23/omp-mobile/releases/tag/v0.1.1) · [Release notes](docs/release-v0.1.1.md).
 

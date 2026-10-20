@@ -24,24 +24,47 @@ self.addEventListener("push", (event) => {
       : slot || "OMP Mobile";
   const identity =
     typeof data.identity === "string" ? data.identity.slice(0, 180) : "";
-  const notificationData = { type: "completion", slot, identity };
+  const type = data.type === "action-needed" ? "action-needed" : "completion";
+  const actionLabel =
+    data.kind === "approval"
+      ? "Approval needed"
+      : data.kind === "ask"
+        ? "Question waiting"
+        : data.kind === "plan"
+          ? "Plan review needed"
+          : "Input needed";
+  const actionTitle =
+    typeof data.actionTitle === "string" ? data.actionTitle.trim().slice(0, 160) : "";
+  const body =
+    type === "completion"
+      ? "Session finished"
+      : actionTitle
+        ? `${actionLabel}: ${actionTitle}`
+        : actionLabel;
+  const notificationData = { type, slot, identity };
   event.waitUntil(
     Promise.all([
       self.registration.showNotification(title, {
-        body: "Session finished",
+        body,
         icon: "/icon-192.svg",
         badge: "/icon-192.svg",
         tag: identity
-          ? `omp-completion-${identity}`
-          : `omp-completion-${slot || "session"}`,
+          ? `omp-${type}-${identity}`
+          : `omp-${type}-${slot || "session"}`,
         renotify: true,
+        requireInteraction: type === "action-needed",
         data: notificationData,
       }),
       self.clients
         .matchAll({ type: "window", includeUncontrolled: true })
         .then((clients) => {
           for (const client of clients)
-            client.postMessage({ type: "omp-notification", slot, identity });
+            client.postMessage({
+              type: "omp-notification",
+              notificationType: type,
+              slot,
+              identity,
+            });
         }),
     ]),
   );

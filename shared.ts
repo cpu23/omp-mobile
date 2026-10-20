@@ -1,3 +1,10 @@
+import type {
+  MobileHistory,
+  MobileImage,
+  MobileInteractionAction,
+  MobileRuntime,
+} from "./parity-types";
+
 export const API_VERSION = 1 as const;
 
 /**
@@ -49,7 +56,7 @@ export type OmpMessage = {
   role?: string;
   type?: string;
   content?: unknown;
-  timestamp?: string;
+  timestamp?: string | null;
   [key: string]: unknown;
 };
 export type SlashCommand = {
@@ -196,6 +203,8 @@ export type SlotState = {
   completion?: CompletionMarker;
   agentActive?: boolean;
   activity?: SessionActivity;
+  runtime?: MobileRuntime;
+  history?: MobileHistory;
   connected?: boolean;
   error?: string;
 };
@@ -205,6 +214,7 @@ export type TerminalWriteAction = {
   type: "write";
   text: string;
   confirmed: true;
+  interactionId?: string;
 };
 export type TerminalSnapshot = {
   apiVersion: typeof API_VERSION;
@@ -226,7 +236,12 @@ export type PendingMessage = {
   text: string;
   status: "sending" | "queued";
 };
-export type PromptAction = { generation: string; type: "prompt"; text: string };
+export type PromptAction = {
+  generation: string;
+  type: "prompt";
+  text: string;
+  images?: MobileImage[];
+};
 export type AbortAction = { generation: string; type: "abort" };
 export type ForceAction = { generation: string; type: "force" };
 export type ModelAction = {
@@ -272,7 +287,9 @@ export type SlotAction =
   | ModelAction
   | EffortAction
   | CommandAction
-  | MoveAction;
+  | MoveAction
+  | MobileInteractionAction;
+
 
 export type DirectoryEntry = {
   name: string;
