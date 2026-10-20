@@ -3,7 +3,7 @@
 For the short install steps, see the [README](../README.md). This guide covers the gateway, desktop-daemon integration,
 security, configuration and operational details.
 
-Screenshots: [session and composer](screenshots/chat.png) · [sidebar settings](screenshots/settings.png).
+Screenshots: [session and composer](screenshots/chat.png) · [to-do drawer](screenshots/todos.png) · [sidebar settings](screenshots/settings.png).
 Captured at 1290 × 2796 pixels (430 × 932 CSS pixels, 3× scale) using disposable sessions.
 
 ## Requirements and service relationship
