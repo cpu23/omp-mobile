@@ -5,6 +5,11 @@
 Send prompts, read replies and switch sessions from your phone. OMP Mobile uses the same live [OMP](https://omp.sh)
 sessions as [OMP Desktop](https://github.com/cpu23/omp-desktop); add it to your home screen.
 
+<p>
+  <img src="docs/screenshots/chat.png" alt="Mobile session transcript and composer" width="260">
+  <img src="docs/screenshots/settings.png" alt="Mobile sidebar settings and shared session limit" width="260">
+</p>
+
 ## Requirements
 
 - Linux or macOS host with Git, [Bun 1.3+](https://bun.sh) and [OMP 18.x](https://omp.sh) on `PATH`; run `omp` once
@@ -44,7 +49,7 @@ local; share only the Mobile gateway over HTTPS.
 
 ## Releases
 
-**v0.1.0 — Source release; no native binaries or app-store packages.** [GitHub release](https://github.com/cpu23/omp-mobile/releases/tag/v0.1.0) · [Release notes](docs/release-v0.1.0.md).
+**v0.1.1 — Source release; no native binaries or app-store packages.** [GitHub release](https://github.com/cpu23/omp-mobile/releases/tag/v0.1.1) · [Release notes](docs/release-v0.1.1.md).
 
 ## Upstream & ecosystem
 
