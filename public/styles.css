@@ -1818,9 +1818,9 @@ pre,
   border: 0;
   background: var(--session-accent, var(--muted));
   color: var(--dark);
-  min-height: 22px;
-  width: 22px;
-  height: 22px;
+  min-height: 29px;
+  width: 29px;
+  height: 29px;
   padding: 0;
   border-radius: 50%;
   font: 700 11px var(--mono);
@@ -1835,17 +1835,17 @@ pre,
 }
 
 #send svg {
-  width: 12px;
-  height: 12px;
+  width: 16px;
+  height: 16px;
 }
 
 #attach-images {
-  width: 22px;
-  height: 22px;
-  min-height: 22px;
+  width: 29px;
+  height: 29px;
+  min-height: 29px;
   padding: 0;
   border-radius: 4px;
-  font-size: 12px;
+  font-size: 16px;
   display: inline-flex;
   align-items: center;
   justify-content: center;

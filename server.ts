@@ -1233,6 +1233,9 @@ function normaliseRuntime(value: unknown): MobileRuntime | undefined {
         finiteNumber(notice.timestamp) === undefined
       )
         continue;
+      // Running older extensions may still emit this redundant queue-status notice.
+      if (tone === "info" && notice.title.trim() === "Queue text unavailable")
+        continue;
       notices.push({
         id: notice.id,
         tone,

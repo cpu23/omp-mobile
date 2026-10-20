@@ -40,11 +40,13 @@ the session was busy, forces the queue only after the first submission succeeds.
 the session is active, an empty composer changes the circular upward-arrow **Send** button to a lightning-bolt **Force** icon; tapping it (or submitting empty Enter)
 interrupts the current run so OMP drains the pending queue, matching desktop's empty-Enter behavior. OMP's public
 extension API may expose queue availability without desktop-origin text; those items show only **Queued**. A single queue card prefers host queue text when available, otherwise mobile-submitted text, with **Submitting** before confirmation. It does not repeat help or API-limitation notices.
+The gateway also discards the redundant informational **Queue text unavailable** notice from already-running older
+extensions, so testing the updated gateway does not require restarting sessions merely to remove that card.
 Restart the affected session for this extension update to take effect.
 Pending dialogs keep their instructions in the interaction card rather than repeating them below the composer.
 Terminal-owned option cards are read-only, but their **Terminal** action opens deliberate live controls; unavailable
 native plan choices use the same action. The ordinary composer is disabled while a dialog is awaiting a response.
-The composer uses compact 22px Send and image-attachment buttons; the Send arrow scales with its circular control.
+The composer uses compact 29px Send and image-attachment buttons; the Send arrow scales with its circular control.
 
 Typing `/move` in the composer opens a directory picker instead of sending the command. Choices are listed as you type: absolute paths are used as-is, relative paths resolve from the session's working directory, `~` expands to the gateway user's home (still confined to `OMP_MOBILE_ROOT`), and a trailing slash (or selecting a folder) lists its subdirectories. Tapping a folder fills `/move <path>`; use the send button (or Enter) to move. Up/Down and Tab work with hardware keyboards, and Escape dismisses the list without affecting other slash commands. Every listing is tied to the session and working directory it was resolved against: switching sessions, resuming another transcript, or a session whose cwd changed (`cd` in the desktop terminal, or a completed move) discards the cached picker, and a listing that arrives after such a change is ignored, so a destination from another working directory is never offered or submitted.
 

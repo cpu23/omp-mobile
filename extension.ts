@@ -2393,7 +2393,6 @@ export default function registerMobileRemote(pi: ExtensionAPI): void {
   let runtimeNotices: MobileNotice[] = [];
   let runtimeStatus: MobileRuntime["status"];
   let runtimeGoal: MobileRuntime["goal"];
-  let queueAvailabilityNoticed = false;
 
   function addRuntimeNotice(
     tone: MobileNotice["tone"],
@@ -2415,7 +2414,6 @@ export default function registerMobileRemote(pi: ExtensionAPI): void {
     runtimeNotices = [];
     runtimeStatus = undefined;
     runtimeGoal = undefined;
-    queueAvailabilityNoticed = false;
   }
 
   function runtimeSnapshot(now = Date.now()): MobileRuntime {
@@ -2887,15 +2885,6 @@ export default function registerMobileRemote(pi: ExtensionAPI): void {
         text: truncateText(message.text, MAX_TEXT_CHARS),
         status: hasPendingMessages ? "queued" : "sending",
       }));
-    if (!hasPendingMessages) queueAvailabilityNoticed = false;
-    else if (!queueAvailabilityNoticed) {
-      addRuntimeNotice(
-        "info",
-        "Queue text unavailable",
-        "This OMP extension API reports whether messages are queued but does not expose their text. Mobile-submitted prompts are listed separately; use the live terminal to inspect other queued messages.",
-      );
-      queueAvailabilityNoticed = true;
-    }
     const runtime = runtimeSnapshot(now);
     if (interaction) runtime.interaction = interaction;
     const state: MobileState = {

@@ -54,6 +54,27 @@ test("state normalisation bounds snapshots and rejects malformed history and not
   expect(malformed?.runtime).toEqual({ notices: [] });
 });
 
+test("queue availability does not become a large runtime notice", () => {
+  const state = normaliseState({
+    generation: "queue-generation",
+    messages: [],
+    hasPendingMessages: true,
+    runtime: {
+      queue: [{ text: "Follow-up" }],
+      notices: [
+        { id: "queue-limit", tone: "info", title: "Queue text unavailable", timestamp: 1 },
+        { id: "provider-error", tone: "error", title: "Provider disconnected", timestamp: 2 },
+        { id: "queue-warning", tone: "warning", title: "Queue text unavailable", timestamp: 3 },
+      ],
+    },
+  });
+  expect(state?.hasPendingMessages).toBe(true);
+  expect(state?.runtime?.queue).toEqual([{ text: "Follow-up" }]);
+  expect(state?.runtime?.notices.map((notice) => notice.id)).toEqual([
+    "provider-error", "queue-warning",
+  ]);
+});
+
 test("native plan actions reject stale ids/generations and accept only exposed choices", () => {
   const state = normaliseState({
     generation: "generation-1",
