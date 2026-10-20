@@ -36,16 +36,18 @@ Typing `/move` in the composer opens a directory picker instead of sending the c
 
 While a session works, the composer shows the host's descriptive tool intent (for example “Trading installed graphics configuration”)
 with the spinner and shimmer, falling back to “Working…” only when the host exposes no intent for the current turn.
-Above the composer, a compact activity dock lists the session's todo phases and tasks as they update, including pending,
-in-progress, completed, abandoned and blocked rows with blocker notes. The dock follows both todo sources in the branch:
+Todos, subagents and background jobs share one compact, closed-by-default drawer attached flush to the composer, with the same surface and no drawer or pull-tab outline. When closed, only a rounded gray-arrow tab, 95% of the composer width and 14px tall, remains behind the composer's top edge: no counts or separate Details control. The entire top strip is tappable in both states, not just the arrow or label. Tap it, pull up to open, or pull down to close. All drawer content shares one capped, scrollable area. Todos keep only the last finished task plus unfinished tasks and use square checkbox markers (accented for the current task). Phase headings retain their Roman numeral positions, including when earlier phases disappear. Unstarted phases are collapsed; tap a phase heading to expand it.
+The composer's top corners stay rounded whether the drawer is open or closed, matching the accent/context track. The open drawer surface extends behind those curves so no page-background gaps appear at the junction.
+The drawer includes blocked-task notes and follows both todo sources in the branch:
 `todo` tool results and the user todo edits the host records as `user_todo_edit` custom entries, so a list changed from
-the desktop terminal (or cleared back to empty) shows the same way. Subagent and background-job counts sit on an
-expandable row: expanding it shows desktop-style per-agent rows (id, agent type, status, spawn description, current
-activity, tool/request/token/context/cost/duration/model, retry notes and terminal errors) and running or recently
+the desktop terminal (or cleared back to empty) shows the same way. Opening the drawer also shows desktop-style
+per-agent rows (id, agent type, status, spawn description, current activity, tool/request/token/context/cost/duration/model,
+retry notes and terminal errors) and running or recently
 finished, failed or cancelled background jobs. `task` tool cards in the transcript carry the same subagent count and rows, so they
 are distinct from ordinary wait/tool calls. Activity is rebuilt for the selected runtime and generation on every refresh;
 switching sessions drops expanded details and never carries another session's agents, jobs or todos. Todo, subagent and
 job rows are display-only — approvals, cancellation and further coordination remain on the desktop.
+The Subagents section inside the open drawer is independently collapsible and defaults to collapsed. Its expansion survives activity refreshes; closing the drawer resets it. The heading omits the running label when none are running.
 Subagent rows use the host's task results and process-global agent registry; a host build without the registry export
 still shows persisted task results, but detached progress may lag until the next refresh.
 
@@ -77,6 +79,10 @@ bun run start          # http://127.0.0.1:4173
 Start the daemon in `../omp-desktop` with `bun install && bun run start`. Either service may start first; they reconnect,
 and the daemon injects the extension into each session it spawns. Open the gateway URL and enter the token printed by
 `bun run setup --show`. **Settings → Access token** reopens token entry at any time.
+
+The app starts loading live runtimes immediately and requests the selected runtime's state as soon as the validated
+runtime list arrives. Saved-session history, pins, and notification setup/status load independently; neither they nor
+their first responses gate live-session refresh polling.
 
 `bun run dev` runs watch mode; `bun run check` typechecks and `bun test` runs unit tests. With both sibling checkouts
 present, `bun run release:check` in `../omp-desktop` tests fresh installs, token setup/reuse and a shared-runtime start,
