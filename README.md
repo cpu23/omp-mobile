@@ -7,10 +7,9 @@ sessions as [OMP Desktop](https://github.com/cpu23/omp-desktop); add it to your 
 
 <p>
   <img src="docs/screenshots/chat.png" alt="Mobile session transcript and composer" width="260">
+  <img src="docs/screenshots/todos.png" alt="Mobile session with the expanded to-do drawer: active task in the session accent, pending tasks in neutral text" width="260">
   <img src="docs/screenshots/settings.png" alt="Mobile sidebar settings and shared session limit" width="260">
 </p>
-
-<img src="docs/screenshots/todos.png" alt="Expanded to-do drawer: active task in the session accent, pending tasks in neutral text" width="520">
 
 ## Requirements
 
