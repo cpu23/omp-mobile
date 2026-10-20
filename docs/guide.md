@@ -68,7 +68,7 @@ the latest messages stay in view as the keyboard opens or closes.
 On phone-sized screens, swipe right across the chat to open the sidebar, and left across the sidebar to close it.
 The drawer responds during the swipe. Closing swipes can start on sidebar buttons without activating them;
 ordinary taps still work. Vertical scrolling, selected text and text inputs do not trigger closing.
-Opening swipes also leave controls and code blocks alone; the menu button remains available.
+Opening swipes also leave controls, code blocks and overflowing horizontal scroll containers (including tables) alone, even at their scroll edges; the menu button remains available.
 
 ## Install and start
 
