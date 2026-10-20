@@ -1818,9 +1818,9 @@ pre,
   border: 0;
   background: var(--session-accent, var(--muted));
   color: var(--dark);
-  min-height: 44px;
-  width: 44px;
-  height: 44px;
+  min-height: 22px;
+  width: 22px;
+  height: 22px;
   padding: 0;
   border-radius: 50%;
   font: 700 11px var(--mono);
@@ -1828,6 +1828,24 @@ pre,
   transition:
     filter 0.15s ease,
     opacity 0.15s ease;
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  flex: 0 0 auto;
+}
+
+#send svg {
+  width: 12px;
+  height: 12px;
+}
+
+#attach-images {
+  width: 22px;
+  height: 22px;
+  min-height: 22px;
+  padding: 0;
+  border-radius: 4px;
+  font-size: 12px;
   display: inline-flex;
   align-items: center;
   justify-content: center;
