@@ -47,6 +47,8 @@ Pending dialogs keep their instructions in the interaction card rather than repe
 Terminal-owned option cards are read-only, but their **Terminal** action opens deliberate live controls; unavailable
 native plan choices use the same action. The ordinary composer is disabled while a dialog is awaiting a response.
 The composer uses compact 29px Send and image-attachment buttons; the Send arrow scales with its circular control.
+Cross icons stop the current task in the composer or stop a session from its sidebar card; tooltips and accessible
+labels distinguish the actions, and the sidebar retains its stop confirmation.
 
 Typing `/move` in the composer opens a directory picker instead of sending the command. Choices are listed as you type: absolute paths are used as-is, relative paths resolve from the session's working directory, `~` expands to the gateway user's home (still confined to `OMP_MOBILE_ROOT`), and a trailing slash (or selecting a folder) lists its subdirectories. Tapping a folder fills `/move <path>`; use the send button (or Enter) to move. Up/Down and Tab work with hardware keyboards, and Escape dismisses the list without affecting other slash commands. Every listing is tied to the session and working directory it was resolved against: switching sessions, resuming another transcript, or a session whose cwd changed (`cd` in the desktop terminal, or a completed move) discards the cached picker, and a listing that arrives after such a change is ignored, so a destination from another working directory is never offered or submitted.
 

@@ -615,14 +615,17 @@ textarea:focus-visible {
 
 .slot-stop {
   flex: 0 0 auto;
-  padding: 2px 8px;
+  width: 24px;
+  height: 24px;
+  padding: 0;
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
   border: 1px solid var(--line);
   border-radius: 999px;
   background: transparent;
   color: var(--dim);
-  font: 700 9px var(--mono);
-  text-transform: uppercase;
-  letter-spacing: 0.04em;
+  line-height: 1;
   cursor: pointer;
 }
 
@@ -1953,9 +1956,10 @@ pre,
   border: 1px solid rgba(255, 71, 87, 0.4);
   background: rgba(255, 71, 87, 0.08);
   color: var(--danger);
-  min-height: 28px;
-  height: 28px;
-  padding: 0 10px;
+  min-height: 29px;
+  width: 29px;
+  height: 29px;
+  padding: 0;
   border-radius: 6px;
   cursor: pointer;
   font: 700 11px var(--mono);
