@@ -280,6 +280,7 @@ let slotsError: string | null = null;
 let stateError: string | null = null;
 let slotsRequest = 0;
 let stateRequest = 0;
+let initialStateRequested = false;
 let creatingSession = false;
 let activeId: SlotId = "";
 let activeState: ClientState | null = null;
@@ -307,8 +308,8 @@ let moveCompletion: MoveCompletion | null = null;
 let moveCompletionTimer = 0;
 let moveCompletionSerial = 0;
 let dismissedMoveDraft: string | null = null;
-/** Expanded activity details, retained only for the session that opened them. */
-let activityExpanded = false;
+/** One activity drawer, retained only for the session that opened it. */
+let todosExpanded = false;
 let activitySlot: SlotId | null = null;
 let lastComposerWorkingText = "";
 let unreadBySlot = new Map<SlotId, CompletionMarker[]>();
@@ -1067,11 +1068,51 @@ function renderShell(): void {
         <button class="sidebar-action" id="reasoning-toggle" type="button" aria-label="Toggle reasoning" aria-pressed="true">${ICONS.sparkles}<span>Reasoning</span><span id="reasoning-state">On</span></button>
         <button class="sidebar-action" id="notifications-enable" type="button" aria-label="Enable notifications" title="Enable notifications">${ICONS.bellDefault}<span>Notifications</span></button>
         <button class="sidebar-action" id="token-open" type="button">${ICONS.key}<span>Access token</span></button>
+        <form id="session-limit-form" class="session-limit">
+          <label for="session-limit-input">Max sessions</label>
+          <input id="session-limit-input" type="number" min="1" step="1" required inputmode="numeric" disabled aria-describedby="session-limit-status">
+          <button class="sidebar-action" id="session-limit-save" type="submit" disabled>Save session limit</button>
+          <p id="session-limit-status" role="status" aria-live="polite"></p>
+          <button class="sidebar-action" id="session-limit-restart" type="button" hidden>Restart daemon to apply</button>
+        </form>
       </section>
     </aside><button class="sidebar-backdrop" id="sidebar-close" type="button" aria-label="Close sessions"></button>
     <section class="workspace"><div class="capabilities hidden" id="capabilities"></div><div class="transcript" id="transcript" tabindex="0" aria-label="Session transcript"></div><pre class="raw-view hidden" id="raw-view" tabindex="0" aria-label="Raw terminal output"></pre><button class="scroll-fab hidden" id="scroll-bottom" type="button" aria-label="Scroll to bottom">${ICONS.arrowDown}</button></section></main>
-    <div class="composer-dock"><section class="activity-dock hidden" id="activity-dock" aria-label="Session activity"><div class="activity-todos" id="activity-todos"></div><button type="button" class="activity-summary" id="activity-toggle" aria-expanded="false" aria-controls="activity-details"><span class="activity-chips" id="activity-chips"></span><span class="activity-toggle-label" id="activity-toggle-label">Details</span></button><div class="activity-details hidden" id="activity-details"></div></section><form class="composer" id="composer"><div class="command-menu hidden" id="command-menu" role="listbox" aria-label="Slash commands"></div><div class="composer-ctx"></div><div class="composer-working hidden" id="composer-working" role="status" aria-live="polite"><span class="working-spinner" aria-hidden="true">${SPINNER_FRAMES[0]}</span><span class="shimmer shimmer-accent" id="composer-working-text">${shimmerMarkup("Working…")}</span></div><div class="composer-input"><textarea id="prompt" rows="1" placeholder="Message this session…" aria-label="Message this session" aria-autocomplete="list" aria-controls="command-menu" aria-expanded="false"></textarea></div><div class="composer-tools"><div class="composer-meta" id="composer-meta"><button type="button" class="ghost-btn" id="model-open">Model</button><button type="button" class="ghost-btn" id="effort-open">Effort</button><span id="ctx-label"></span><span id="cost-label"></span></div><button type="button" class="abort-btn hidden" id="abort">Stop</button><button type="submit" class="send-btn" id="send">Send</button></div></form>
+    <div class="composer-dock"><section class="activity-dock hidden" id="activity-dock" aria-label="Session activity"><div id="activity-content" class="activity-content hidden"><div class="activity-todos" id="activity-todos"></div><div class="activity-details hidden" id="activity-details"></div></div></section><form class="composer" id="composer"><div class="command-menu hidden" id="command-menu" role="listbox" aria-label="Slash commands"></div><div class="composer-ctx"></div><div class="composer-working hidden" id="composer-working" role="status" aria-live="polite"><span class="working-spinner" aria-hidden="true">${SPINNER_FRAMES[0]}</span><span class="shimmer shimmer-accent" id="composer-working-text">${shimmerMarkup("Working…")}</span></div><div class="composer-input"><textarea id="prompt" rows="1" placeholder="Message this session…" aria-label="Message this session" aria-autocomplete="list" aria-controls="command-menu" aria-expanded="false"></textarea></div><div class="composer-tools"><div class="composer-meta" id="composer-meta"><button type="button" class="ghost-btn" id="model-open">Model</button><button type="button" class="ghost-btn" id="effort-open">Effort</button><span id="ctx-label"></span><span id="cost-label"></span></div><button type="button" class="abort-btn hidden" id="abort">Stop</button><button type="submit" class="send-btn" id="send">Send</button></div></form>
   </div>`;
+  requiredElement<HTMLElement>("#activity-content").insertAdjacentHTML("beforebegin",
+    `<button type="button" class="todo-pull-tab" id="todo-toggle" aria-expanded="false" aria-controls="activity-content"><span id="todo-toggle-label">Activity</span><svg width="12" height="12" viewBox="0 0 12 12" fill="none" stroke="currentColor" aria-hidden="true"><path d="m3 7 3-3 3 3"/></svg></button>`);
+  const todoTab = requiredElement<HTMLButtonElement>("#todo-toggle");
+  let todoPullStart: number | null = null;
+  let todoPulled = false;
+  todoTab.addEventListener("pointerdown", (event) => {
+    if (!event.isPrimary || event.button !== 0) return;
+    todoPullStart = event.clientY;
+    todoPulled = false;
+    todoTab.setPointerCapture(event.pointerId);
+  });
+  todoTab.addEventListener("pointerup", (event) => {
+    if (todoPullStart === null) return;
+    const distance = event.clientY - todoPullStart;
+    todoPullStart = null;
+    if (Math.abs(distance) < 12) return;
+    todoPulled = true;
+    todosExpanded = distance < 0;
+    activitySlot = activeId;
+    renderActivity(activeState);
+    syncAnimation();
+  });
+  todoTab.addEventListener("pointercancel", () => { todoPullStart = null; });
+  todoTab.addEventListener("click", () => {
+    if (todoPulled) {
+      todoPulled = false;
+      return;
+    }
+    todosExpanded = !todosExpanded;
+    activitySlot = activeId;
+    renderActivity(activeState);
+    syncAnimation();
+  });
   const sidebar = requiredElement<HTMLElement>("#sidebar");
   const menu = requiredElement<HTMLButtonElement>("#menu-open");
   bindSidebarSettings(sidebar);
@@ -1093,15 +1134,6 @@ function renderShell(): void {
   requiredElement<HTMLButtonElement>("#sidebar-close").addEventListener(
     "click",
     closeSidebar,
-  );
-  requiredElement<HTMLButtonElement>("#activity-toggle").addEventListener(
-    "click",
-    () => {
-      activityExpanded = !activityExpanded;
-      activitySlot = activeId;
-      renderActivity(activeState);
-      syncAnimation();
-    },
   );
   requiredElement<HTMLButtonElement>("#pin-open").addEventListener(
     "click",
@@ -1460,12 +1492,81 @@ function bindSidebarSettings(sidebar: HTMLElement): void {
   const settings = requiredElement<HTMLElement>("#sidebar-settings", sidebar);
   const open = requiredElement<HTMLButtonElement>("#sidebar-settings-open", sidebar);
   const back = requiredElement<HTMLButtonElement>("#sidebar-settings-back", sidebar);
+  const form = requiredElement<HTMLFormElement>("#session-limit-form", sidebar);
+  const input = requiredElement<HTMLInputElement>("#session-limit-input", sidebar);
+  const save = requiredElement<HTMLButtonElement>("#session-limit-save", sidebar);
+  const restart = requiredElement<HTMLButtonElement>("#session-limit-restart", sidebar);
+  const status = requiredElement<HTMLElement>("#session-limit-status", sidebar);
+  let busy = false;
+  let loaded = false;
+  type RuntimeSettings = {
+    maxRuntimes: number;
+    effectiveMaxRuntimes: number;
+    restartRequired: boolean;
+  };
+  const update = async (method: "GET" | "PUT" | "POST"): Promise<void> => {
+    if (busy) return;
+    busy = true;
+    input.disabled = save.disabled = restart.disabled = true;
+    status.textContent = method === "POST"
+      ? "Restarting the shared daemon stops running work in desktop and mobile. Sessions reopen from saved transcripts; execution does not continue. Wait until work finishes before restarting."
+      : "Loading session limit…";
+    try {
+      if (method === "POST") await api("/api/restart", { method: "POST" });
+      let current: RuntimeSettings | undefined;
+      const deadline = Date.now() + 60_000;
+      do {
+        try {
+          current = await api<RuntimeSettings>("/api/settings", {
+            method: method === "PUT" ? "PUT" : "GET",
+            ...(method === "PUT" ? { body: JSON.stringify({ maxRuntimes: Number(input.value) }) } : {}),
+          });
+          if (!Number.isSafeInteger(current.maxRuntimes) || current.maxRuntimes < 1 ||
+              !Number.isSafeInteger(current.effectiveMaxRuntimes) || current.effectiveMaxRuntimes < 1 ||
+              typeof current.restartRequired !== "boolean")
+            throw new Error("Invalid daemon settings response");
+          if (method !== "POST" || !current.restartRequired) break;
+        } catch (error) {
+          if (method !== "POST" || hasAuth(error)) throw error;
+        }
+        const { promise, resolve } = Promise.withResolvers<void>();
+        setTimeout(resolve, 1000);
+        await promise;
+      } while (Date.now() < deadline);
+      if (!current || (method === "POST" && current.restartRequired))
+        throw new Error("Daemon restart not confirmed. Reopen Settings to check its status.");
+      input.value = String(current.maxRuntimes);
+      loaded = true;
+      restart.hidden = !current.restartRequired;
+      status.textContent = `Max sessions ${current.maxRuntimes}; in effect now ${current.effectiveMaxRuntimes}.` +
+        (current.restartRequired
+          ? " Restart required to apply. Restarting the shared daemon stops running work in desktop and mobile. Sessions reopen from saved transcripts, but their previous execution does not continue. Wait until work finishes before restarting."
+          : method === "POST"
+            ? " The shared daemon restarted: running work in desktop and mobile stopped. Sessions reopened from saved transcripts; execution did not continue. Wait until work finishes before restarting."
+            : "");
+    } catch (error) {
+      status.textContent = error instanceof Error ? error.message : String(error);
+    } finally {
+      busy = false;
+      input.disabled = save.disabled = !loaded;
+      restart.disabled = false;
+    }
+  };
+  form.addEventListener("submit", (event) => {
+    event.preventDefault();
+    if (form.reportValidity()) void update("PUT");
+  });
+  restart.addEventListener("click", () => {
+    if (confirm("Restart the shared daemon? This stops running work in desktop and mobile. Sessions reopen from their saved transcripts; execution does not continue. Wait until work finishes before restarting."))
+      void update("POST");
+  });
   const show = (visible: boolean): void => {
     sessions.hidden = visible;
     settings.hidden = !visible;
     open.setAttribute("aria-expanded", String(visible));
     (visible ? back : open).focus();
     syncAnimation();
+    if (visible) void update("GET");
   };
   open.addEventListener("click", () => show(true));
   back.addEventListener("click", () => show(false));
@@ -3470,9 +3571,9 @@ async function loadRawTerminal(): Promise<void> {
 }
 
 const TODO_MARKER: Record<string, string> = {
-  pending: "○",
-  in_progress: "◐",
-  completed: "✓",
+  pending: "☐",
+  in_progress: "☐",
+  completed: "☑",
   abandoned: "–",
   blocked: "!",
 };
@@ -3484,23 +3585,20 @@ const TODO_STATE_LABEL: Record<string, string> = {
   blocked: "blocked",
 };
 
-/**
- * Compact activity surface above the composer, mirroring desktop's sticky HUD:
- * the todo list is always visible; subagent/background-job counts expand into
- * per-agent rows with task, current activity and usage.
- */
+/** One composer-attached drawer owns todos, subagents and background jobs. */
 function renderActivity(state: ClientState | null): void {
   const dock = document.querySelector<HTMLElement>("#activity-dock");
   const todosEl = document.querySelector<HTMLElement>("#activity-todos");
-  const toggle = document.querySelector<HTMLButtonElement>("#activity-toggle");
-  const chips = document.querySelector<HTMLElement>("#activity-chips");
-  const label = document.querySelector<HTMLElement>("#activity-toggle-label");
+  const todoToggle = document.querySelector<HTMLButtonElement>("#todo-toggle");
+  const todoLabel = document.querySelector<HTMLElement>("#todo-toggle-label");
+  const content = document.querySelector<HTMLElement>("#activity-content");
   const details = document.querySelector<HTMLElement>("#activity-details");
-  if (!dock || !todosEl || !toggle || !chips || !label || !details) return;
+  if (!dock || !todosEl || !todoToggle || !todoLabel || !content || !details) return;
 
   if (activitySlot !== activeId) {
     activitySlot = activeId;
-    activityExpanded = false;
+    todosExpanded = false;
+    todosEl.innerHTML = "";
   }
   const activity: SessionActivity | undefined = state?.activity;
   const todoPhases = (activity?.todos ?? []).filter(
@@ -3516,62 +3614,68 @@ function renderActivity(state: ClientState | null): void {
   const hasDetails = agents.length > 0 || jobs.length > 0;
   const visible = hasTodos || hasDetails;
   dock.classList.toggle("hidden", !visible);
+  content.classList.toggle("hidden", !visible || !todosExpanded);
+  dock.classList.toggle("todos-closed", !todosExpanded);
   if (!visible) {
     details.classList.add("hidden");
     return;
   }
 
+  todoToggle.hidden = !visible;
+  todoToggle.setAttribute("aria-expanded", String(todosExpanded));
+  todoToggle.setAttribute("aria-label", todosExpanded ? "Close activity drawer" : "Open activity drawer");
+  todoLabel.textContent = "Activity";
   if (hasTodos) {
-    const todoRows = todoPhases
-      .map((phase) => {
-        const rows = phase.tasks
-          .map((todo) => {
-            const status = TODO_STATE_LABEL[todo.status] ?? todo.status;
-            return `<div class="activity-todo is-${esc(todo.status)}" aria-label="${esc(`${status}: ${todo.content}`)}"><span class="activity-todo-marker" aria-hidden="true">${esc(TODO_MARKER[todo.status] ?? "○")}</span><span class="activity-todo-text">${esc(todo.content)}</span>${todo.blocker ? `<span class="activity-todo-blocker">${esc(todo.blocker)}</span>` : ""}</div>`;
-          })
-          .join("");
-        return `<div class="activity-todo-phase">${esc(phase.name)}</div>${rows}`;
-      })
-      .join("");
     const tasks = todoPhases.flatMap((phase) => phase.tasks);
+    let lastFinished: (typeof tasks)[number] | undefined;
+    for (const todo of tasks) {
+      if (todo.status === "completed" || todo.status === "abandoned") lastFinished = todo;
+    }
     const finished = tasks.filter(
       (todo) => todo.status === "completed" || todo.status === "abandoned",
     ).length;
-    todosEl.innerHTML = `<div class="activity-section-head">Todos<span>${finished}/${tasks.length} done</span></div>${todoRows}`;
-    todosEl.classList.remove("hidden");
+    todoLabel.textContent = `Todos · ${finished}/${tasks.length}`;
+    const phaseExpansion = new Map(
+      Array.from(todosEl.querySelectorAll<HTMLDetailsElement>("details[data-phase]"),
+        (element) => [element.dataset.phase, element.open] as const),
+    );
+    todosEl.innerHTML = todoPhases.map((phase, index) => {
+      const visibleTasks = phase.tasks.filter((todo) =>
+        todo === lastFinished || (todo.status !== "completed" && todo.status !== "abandoned"));
+      if (!visibleTasks.length) return "";
+      const started = phase.tasks.some((todo) => todo.status !== "pending");
+      const open = phaseExpansion.get(String(index)) ?? started;
+      const count = phase.tasks.filter((todo) =>
+        todo.status === "completed" || todo.status === "abandoned").length;
+      const rows = visibleTasks.map((todo) => {
+        const status = TODO_STATE_LABEL[todo.status] ?? todo.status;
+        return `<div class="activity-todo is-${esc(todo.status)}" aria-label="${esc(`${status}: ${todo.content}`)}"><span class="activity-todo-marker" aria-hidden="true">${esc(TODO_MARKER[todo.status] ?? "☐")}</span><span class="activity-todo-text">${esc(todo.content)}</span>${todo.blocker ? `<span class="activity-todo-blocker">${esc(todo.blocker)}</span>` : ""}</div>`;
+      }).join("");
+      const numbered = /^[IVXLCDM]+\.\s/i.test(phase.name);
+      return `<details data-phase="${index}"${open ? " open" : ""}><summary class="activity-todo-phase${numbered ? "" : " is-numbered"}" style="counter-set: todo-phase ${index + 1}">${esc(phase.name)} · ${count}/${phase.tasks.length}</summary>${rows}</details>`;
+    }).join("");
+    todosEl.classList.toggle("hidden", !todosExpanded);
   } else {
     todosEl.innerHTML = "";
     todosEl.classList.add("hidden");
   }
 
-  const chipParts: string[] = [];
-  if (agents.length > 0) {
-    chipParts.push(
-      `<span class="activity-chip">${runningAgents} running · ${agents.length} subagent${agents.length === 1 ? "" : "s"}</span>`,
-    );
-  }
-  if (jobs.length > 0) {
-    chipParts.push(
-      `<span class="activity-chip">${runningJobs} running · ${jobs.length} job${jobs.length === 1 ? "" : "s"}</span>`,
-    );
-  }
-  chips.innerHTML = chipParts.join("");
-  toggle.classList.toggle("hidden", !hasDetails);
-  toggle.setAttribute("aria-expanded", activityExpanded ? "true" : "false");
-  label.textContent = activityExpanded ? "Hide" : "Details";
-  if (!hasDetails || !activityExpanded) {
+  if (!hasDetails || !todosExpanded) {
     details.classList.add("hidden");
     details.innerHTML = "";
     return;
   }
 
+  const subagentsOpen = details.querySelector<HTMLDetailsElement>("#drawer-subagents")?.open ?? false;
   details.innerHTML = "";
   if (agents.length > 0) {
-    const section = document.createElement("div");
+    const section = document.createElement("details");
+    section.id = "drawer-subagents";
+    section.open = subagentsOpen;
     section.className = "activity-section";
-    const heading = document.createElement("div");
+    const heading = document.createElement("summary");
     heading.className = "activity-section-head";
-    heading.innerHTML = `Subagents<span>${runningAgents} running</span>`;
+    heading.innerHTML = `Subagents${runningAgents > 0 ? `<span>${runningAgents} running</span>` : ""}`;
     section.append(heading);
     appendAgentRows(section, agents);
     details.append(section);
@@ -3853,7 +3957,13 @@ function reconcileActiveSlot(): void {
   for (const id of [...unreadBySlot.keys()]) {
     if (!slots.some((slot) => slot.id === id)) unreadBySlot.delete(id);
   }
-  if (activeId && slots.some((slot) => slot.id === activeId)) return;
+  if (activeId && slots.some((slot) => slot.id === activeId)) {
+    if (!initialStateRequested) {
+      initialStateRequested = true;
+      void loadState();
+    }
+    return;
+  }
   const prompt = document.querySelector<HTMLTextAreaElement>("#prompt");
   if (prompt && activeId) drafts.set(activeId, prompt.value);
   // Falling back to another runtime (or none) changes the session identity:
@@ -3873,7 +3983,10 @@ function reconcileActiveSlot(): void {
   else localStorage.removeItem("omp-mobile-active-slot");
   updateSlots();
   renderActive();
-  if (activeId) void loadState();
+  if (activeId) {
+    initialStateRequested = true;
+    void loadState();
+  }
   void loadRawTerminal();
 }
 
@@ -5008,18 +5121,16 @@ async function start(): Promise<void> {
   renderShell();
   applyRawMode();
   applyReasoningToggle();
-  await syncPermissionState();
   updateNotificationButton();
   if (!authToken()) {
     openTokenModal();
   }
-  await Promise.all([
-    loadPins(),
-    registerNotifications(),
-    loadNotificationConfig(),
-  ]);
-  await Promise.all([loadSlots(), loadSessions()]);
-  await loadNotifications();
+  void loadSlots();
+  void loadSessions();
+  void loadPins();
+  void registerNotifications();
+  void loadNotificationConfig();
+  void loadNotifications();
   window.setInterval(() => {
     void loadSlots();
   }, 8000);
