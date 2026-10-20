@@ -18,8 +18,10 @@ import type {
   MobilePart,
   MobileRuntime,
   MobileAskDisplay,
+  MobileAskSubmissionAnswer,
 } from "./parity-types";
 import { createInteractionBridge } from "./interactions";
+import { registerMobileAskTool } from "./ask-tool";
 
 /**
  * In-process OMP mobile bridge.
@@ -51,6 +53,7 @@ type Action = {
   images?: unknown;
   choice?: unknown;
   feedback?: unknown;
+  answers?: unknown;
   role?: unknown;
 };
 type MobileModel = {
@@ -2276,6 +2279,7 @@ export default function registerMobileRemote(pi: ExtensionAPI): void {
     return;
   }
   const interactionBridge = createInteractionBridge(pi);
+  registerMobileAskTool(pi, interactionBridge);
 
   const stateDir =
     process.env.OMP_MOBILE_STATE_DIR ??
@@ -3000,10 +3004,17 @@ export default function registerMobileRemote(pi: ExtensionAPI): void {
       const feedback =
         action.feedback === undefined ? undefined : asString(action.feedback);
       const role = action.role === undefined ? undefined : asString(action.role);
+      const answers =
+        action.answers === undefined
+          ? undefined
+          : Array.isArray(action.answers)
+            ? (action.answers as MobileAskSubmissionAnswer[])
+            : undefined;
       if (
         !id ||
         !choice ||
         (action.feedback !== undefined && feedback === undefined) ||
+        (action.answers !== undefined && answers === undefined) ||
         (action.role !== undefined && role === undefined)
       )
         throw Object.assign(new Error("interaction id and choice are required"), {
@@ -3015,6 +3026,7 @@ export default function registerMobileRemote(pi: ExtensionAPI): void {
         id,
         choice,
         ...(feedback !== undefined ? { feedback } : {}),
+        ...(answers !== undefined ? { answers } : {}),
         ...(role !== undefined ? { role } : {}),
       };
       if (await interactionBridge.handleAction(ctx, interactionAction))

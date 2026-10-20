@@ -7,13 +7,14 @@ type Handler = (event: unknown, ctx: ExtensionContext) => void;
 
 function fixture() {
   const handlers = new Map<string, Handler>();
+  let sessionId = "session-a";
   let review: unknown;
   const resolved: Array<{ id: string; choice: string; input?: unknown }> = [];
   const pi = {
     on: (event: string, handler: Handler) => handlers.set(event, handler),
   } as unknown as ExtensionAPI;
   const context = {
-    sessionManager: { getSessionId: () => "session-a" },
+    sessionManager: { getSessionId: () => sessionId },
     getPendingPlanReview: () => review,
     resolvePlanReview: (id: string, choice: string, input?: unknown) => {
       resolved.push({ id, choice, input });
@@ -42,6 +43,7 @@ function fixture() {
     context,
     resolved,
     setReview: (next: unknown) => (review = next),
+    setSession: (next: string) => (sessionId = next),
     emit: (event: string, payload: unknown) =>
       handlers.get(event)?.(payload, context),
   };
@@ -161,6 +163,174 @@ describe("mobile plan interactions", () => {
     emit("tool_execution_end", { toolCallId: "call-a", toolName: "ask" });
     expect(bridge.snapshot(context)).toBeUndefined();
   });
+  it("resolves all mobile ask answers, including multi-select and Other", async () => {
+    const { bridge, context, setReview } = fixture();
+    setReview(undefined);
+    const wait = bridge.beginAsk(context, "call-ask", [
+      {
+        id: "choice",
+        question: "Choose one",
+        options: [{ label: "Yes" }, { label: "No" }],
+      },
+      {
+        id: "features",
+        question: "Choose any",
+        options: [{ label: "A" }, { label: "B" }],
+        multi: true,
+      },
+    ]);
+    if (!wait) throw new Error("mobile ask wait was not created");
+    expect(bridge.snapshot(context)?.transport).toBe("native");
+    const answers = [
+      { selectedOptions: ["No"] },
+      { selectedOptions: ["A"], customInput: "Add another feature" },
+    ];
+    expect(
+      await bridge.handleAction(
+        context,
+        action("ask:call-ask", "answer", { answers }),
+      ),
+    ).toBe(true);
+    expect(await wait.promise).toEqual({ kind: "answer", answers });
+    expect(bridge.snapshot(context)).toBeUndefined();
+    expect(
+      await bridge.handleAction(
+        context,
+        action("ask:call-ask", "answer", { answers }),
+      ),
+    ).toBe(false);
+  });
+
+  it("rejects invalid ask choices without consuming the pending answer", async () => {
+    const { bridge, context, setReview } = fixture();
+    setReview(undefined);
+    const wait = bridge.beginAsk(context, "call-single", [
+      {
+        id: "choice",
+        question: "Choose one",
+        options: [{ label: "A" }, { label: "B" }],
+      },
+    ]);
+    if (!wait) throw new Error("mobile ask wait was not created");
+    for (const answers of [
+      [{ selectedOptions: ["missing"] }],
+      [{ selectedOptions: ["A", "B"] }],
+      [{ selectedOptions: [], customInput: "  " }],
+    ]) {
+      expect(
+        await bridge.handleAction(
+          context,
+          action("ask:call-single", "answer", {
+            answers: answers as MobileInteractionAction["answers"],
+          }),
+        ),
+      ).toBe(false);
+    }
+    expect(bridge.snapshot(context)?.id).toBe("ask:call-single");
+    const answers = [{ selectedOptions: ["A"] }];
+    expect(
+      await bridge.handleAction(
+        context,
+        action("ask:call-single", "answer", { answers }),
+      ),
+    ).toBe(true);
+    expect((await wait.promise).kind).toBe("answer");
+  });
+
+  it("cancels mobile asks and closes them when the session becomes stale", async () => {
+    const { bridge, context, setReview, setSession } = fixture();
+    setReview(undefined);
+    const questions = [
+      {
+        id: "choice",
+        question: "Choose one",
+        options: [{ label: "A" }],
+      },
+    ];
+    const cancelled = bridge.beginAsk(context, "call-cancel", questions);
+    if (!cancelled) throw new Error("mobile ask wait was not created");
+    expect(
+      await bridge.handleAction(
+        context,
+        action("ask:call-cancel", "cancel"),
+      ),
+    ).toBe(true);
+    expect(await cancelled.promise).toEqual({ kind: "cancel" });
+
+    const stale = bridge.beginAsk(context, "call-stale", questions);
+    if (!stale) throw new Error("mobile ask wait was not created");
+    setSession("session-b");
+    bridge.observe(context);
+    expect(await stale.promise).toEqual({ kind: "closed" });
+    expect(
+      await bridge.handleAction(
+        context,
+        action("ask:call-stale", "answer", {
+          answers: [{ selectedOptions: ["A"] }],
+        }),
+      ),
+    ).toBe(false);
+  });
+
+  it("keeps questions read-only until the native ask override starts", () => {
+    const { bridge, context, emit, setReview } = fixture();
+    setReview(undefined);
+    emit("tool_execution_start", {
+      toolCallId: "call-live",
+      toolName: "ask",
+      args: {
+        questions: [
+          {
+            id: "choice",
+            question: "Choose one",
+            options: [{ label: "A" }],
+          },
+        ],
+      },
+    });
+    expect(bridge.snapshot(context)?.transport).toBe("terminal");
+    const wait = bridge.beginAsk(context, "call-live", [
+      {
+        id: "choice",
+        question: "Choose one",
+        options: [{ label: "A" }],
+      },
+    ]);
+    expect(bridge.snapshot(context)?.transport).toBe("native");
+    wait?.cancel();
+  });
+  it("does not downgrade a mobile waiter when execution-start arrives late", async () => {
+    const { bridge, context, emit, setReview } = fixture();
+    setReview(undefined);
+    const questions = [
+      {
+        id: "choice",
+        question: "Choose one",
+        options: [{ label: "A" }],
+      },
+    ];
+    const wait = bridge.beginAsk(context, "call-late-start", questions);
+    if (!wait) throw new Error("mobile ask wait was not created");
+    emit("tool_execution_start", {
+      toolCallId: "call-late-start",
+      toolName: "ask",
+      args: { questions },
+    });
+    expect(bridge.snapshot(context)?.transport).toBe("native");
+    const answers = [{ selectedOptions: ["A"] }];
+    expect(
+      await bridge.handleAction(
+        context,
+        action("ask:call-late-start", "answer", { answers }),
+      ),
+    ).toBe(true);
+    expect(await wait.promise).toEqual({ kind: "answer", answers });
+    emit("tool_execution_end", {
+      toolCallId: "call-late-start",
+      toolName: "ask",
+    });
+  });
+
   it("rejects unknown tiers and roles for non-approval choices", async () => {
     const { bridge, context, resolved } = fixture();
     expect(

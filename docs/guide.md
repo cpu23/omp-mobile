@@ -23,11 +23,16 @@ terminal-only views and reports transcript, model and capability data as unavail
 resize the desktop PTY. Its live controls send only the key or text you explicitly choose.
 
 OMP `ask` prompts appear inline with question text, options, descriptions, selection mode and recommended options.
-Pending prompts also create an **Action needed** session badge and an interaction card. Open **Live terminal controls**
-to answer from the phone: use arrows/Space to select, type custom text when appropriate, and press **Enter** separately.
-OMP owns these dialogs; Mobile does not auto-answer or pretend that option cards are a native remote-answer API.
+Pending prompts create an **Action needed** session badge and an answer card. Tap a radio option for single-choice
+questions or checkboxes for multi-select, then select **Submit answers**. Every question also offers **Other** with
+a custom text field; multi-select answers can combine options and custom text. Unsubmitted choices survive state
+refreshes, and controls are disabled while submitting. **Cancel** stops the pending ask.
+The extension delegates to OMP's native AskTool while also accepting explicit mobile answers: whichever surface
+finishes first closes the other, without answering twice. Desktop dialogs, timeouts and desktop image answers retain
+their native behavior. Oversized or incomplete question metadata remains terminal-owned rather than permitting
+answers to unseen choices; use **Live terminal controls** for those prompts.
 After completion, the transcript shows recorded selections, custom answers and notes. Restart affected OMP sessions
-after updating the extension so they receive the new interaction bridge.
+after updating the extension so they receive the new answer bridge.
 
 While OMP is busy, Mobile sends ordinary text through the steering path and shows its queued text until OMP starts it.
 If the same Send action is tapped again before its first submission resolves, Mobile coalesces the duplicate and, when
@@ -87,8 +92,9 @@ Plan review uses OMP's public resolver: read the plan, select an execution tier 
 execute, compact, keep context, refine with feedback, or save and quit. Choices and tiers are validated against the
 current review and runtime generation; stale, duplicate or disabled choices are rejected. Reviews exceeding the
 1 MiB display budget disable native choices and direct you to terminal inspection instead of approving unseen text.
-`ask`, core approvals and other terminal-owned selectors use the live terminal keypad/text controls, not a fabricated
-native resolver. Each known-dialog action is scoped to the current interaction and generation.
+`ask` answers use the extension's shared native/mobile wait; stale generations, changed interaction IDs and invalid
+options are rejected before completion. Core approvals and other terminal-owned selectors still use the live terminal
+keypad/text controls. Each known-dialog action is scoped to the current interaction and generation.
 
 Images open for inspection. Mermaid diagrams, sanitized static SVG, KaTeX math and chartable numeric tables render
 locally with source/zoom controls. Rendering dependencies and math fonts are served by the gateway, not a CDN.

@@ -125,6 +125,40 @@ test("native plan actions reject stale ids/generations and accept only exposed c
       feedback: "x".repeat(8001),
     }),
   ).toMatchObject({ ok: false, status: 400 });
+  expect(validateInteractionAction(state, {
+    generation: "generation-1", type: "interaction", id: "plan-1", choice: "approve",
+    answers: [{ selectedOptions: ["approve"] }],
+  })).toMatchObject({ ok: false, status: 400 });
+});
+
+test("native ask gateway validates answers and keeps plan and ask payloads separate", () => {
+  const state = normaliseState({
+    generation: "generation-ask",
+    messages: [],
+    runtime: {
+      interaction: {
+        id: "ask-1", kind: "ask", title: "Choose", transport: "native", createdAt: 1,
+        questions: [
+          { id: "browser", question: "Browser?", options: [{ label: "Brave" }, { label: "Chrome" }] },
+          { id: "features", question: "Features?", multi: true, options: [{ label: "Paste" }] },
+        ],
+      },
+    },
+  });
+  if (!state) throw new Error("Ask state failed normalization");
+  const action = { generation: state.generation, type: "interaction", id: "ask-1", choice: "answer" };
+  const answers = [{ selectedOptions: ["Brave"] }, { selectedOptions: ["Paste"], customInput: "Camera" }];
+  expect(validateInteractionAction(state, { ...action, answers })).toEqual({
+    ok: true, action: { ...action, answers },
+  });
+  expect(validateInteractionAction(state, { ...action, answers: answers.slice(0, 1) })).toMatchObject({ ok: false, status: 400 });
+  expect(validateInteractionAction(state, { ...action, answers: [{ selectedOptions: ["Unknown"] }, answers[1]] })).toMatchObject({ ok: false, status: 400 });
+  expect(validateInteractionAction(state, { ...action, answers, role: "planner" })).toMatchObject({ ok: false, status: 400 });
+  expect(validateInteractionAction(state, { ...action, answers, generation: "old" })).toMatchObject({ ok: false, status: 409 });
+  expect(validateInteractionAction(state, { ...action, choice: "cancel" })).toEqual({
+    ok: true, action: { ...action, choice: "cancel" },
+  });
+  expect(validateInteractionAction(state, { ...action, choice: "cancel", answers })).toMatchObject({ ok: false, status: 400 });
 });
 
 test("prompt image attachments validate raster signatures and aggregate base64 size", () => {

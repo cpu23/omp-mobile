@@ -25,6 +25,8 @@ import {
 } from "./shared";
 import type {
   MobileAskDisplay,
+  MobileAskQuestion,
+  MobileAskSubmissionAnswer,
   MobileHistory,
   MobileImage,
   MobileInteraction,
@@ -33,6 +35,14 @@ import type {
   MobileRuntime,
 } from "./parity-types";
 import { appendRichContent } from "./rich-content";
+import {
+  askAnswerFromDraft,
+  canSubmitAskAnswer,
+  createAskAnswerDraft,
+  selectAskOption,
+  selectAskOther,
+  type AskAnswerDraft,
+} from "./ask-selection";
 import {
   buildMoveCompletion,
   moveBasePath,
@@ -323,6 +333,7 @@ let unreadBySlot = new Map<SlotId, CompletionMarker[]>();
 const actionNeededBySlot = new Map<SlotId, NotificationActionNeeded>();
 const interactionActionsInFlight = new Set<string>();
 const interactionFeedbackDrafts = new Map<string, string>();
+const askAnswerDrafts = new Map<string, AskAnswerDraft[]>();
 let terminalControlsTarget:
   | { slotId: SlotId; generation: string; interactionId?: string }
   | null = null;
@@ -3057,28 +3068,39 @@ function appendAskCard(
   heading.textContent = "Ask";
   card.append(heading);
 
+  const interaction = activeState?.runtime?.interaction;
+  const terminalOwnedAsk =
+    interaction?.kind === "ask" &&
+    interaction.transport === "terminal" &&
+    interaction.toolCallId === part.id;
   const status = document.createElement("p");
   status.className = "part-ask-status";
   if (part.isError) {
-    status.textContent = "Ask failed in the session terminal.";
+    status.textContent = "Ask failed.";
   } else if (ask.status === "pending") {
-    status.textContent =
-      "Terminal-owned ask. Review the answer in the live terminal controls; these displayed options are read-only.";
-    const openTerminal = document.createElement("button");
-    openTerminal.type = "button";
-    openTerminal.className = "ghost-btn part-ask-terminal";
-    openTerminal.textContent = "Open live terminal controls";
-    openTerminal.addEventListener("click", () => {
-      const interaction = activeState?.runtime?.interaction;
-      void openTerminalControls(
-        interaction?.kind === "ask" ? interaction.id : undefined,
-      );
-    });
-    card.append(openTerminal);
+    status.textContent = terminalOwnedAsk
+      ? "This ask is pending in the live OMP terminal; transcript options are read-only."
+      : "Ask pending. Answer using the active interaction controls or the OMP dialog.";
+    if (terminalOwnedAsk) {
+      const openTerminal = document.createElement("button");
+      openTerminal.type = "button";
+      openTerminal.className = "ghost-btn part-ask-terminal";
+      openTerminal.textContent = "Open live terminal controls";
+      openTerminal.addEventListener("click", () => {
+        const currentInteraction = activeState?.runtime?.interaction;
+        if (
+          currentInteraction?.kind === "ask" &&
+          currentInteraction.transport === "terminal" &&
+          currentInteraction.toolCallId === part.id
+        )
+          void openTerminalControls(currentInteraction.id);
+      });
+      card.append(openTerminal);
+    }
   } else if (ask.status === "redirected") {
-    status.textContent = "Conversation continued from the session terminal.";
+    status.textContent = "Conversation continued instead of answering.";
   } else {
-    status.textContent = "Answered in the session terminal.";
+    status.textContent = "Answer received.";
   }
   card.append(status);
 
@@ -4405,11 +4427,34 @@ function interactionActionKey(
   return JSON.stringify([slotId, generation, interactionId, choice]);
 }
 
+
+function askAnswerDraftsFor(
+  slotId: SlotId,
+  generation: string,
+  interactionId: string,
+  questions: MobileAskQuestion[],
+): AskAnswerDraft[] {
+  const key = JSON.stringify([slotId, generation, interactionId]);
+  let drafts = askAnswerDrafts.get(key);
+  if (!drafts || drafts.length !== questions.length) {
+    drafts = questions.map(() => createAskAnswerDraft());
+  }
+  askAnswerDrafts.delete(key);
+  askAnswerDrafts.set(key, drafts);
+  while (askAnswerDrafts.size > 16) {
+    const oldest = askAnswerDrafts.keys().next().value;
+    if (oldest === undefined) break;
+    askAnswerDrafts.delete(oldest);
+  }
+  return drafts;
+}
+
 async function sendInteractionChoice(
   interaction: MobileInteraction,
   choice: string,
   feedback: string,
   role: string | undefined,
+  answers?: MobileAskSubmissionAnswer[],
 ): Promise<void> {
   const targetId = activeId;
   const targetState = activeState;
@@ -4430,9 +4475,14 @@ async function sendInteractionChoice(
         choice,
         ...(feedback ? { feedback } : {}),
         ...(role ? { role } : {}),
+        ...(answers !== undefined ? { answers } : {}),
       }),
     });
     interactionFeedbackDrafts.delete(interaction.id);
+    if (interaction.kind === "ask")
+      askAnswerDrafts.delete(
+        JSON.stringify([targetId, generation, interaction.id]),
+      );
     window.setTimeout(() => {
       if (activeId === targetId && activeState?.generation === generation)
         void loadState();
@@ -4447,6 +4497,176 @@ async function sendInteractionChoice(
     interactionActionsInFlight.delete(key);
     if (activeId === targetId) renderRuntime(activeState);
   }
+}
+
+function appendAskInteraction(
+  card: HTMLElement,
+  interaction: MobileInteraction,
+  state: ClientState,
+  inFlight: boolean,
+): void {
+  const questions = interaction.questions;
+  const slotId = activeId;
+  const generation = state.generation;
+  if (!slotId || !generation || !questions?.length) return;
+  const drafts = askAnswerDraftsFor(
+    slotId,
+    generation,
+    interaction.id,
+    questions,
+  );
+  const instructions = document.createElement("p");
+  instructions.className = "ask-interaction-instructions";
+  instructions.textContent =
+    "Choose an option for each question. Select Other to enter a custom answer.";
+  card.append(instructions);
+
+  const form = document.createElement("div");
+  form.className = "ask-interaction-form";
+  const submit = document.createElement("button");
+  submit.type = "button";
+  submit.className = "send-btn interaction-choice";
+  submit.textContent = "Submit answers";
+  const canSubmit = () =>
+    questions.every((question, index) =>
+      canSubmitAskAnswer(question, drafts[index]!),
+    );
+  const updateSubmit = () => {
+    submit.disabled = inFlight || !canSubmit();
+  };
+
+  questions.forEach((question, questionIndex) => {
+    const draft = drafts[questionIndex]!;
+    const fieldset = document.createElement("fieldset");
+    fieldset.className = "ask-interaction-question";
+    fieldset.disabled = inFlight;
+    const legend = document.createElement("legend");
+    if (question.header) {
+      const header = document.createElement("span");
+      header.className = "ask-interaction-header";
+      header.textContent = question.header;
+      legend.append(header);
+    }
+    const prompt = document.createElement("span");
+    prompt.className = "ask-interaction-prompt";
+    prompt.textContent = question.question;
+    legend.append(prompt);
+    fieldset.append(legend);
+    const mode = document.createElement("div");
+    mode.className = "ask-interaction-mode";
+    mode.textContent = question.multi ? "Select all that apply" : "Select one";
+    fieldset.append(mode);
+
+    const name = `ask-${interaction.id}-${questionIndex}`;
+    let otherChoice!: HTMLInputElement;
+    let otherInput!: HTMLTextAreaElement;
+    question.options.forEach((option, optionIndex) => {
+      const label = document.createElement("label");
+      label.className = "ask-interaction-option";
+      const input = document.createElement("input");
+      input.type = question.multi ? "checkbox" : "radio";
+      input.name = name;
+      input.value = option.label;
+      input.checked = draft.selectedOptions.includes(option.label);
+      input.disabled = inFlight;
+      input.setAttribute(
+        "aria-label",
+        `${question.question}: ${option.label}`,
+      );
+      input.addEventListener("change", () => {
+        selectAskOption(question, draft, option.label, input.checked);
+        if (!question.multi && otherChoice) {
+          otherChoice.checked = false;
+          otherInput.hidden = true;
+          otherInput.disabled = true;
+        }
+        updateSubmit();
+      });
+      const text = document.createElement("span");
+      text.className = "ask-interaction-option-label";
+      text.textContent = option.label;
+      label.append(input, text);
+      if (question.recommended === optionIndex) {
+        const recommended = document.createElement("span");
+        recommended.className = "ask-interaction-recommended";
+        recommended.textContent = "Recommended";
+        label.append(recommended);
+      }
+      if (option.description) {
+        const description = document.createElement("span");
+        description.className = "ask-interaction-option-description";
+        description.textContent = option.description;
+        label.append(description);
+      }
+      fieldset.append(label);
+    });
+
+    const otherLabel = document.createElement("label");
+    otherLabel.className = "ask-interaction-option ask-interaction-other";
+    otherChoice = document.createElement("input");
+    otherChoice.type = question.multi ? "checkbox" : "radio";
+    otherChoice.name = name;
+    otherChoice.value = "other";
+    otherChoice.checked = draft.otherSelected;
+    otherChoice.disabled = inFlight;
+    otherChoice.setAttribute(
+      "aria-label",
+      `${question.question}: Other custom answer`,
+    );
+    const otherText = document.createElement("span");
+    otherText.className = "ask-interaction-option-label";
+    otherText.textContent = "Other";
+    otherLabel.append(otherChoice, otherText);
+    fieldset.append(otherLabel);
+
+    otherInput = document.createElement("textarea");
+    otherInput.className = "ask-interaction-custom";
+    otherInput.rows = 2;
+    otherInput.maxLength = 4096;
+    otherInput.placeholder = "Enter a custom answer";
+    otherInput.setAttribute(
+      "aria-label",
+      `${question.question}: Other custom answer`,
+    );
+    otherInput.value = draft.customInput;
+    otherInput.hidden = !draft.otherSelected;
+    otherInput.disabled = inFlight || !draft.otherSelected;
+    otherChoice.addEventListener("change", () => {
+      selectAskOther(question, draft, otherChoice.checked);
+      otherInput.hidden = !draft.otherSelected;
+      otherInput.disabled = inFlight || !draft.otherSelected;
+      updateSubmit();
+    });
+    otherInput.addEventListener("input", () => {
+      draft.customInput = otherInput.value;
+      updateSubmit();
+    });
+    fieldset.append(otherInput);
+    form.append(fieldset);
+  });
+
+  const actions = document.createElement("div");
+  actions.className = "interaction-choices ask-interaction-actions";
+  submit.disabled = inFlight || !canSubmit();
+  submit.addEventListener("click", () => {
+    if (inFlight || !canSubmit()) return;
+    const answers = questions.map((question, index) =>
+      askAnswerFromDraft(question, drafts[index]!),
+    );
+    void sendInteractionChoice(interaction, "answer", "", undefined, answers);
+  });
+  actions.append(submit);
+  const cancel = document.createElement("button");
+  cancel.type = "button";
+  cancel.className = "ghost-btn interaction-choice";
+  cancel.textContent = "Cancel";
+  cancel.disabled = inFlight;
+  cancel.addEventListener("click", () => {
+    void sendInteractionChoice(interaction, "cancel", "", undefined);
+  });
+  actions.append(cancel);
+  form.append(actions);
+  card.append(form);
 }
 
 function renderRuntime(state: ClientState | null): void {
@@ -4620,6 +4840,13 @@ function renderRuntime(state: ClientState | null): void {
       });
       card.append(terminal);
     }
+  } else if (
+    interaction.kind === "ask" &&
+    interaction.transport === "native" &&
+    interaction.questions?.length &&
+    state
+  ) {
+    appendAskInteraction(card, interaction, state, inFlight);
   } else {
     const ownership = document.createElement("p");
     ownership.className = "interaction-ownership";
@@ -5013,7 +5240,7 @@ function renderActive(): void {
   syncTopBar();
   const prompt = requiredElement<HTMLDivElement>("#prompt");
   prompt.dataset.placeholder = pendingInteraction
-    ? "Resolve the pending dialog in live terminal controls…"
+    ? "Resolve the pending dialog above…"
     : activeId
       ? "Message this session…"
       : "Start or select a session…";
