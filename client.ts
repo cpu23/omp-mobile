@@ -5028,7 +5028,8 @@ async function encodeRasterImage(
 }
 
 async function addImageFiles(files: File[]): Promise<void> {
-  if (!files.length) return;
+  const targetId = activeId;
+  if (!files.length || !targetId) return;
   if (attachedImages.length + files.length > 8) {
     showToast("A prompt can contain at most 8 images", true);
     return;
@@ -5048,10 +5049,16 @@ async function addImageFiles(files: File[]): Promise<void> {
       imageSubmissionIds.set(image, String(nextImageSubmissionId));
       nextImageSubmissionId += 1;
     }
-    attachedImages = [...attachedImages, ...next];
-    attachmentRevision += 1;
-    if (activeId) attachmentsBySlot.set(activeId, attachedImages);
-    renderAttachments();
+    const images = targetId === activeId
+      ? attachedImages
+      : (attachmentsBySlot.get(targetId) ?? []);
+    const updated = [...images, ...next];
+    attachmentsBySlot.set(targetId, updated);
+    if (targetId === activeId) {
+      attachedImages = updated;
+      attachmentRevision += 1;
+      renderAttachments();
+    }
   } catch (error: unknown) {
     showToast(errorMessage(error), true);
   }
