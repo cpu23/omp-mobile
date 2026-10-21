@@ -23,11 +23,16 @@ terminal-only views and reports transcript, model and capability data as unavail
 resize the desktop PTY. Its live controls send only the key or text you explicitly choose.
 
 OMP `ask` prompts appear inline with question text, options, descriptions, selection mode and recommended options.
-Pending prompts also create an **Action needed** session badge and an interaction card. Open **Live terminal controls**
-to answer from the phone: use arrows/Space to select, type custom text when appropriate, and press **Enter** separately.
-OMP owns these dialogs; Mobile does not auto-answer or pretend that option cards are a native remote-answer API.
+Pending prompts create an **Action needed** session badge and an answer card. Tap a radio option for single-choice
+questions or checkboxes for multi-select, then select **Submit answers**. Every question also offers **Other** with
+a custom text field; multi-select answers can combine options and custom text. Unsubmitted choices survive state
+refreshes, and controls are disabled while submitting. **Cancel** stops the pending ask.
+The extension delegates to OMP's native AskTool while also accepting explicit mobile answers: whichever surface
+finishes first closes the other, without answering twice. Desktop dialogs, timeouts and desktop image answers retain
+their native behavior. Oversized or incomplete question metadata remains terminal-owned rather than permitting
+answers to unseen choices; use **Live terminal controls** for those prompts.
 After completion, the transcript shows recorded selections, custom answers and notes. Restart affected OMP sessions
-after updating the extension so they receive the new interaction bridge.
+after updating the extension so they receive the new answer bridge.
 
 While OMP is busy, Mobile sends ordinary text through the steering path and shows its queued text until OMP starts it.
 If the same Send action is tapped again before its first submission resolves, Mobile coalesces the duplicate and, when
@@ -35,10 +40,15 @@ the session was busy, forces the queue only after the first submission succeeds.
 the session is active, an empty composer changes the circular upward-arrow **Send** button to a lightning-bolt **Force** icon; tapping it (or submitting empty Enter)
 interrupts the current run so OMP drains the pending queue, matching desktop's empty-Enter behavior. OMP's public
 extension API may expose queue availability without desktop-origin text; those items show only **Queued**. A single queue card prefers host queue text when available, otherwise mobile-submitted text, with **Submitting** before confirmation. It does not repeat help or API-limitation notices.
+The gateway also discards the redundant informational **Queue text unavailable** notice from already-running older
+extensions, so testing the updated gateway does not require restarting sessions merely to remove that card.
 Restart the affected session for this extension update to take effect.
 Pending dialogs keep their instructions in the interaction card rather than repeating them below the composer.
 Terminal-owned option cards are read-only, but their **Terminal** action opens deliberate live controls; unavailable
 native plan choices use the same action. The ordinary composer is disabled while a dialog is awaiting a response.
+The composer uses compact 29px Send and image-attachment buttons; the Send arrow scales with its circular control.
+Cross icons stop the current task in the composer or stop a session from its sidebar card; tooltips and accessible
+labels distinguish the actions, and the sidebar retains its stop confirmation.
 
 Typing `/move` in the composer opens a directory picker instead of sending the command. Choices are listed as you type: absolute paths are used as-is, relative paths resolve from the session's working directory, `~` expands to the gateway user's home (still confined to `OMP_MOBILE_ROOT`), and a trailing slash (or selecting a folder) lists its subdirectories. Tapping a folder fills `/move <path>`; use the send button (or Enter) to move. Up/Down and Tab work with hardware keyboards, and Escape dismisses the list without affecting other slash commands. Every listing is tied to the session and working directory it was resolved against: switching sessions, resuming another transcript, or a session whose cwd changed (`cd` in the desktop terminal, or a completed move) discards the cached picker, and a listing that arrives after such a change is ignored, so a destination from another working directory is never offered or submitted.
 
@@ -87,8 +97,9 @@ Plan review uses OMP's public resolver: read the plan, select an execution tier 
 execute, compact, keep context, refine with feedback, or save and quit. Choices and tiers are validated against the
 current review and runtime generation; stale, duplicate or disabled choices are rejected. Reviews exceeding the
 1 MiB display budget disable native choices and direct you to terminal inspection instead of approving unseen text.
-`ask`, core approvals and other terminal-owned selectors use the live terminal keypad/text controls, not a fabricated
-native resolver. Each known-dialog action is scoped to the current interaction and generation.
+`ask` answers use the extension's shared native/mobile wait; stale generations, changed interaction IDs and invalid
+options are rejected before completion. Core approvals and other terminal-owned selectors still use the live terminal
+keypad/text controls. Each known-dialog action is scoped to the current interaction and generation.
 
 Images open for inspection. Mermaid diagrams, sanitized static SVG, KaTeX math and chartable numeric tables render
 locally with source/zoom controls. Rendering dependencies and math fonts are served by the gateway, not a CDN.

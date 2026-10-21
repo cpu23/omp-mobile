@@ -18,8 +18,10 @@ import type {
   MobilePart,
   MobileRuntime,
   MobileAskDisplay,
+  MobileAskSubmissionAnswer,
 } from "./parity-types";
 import { createInteractionBridge } from "./interactions";
+import { registerMobileAskTool } from "./ask-tool";
 
 /**
  * In-process OMP mobile bridge.
@@ -51,6 +53,7 @@ type Action = {
   images?: unknown;
   choice?: unknown;
   feedback?: unknown;
+  answers?: unknown;
   role?: unknown;
 };
 type MobileModel = {
@@ -2276,6 +2279,7 @@ export default function registerMobileRemote(pi: ExtensionAPI): void {
     return;
   }
   const interactionBridge = createInteractionBridge(pi);
+  registerMobileAskTool(pi, interactionBridge);
 
   const stateDir =
     process.env.OMP_MOBILE_STATE_DIR ??
@@ -2389,7 +2393,6 @@ export default function registerMobileRemote(pi: ExtensionAPI): void {
   let runtimeNotices: MobileNotice[] = [];
   let runtimeStatus: MobileRuntime["status"];
   let runtimeGoal: MobileRuntime["goal"];
-  let queueAvailabilityNoticed = false;
 
   function addRuntimeNotice(
     tone: MobileNotice["tone"],
@@ -2411,7 +2414,6 @@ export default function registerMobileRemote(pi: ExtensionAPI): void {
     runtimeNotices = [];
     runtimeStatus = undefined;
     runtimeGoal = undefined;
-    queueAvailabilityNoticed = false;
   }
 
   function runtimeSnapshot(now = Date.now()): MobileRuntime {
@@ -2883,15 +2885,6 @@ export default function registerMobileRemote(pi: ExtensionAPI): void {
         text: truncateText(message.text, MAX_TEXT_CHARS),
         status: hasPendingMessages ? "queued" : "sending",
       }));
-    if (!hasPendingMessages) queueAvailabilityNoticed = false;
-    else if (!queueAvailabilityNoticed) {
-      addRuntimeNotice(
-        "info",
-        "Queue text unavailable",
-        "This OMP extension API reports whether messages are queued but does not expose their text. Mobile-submitted prompts are listed separately; use the live terminal to inspect other queued messages.",
-      );
-      queueAvailabilityNoticed = true;
-    }
     const runtime = runtimeSnapshot(now);
     if (interaction) runtime.interaction = interaction;
     const state: MobileState = {
@@ -3000,10 +2993,17 @@ export default function registerMobileRemote(pi: ExtensionAPI): void {
       const feedback =
         action.feedback === undefined ? undefined : asString(action.feedback);
       const role = action.role === undefined ? undefined : asString(action.role);
+      const answers =
+        action.answers === undefined
+          ? undefined
+          : Array.isArray(action.answers)
+            ? (action.answers as MobileAskSubmissionAnswer[])
+            : undefined;
       if (
         !id ||
         !choice ||
         (action.feedback !== undefined && feedback === undefined) ||
+        (action.answers !== undefined && answers === undefined) ||
         (action.role !== undefined && role === undefined)
       )
         throw Object.assign(new Error("interaction id and choice are required"), {
@@ -3015,6 +3015,7 @@ export default function registerMobileRemote(pi: ExtensionAPI): void {
         id,
         choice,
         ...(feedback !== undefined ? { feedback } : {}),
+        ...(answers !== undefined ? { answers } : {}),
         ...(role !== undefined ? { role } : {}),
       };
       if (await interactionBridge.handleAction(ctx, interactionAction))

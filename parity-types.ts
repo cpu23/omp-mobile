@@ -8,6 +8,24 @@ export type MobileNotice = {
   body?: string;
   timestamp: number;
 };
+export type MobileAskQuestion = {
+  id?: string;
+  question: string;
+  header?: string;
+  options: Array<{ label: string; description?: string }>;
+  multi: boolean;
+  recommended?: number;
+};
+export type MobileAskAnswer = {
+  selectedOptions: string[];
+  customInput?: string;
+  note?: string;
+  timedOut?: boolean;
+};
+export type MobileAskSubmissionAnswer = Pick<
+  MobileAskAnswer,
+  "selectedOptions" | "customInput"
+>;
 export type MobileInteraction = {
   id: string;
   kind: "approval" | "ask" | "plan" | "dialog";
@@ -16,7 +34,7 @@ export type MobileInteraction = {
   toolCallId?: string;
   options?: Array<{ id: string; label: string; disabled?: boolean }>;
   tiers?: Array<{ role: string; provider?: string; model?: string; label?: string }>;
-  questions?: unknown[];
+  questions?: MobileAskQuestion[];
   transport: "native" | "terminal";
   createdAt: number;
 };
@@ -51,5 +69,6 @@ export type MobileInteractionAction = {
   id: string;
   choice: string;
   feedback?: string;
+  answers?: MobileAskSubmissionAnswer[];
   role?: string;
 };

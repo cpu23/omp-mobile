@@ -1,5 +1,11 @@
 import type { ExtensionAPI, ExtensionContext } from "@oh-my-pi/pi-coding-agent";
-import type { MobileInteraction, MobileInteractionAction } from "./parity-types";
+import type {
+  MobileAskAnswer,
+  MobileAskQuestion,
+  MobileInteraction,
+  MobileInteractionAction,
+} from "./parity-types";
+import { validateAskAnswers } from "./ask-selection";
 
 type PlanChoice = "execute" | "compact" | "keep" | "refine" | "save";
 type PlanReview = {
@@ -29,6 +35,37 @@ type PendingEntry = {
   sessionId: string;
   sequence: number;
 };
+export type MobileAskWaitResult =
+  | { kind: "answer"; answers: MobileAskAnswer[] }
+  | { kind: "cancel" }
+  | { kind: "closed" };
+type AskWaiter = {
+  toolCallId: string;
+  interactionId: string;
+  sessionId: string;
+  questions: MobileAskQuestion[];
+  promise: Promise<MobileAskWaitResult>;
+  resolve: (result: MobileAskWaitResult) => void;
+  settled: boolean;
+};
+export type MobileAskWait = {
+  promise: Promise<MobileAskWaitResult>;
+  cancel(): void;
+};
+export interface InteractionBridge {
+  observe(ctx: ExtensionContext): void;
+  reset(): void;
+  beginAsk(
+    ctx: ExtensionContext,
+    toolCallId: string,
+    questions: unknown,
+  ): MobileAskWait | undefined;
+  snapshot(ctx: ExtensionContext): MobileInteraction | undefined;
+  handleAction(
+    ctx: ExtensionContext,
+    action: MobileInteractionAction,
+  ): Promise<boolean>;
+}
 
 const PLAN_CHOICES: Record<PlanChoice, true> = {
   execute: true,
@@ -111,7 +148,7 @@ function limitUtf8Text(
 
 function parseAskQuestions(
   value: unknown,
-): { questions: unknown[]; truncated: boolean } | undefined {
+): { questions: MobileAskQuestion[]; truncated: boolean } | undefined {
   if (!Array.isArray(value)) return undefined;
   let remaining = MAX_ASK_DETAILS_CHARS;
   let truncated = value.length > MAX_ASK_QUESTIONS;
@@ -139,14 +176,18 @@ function parseAskQuestions(
       return [];
     }
     const question = takeText(raw.question);
-    if (!question) return [];
+    if (!question) {
+      // Answers are positional; dropping a question must disable native replies.
+      truncated = true;
+      return [];
+    }
     const id = typeof raw.id === "string" ? takeText(raw.id) : undefined;
     const header =
       typeof raw.header === "string" ? takeText(raw.header) : undefined;
     const options = Array.isArray(raw.options) ? raw.options : [];
     if (!Array.isArray(raw.options)) truncated = true;
     if (options.length > MAX_ASK_OPTIONS) truncated = true;
-    const safeOptions = options
+    const safeOptions: MobileAskQuestion["options"] = options
       .slice(0, MAX_ASK_OPTIONS)
       .flatMap((option) => {
         if (
@@ -190,6 +231,7 @@ function parseAskQuestions(
   });
   return { questions, truncated };
 }
+
 
 function formatDetails(value: unknown): string {
   try {
@@ -341,29 +383,40 @@ function toolCallId(event: unknown): string | undefined {
 }
 
 /**
- * Observe OMP's public interaction events and resolve plan reviews through their
- * public ExtensionContext API. Approval, ask, and other dialogs have no public
- * resolver, so they are exposed as terminal-owned with their live call metadata.
- * The host exposes no public hook for inspecting arbitrary active UI dialogs.
+ * Observe public interaction events. Plan reviews use their native resolver;
+ * mobile asks race their native AskTool against a bridge-owned answer promise.
  */
-export function createInteractionBridge(pi: ExtensionAPI): {
-  observe(ctx: ExtensionContext): void;
-  reset(): void;
-  snapshot(ctx: ExtensionContext): MobileInteraction | undefined;
-  handleAction(
-    ctx: ExtensionContext,
-    action: MobileInteractionAction,
-  ): Promise<boolean>;
-} {
+export function createInteractionBridge(pi: ExtensionAPI): InteractionBridge {
   const pending = new Map<string, PendingEntry>();
   const callArguments = new Map<string, { name: string; args: unknown }>();
   const resolvedPlanIds = new Set<string>();
+  const askWaiters = new Map<string, AskWaiter>();
+  const askCallIds = new Set<string>();
   let activeSessionId: string | undefined;
   let sequence = 0;
 
+  const settleAsk = (waiter: AskWaiter, result: MobileAskWaitResult) => {
+    if (waiter.settled) return;
+    waiter.settled = true;
+    if (askWaiters.get(waiter.toolCallId) === waiter)
+      askWaiters.delete(waiter.toolCallId);
+    waiter.resolve(result);
+  };
+  const closeAskInteractions = (toolCallId: string) => {
+    for (const [key, entry] of pending) {
+      if (entry.interaction.toolCallId === toolCallId) pending.delete(key);
+    }
+  };
+  const closeAllAskWaiters = () => {
+    for (const waiter of askWaiters.values())
+      settleAsk(waiter, { kind: "closed" });
+  };
+
   const clear = () => {
+    closeAllAskWaiters();
     pending.clear();
     callArguments.clear();
+    askCallIds.clear();
     resolvedPlanIds.clear();
     activeSessionId = undefined;
     sequence = 0;
@@ -372,8 +425,10 @@ export function createInteractionBridge(pi: ExtensionAPI): {
   const observe = (ctx: ExtensionContext) => {
     const sessionId = ctx.sessionManager.getSessionId();
     if (activeSessionId !== undefined && sessionId !== activeSessionId) {
+      closeAllAskWaiters();
       pending.clear();
       callArguments.clear();
+      askCallIds.clear();
       resolvedPlanIds.clear();
       sequence = 0;
     }
@@ -381,10 +436,11 @@ export function createInteractionBridge(pi: ExtensionAPI): {
   };
 
   const removeByCallId = (id: string) => {
-    for (const [key, entry] of pending) {
-      if (entry.interaction.toolCallId === id) pending.delete(key);
-    }
+    const waiter = askWaiters.get(id);
+    if (waiter) settleAsk(waiter, { kind: "closed" });
+    closeAskInteractions(id);
     callArguments.delete(id);
+    askCallIds.delete(id);
   };
 
   const putPending = (
@@ -400,6 +456,65 @@ export function createInteractionBridge(pi: ExtensionAPI): {
       sessionId,
       sequence: previous?.sequence ?? ++sequence,
     });
+  };
+
+  const beginAsk = (
+    ctx: ExtensionContext,
+    toolCallId: string,
+    rawQuestions: unknown,
+  ): MobileAskWait | undefined => {
+    observe(ctx);
+    const sessionId = activeSessionId;
+    const parsed = parseAskQuestions(rawQuestions);
+    if (
+      !sessionId ||
+      !parsed ||
+      parsed.questions.length === 0 ||
+      parsed.truncated
+    )
+      return undefined;
+    askCallIds.add(toolCallId);
+    const existing = askWaiters.get(toolCallId);
+    if (existing && existing.sessionId === sessionId) {
+      return {
+        promise: existing.promise,
+        cancel: () => {
+          settleAsk(existing, { kind: "closed" });
+          closeAskInteractions(toolCallId);
+        },
+      };
+    }
+    const interactionId = `ask:${toolCallId}`;
+    putPending(interactionId, sessionId, {
+      id: interactionId,
+      kind: "ask",
+      title: "Input required",
+      toolCallId,
+      questions: parsed.questions,
+      transport: "native",
+      createdAt: Date.now(),
+    });
+    let resolve!: (result: MobileAskWaitResult) => void;
+    const promise = new Promise<MobileAskWaitResult>((settle) => {
+      resolve = settle;
+    });
+    const waiter: AskWaiter = {
+      toolCallId,
+      interactionId,
+      sessionId,
+      questions: parsed.questions,
+      promise,
+      resolve,
+      settled: false,
+    };
+    askWaiters.set(toolCallId, waiter);
+    return {
+      promise,
+      cancel: () => {
+        settleAsk(waiter, { kind: "closed" });
+        closeAskInteractions(toolCallId);
+      },
+    };
   };
 
   const putPlan = (ctx: ExtensionContext, value: unknown) => {
@@ -419,6 +534,7 @@ export function createInteractionBridge(pi: ExtensionAPI): {
       if (entry.interaction.transport === "terminal") pending.delete(key);
     }
     callArguments.clear();
+    askCallIds.clear();
   };
 
   const events = pi as unknown as InteractionEvents;
@@ -451,6 +567,7 @@ export function createInteractionBridge(pi: ExtensionAPI): {
     if (!id || !name) return;
     callArguments.set(id, { name, args: event.args });
     if (name !== "ask") return;
+    if (askCallIds.has(id)) return;
     let askInput: unknown;
     if (
       typeof event.args === "object" &&
@@ -465,13 +582,12 @@ export function createInteractionBridge(pi: ExtensionAPI): {
       kind: "ask",
       title: "Input required",
       body: [
-        TERMINAL_OWNERSHIP,
         ...(!questions || questions.length === 0
           ? ["Question details are unavailable from the tool event."]
           : []),
         ...(parsedQuestions?.truncated
-          ? ["Some question details are truncated; use the live terminal for the full dialog."]
-          : []),
+          ? ["Question details exceed mobile limits; answer in the native OMP dialog."]
+          : ["Waiting for the native OMP dialog."]),
       ].join("\n\n"),
       toolCallId: id,
       ...(questions && questions.length > 0 ? { questions } : {}),
@@ -636,6 +752,14 @@ export function createInteractionBridge(pi: ExtensionAPI): {
     );
     const plan = entries.find((entry) => entry.interaction.kind === "plan");
     if (plan) return plan.interaction;
+    const ask = entries
+      .filter(
+        (entry) =>
+          entry.interaction.kind === "ask" &&
+          entry.interaction.transport === "native",
+      )
+      .sort((left, right) => left.sequence - right.sequence)[0];
+    if (ask) return ask.interaction;
     return entries
       .filter((entry) => entry.interaction.transport === "terminal")
       .sort((left, right) => right.sequence - left.sequence)[0]?.interaction;
@@ -659,11 +783,34 @@ export function createInteractionBridge(pi: ExtensionAPI): {
     const interaction = snapshot(ctx);
     if (
       !interaction ||
-      interaction.kind !== "plan" ||
       interaction.transport !== "native" ||
       interaction.id !== action.id
     )
       return false;
+    if (interaction.kind === "ask") {
+      const toolCallId = interaction.toolCallId;
+      const waiter = toolCallId ? askWaiters.get(toolCallId) : undefined;
+      if (
+        !waiter ||
+        waiter.sessionId !== activeSessionId ||
+        waiter.interactionId !== interaction.id ||
+        action.feedback !== undefined ||
+        action.role !== undefined
+      )
+        return false;
+      if (action.choice === "cancel" && action.answers === undefined) {
+        settleAsk(waiter, { kind: "cancel" });
+        pending.delete(waiter.interactionId);
+        return true;
+      }
+      if (action.choice !== "answer") return false;
+      const answers = validateAskAnswers(waiter.questions, action.answers);
+      if (!answers) return false;
+      settleAsk(waiter, { kind: "answer", answers });
+      pending.delete(waiter.interactionId);
+      return true;
+    }
+    if (interaction.kind !== "plan") return false;
     const planContext = ctx as PlanContext;
     if (typeof planContext.getPendingPlanReview !== "function" ||
         typeof planContext.resolvePlanReview !== "function")
@@ -717,6 +864,6 @@ export function createInteractionBridge(pi: ExtensionAPI): {
     return true;
   };
 
-  return { observe, reset: clear, snapshot, handleAction };
+  return { observe, reset: clear, beginAsk, snapshot, handleAction };
 }
 

@@ -14,6 +14,7 @@ import { fileURLToPath } from "node:url";
 import { homedir } from "node:os";
 import { randomUUID, timingSafeEqual } from "node:crypto";
 import { Terminal as HeadlessTerminal } from "@xterm/headless";
+import { validateAskAnswers } from "./ask-selection";
 import {
   API_VERSION,
   isSlotId,
@@ -33,6 +34,7 @@ import {
   type TerminalSnapshot,
 } from "./shared";
 import type {
+  MobileAskQuestion,
   MobileHistory,
   MobileImage,
   MobileNotice,
@@ -1231,6 +1233,9 @@ function normaliseRuntime(value: unknown): MobileRuntime | undefined {
         finiteNumber(notice.timestamp) === undefined
       )
         continue;
+      // Running older extensions may still emit this redundant queue-status notice.
+      if (tone === "info" && notice.title.trim() === "Queue text unavailable")
+        continue;
       notices.push({
         id: notice.id,
         tone,
@@ -1319,10 +1324,49 @@ function normaliseRuntime(value: unknown): MobileRuntime | undefined {
           })
         : undefined;
       const questions = Array.isArray(pending.questions)
-        ? pending.questions
-            .slice(0, 32)
-            .map((question) => boundedJsonValue(question))
-            .filter((question) => question !== undefined)
+        ? pending.questions.slice(0, 32).flatMap((entry): MobileAskQuestion[] => {
+            if (
+              !entry ||
+              typeof entry !== "object" ||
+              Array.isArray(entry)
+            )
+              return [];
+            const question = entry as Record<string, unknown>;
+            if (
+              typeof question.question !== "string" ||
+              !Array.isArray(question.options)
+            )
+              return [];
+            const options = question.options.slice(0, 32).flatMap((value) => {
+              if (
+                !value ||
+                typeof value !== "object" ||
+                Array.isArray(value)
+              )
+                return [];
+              const option = value as Record<string, unknown>;
+              if (typeof option.label !== "string") return [];
+              return [{
+                label: option.label.slice(0, 4096),
+                ...(typeof option.description === "string"
+                  ? { description: option.description.slice(0, 4096) }
+                  : {}),
+              }];
+            });
+            const recommended = finiteNumber(question.recommended);
+            return [{
+              ...(typeof question.id === "string"
+                ? { id: question.id.slice(0, 200) }
+                : {}),
+              question: question.question.slice(0, 4096),
+              ...(typeof question.header === "string"
+                ? { header: question.header.slice(0, 200) }
+                : {}),
+              options,
+              multi: question.multi === true,
+              ...(recommended !== undefined ? { recommended } : {}),
+            }];
+          })
         : undefined;
       result.interaction = {
         id: pending.id,
@@ -1725,6 +1769,7 @@ export function validateInteractionAction(
     choice: true,
     feedback: true,
     role: true,
+    answers: true,
   };
   if (
     body.type !== "interaction" ||
@@ -1759,6 +1804,24 @@ export function validateInteractionAction(
       status: 409,
       message: "pending interaction changed; refresh before responding",
     };
+  if (pending.kind === "ask" && pending.transport === "native") {
+    if (body.feedback !== undefined || body.role !== undefined)
+      return { ok: false, status: 400, message: "ask actions do not accept plan fields" };
+    if (body.choice === "cancel" && body.answers === undefined)
+      return {
+        ok: true,
+        action: { generation: state.generation, type: "interaction", id: body.id, choice: "cancel" },
+      };
+    const answers = pending.questions
+      ? validateAskAnswers(pending.questions, body.answers)
+      : undefined;
+    if (body.choice !== "answer" || !answers)
+      return { ok: false, status: 400, message: "ask answers do not match the pending questions" };
+    return {
+      ok: true,
+      action: { generation: state.generation, type: "interaction", id: body.id, choice: "answer", answers },
+    };
+  }
   if (pending.kind !== "plan" || pending.transport !== "native")
     return {
       ok: false,
@@ -1766,6 +1829,8 @@ export function validateInteractionAction(
       message:
         "this interaction must be completed through its owning terminal controls",
     };
+  if (body.answers !== undefined)
+    return { ok: false, status: 400, message: "plan actions do not accept ask answers" };
   if (
     !pending.options?.some(
       (option) => option.id === body.choice && option.disabled !== true,
