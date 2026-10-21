@@ -176,7 +176,11 @@ function parseAskQuestions(
       return [];
     }
     const question = takeText(raw.question);
-    if (!question) return [];
+    if (!question) {
+      // Answers are positional; dropping a question must disable native replies.
+      truncated = true;
+      return [];
+    }
     const id = typeof raw.id === "string" ? takeText(raw.id) : undefined;
     const header =
       typeof raw.header === "string" ? takeText(raw.header) : undefined;

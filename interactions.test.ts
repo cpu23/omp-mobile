@@ -1,6 +1,7 @@
 import { describe, expect, it } from "bun:test";
 import type { ExtensionAPI, ExtensionContext } from "@oh-my-pi/pi-coding-agent";
 import type { MobileInteractionAction } from "./parity-types";
+import { normaliseState, validateInteractionAction } from "./server";
 import { createInteractionBridge } from "./interactions";
 
 type Handler = (event: unknown, ctx: ExtensionContext) => void;
@@ -64,6 +65,37 @@ function action(
 }
 
 describe("mobile plan interactions", () => {
+  it("falls back to terminal when dropping an empty question would shift answer positions", () => {
+    for (const emptyIndex of [0, 1]) {
+      const { bridge, context, setReview } = fixture();
+      setReview(undefined);
+      const questions = [
+        { id: "first", question: "First?", options: [{ label: "A" }] },
+        { id: "second", question: "Second?", options: [{ label: "B" }] },
+      ];
+      questions[emptyIndex]!.question = "";
+      const wait = bridge.beginAsk(context, `empty-${emptyIndex}`, questions);
+      try {
+        expect(wait).toBeUndefined();
+        expect(bridge.snapshot(context)?.transport).not.toBe("native");
+      } finally {
+        wait?.cancel();
+      }
+    }
+  });
+  it("round-trips long ask option labels through the gateway and bridge", async () => {
+    const { bridge, context, setReview } = fixture();
+    setReview(undefined);
+    const label = "L".repeat(4096);
+    const wait = bridge.beginAsk(context, "long-label", [{ id: "q", question: "Choose", options: [{ label }] }]);
+    expect(wait).toBeDefined();
+    const state = normaliseState({ generation: "generation-a", runtime: { notices: [], interaction: bridge.snapshot(context) } })!;
+    expect(state.runtime?.interaction?.questions?.[0]?.options[0]?.label.length).toBe(4096);
+    const answer = action("ask:long-label", "answer", { answers: [{ selectedOptions: [label] }] });
+    expect(validateInteractionAction(state, answer).ok).toBe(true);
+    expect(await bridge.handleAction(context, answer)).toBe(true);
+    expect(await wait!.promise).toMatchObject({ kind: "answer", answers: answer.answers });
+  });
   it("rejects stale ids and disabled choices without resolving a review", async () => {
     const { bridge, context, resolved } = fixture();
     expect(await bridge.handleAction(context, action("stale-review", "execute"))).toBe(false);

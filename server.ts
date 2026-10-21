@@ -1347,7 +1347,7 @@ function normaliseRuntime(value: unknown): MobileRuntime | undefined {
               const option = value as Record<string, unknown>;
               if (typeof option.label !== "string") return [];
               return [{
-                label: option.label.slice(0, 512),
+                label: option.label.slice(0, 4096),
                 ...(typeof option.description === "string"
                   ? { description: option.description.slice(0, 4096) }
                   : {}),
