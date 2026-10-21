@@ -5045,13 +5045,22 @@ async function addImageFiles(files: File[]): Promise<void> {
       next.push(image);
       remaining -= image.data.length;
     }
+    const images = targetId === activeId
+      ? attachedImages
+      : (attachmentsBySlot.get(targetId) ?? []);
+    const totalBase64Chars = images.reduce((total, image) => total + image.data.length, 0);
+    if (images.length + next.length > 8) {
+      showToast("A prompt can contain at most 8 images", true);
+      return;
+    }
+    if (totalBase64Chars + next.reduce((total, image) => total + image.data.length, 0) > maximumBase64Chars) {
+      showToast("Images are too large to attach together.", true);
+      return;
+    }
     for (const image of next) {
       imageSubmissionIds.set(image, String(nextImageSubmissionId));
       nextImageSubmissionId += 1;
     }
-    const images = targetId === activeId
-      ? attachedImages
-      : (attachmentsBySlot.get(targetId) ?? []);
     const updated = [...images, ...next];
     attachmentsBySlot.set(targetId, updated);
     if (targetId === activeId) {
