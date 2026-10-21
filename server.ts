@@ -1258,7 +1258,7 @@ function normaliseRuntime(value: unknown): MobileRuntime | undefined {
         kind === "dialog") &&
       typeof pending.title === "string" &&
       pending.title.trim() &&
-      pending.title.length <= 200 &&
+      pending.title.length <= 256 &&
       (transport === "native" || transport === "terminal") &&
       finiteNumber(pending.createdAt) !== undefined
     ) {
@@ -1329,7 +1329,9 @@ function normaliseRuntime(value: unknown): MobileRuntime | undefined {
         kind,
         title: pending.title.trim(),
         ...(typeof pending.body === "string"
-          ? { body: pending.body.slice(0, 8000) }
+          // The bridge already bounds plan reviews to 1 MiB and disables
+          // native choices when incomplete. Do not silently truncate that review.
+          ? { body: pending.body.slice(0, 1_048_576) }
           : {}),
         ...(typeof pending.toolCallId === "string"
           ? { toolCallId: pending.toolCallId.slice(0, 200) }
