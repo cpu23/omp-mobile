@@ -1117,7 +1117,7 @@ function renderShell(): void {
       </section>
     </aside><button class="sidebar-backdrop" id="sidebar-close" type="button" aria-label="Close sessions"></button>
     <section class="workspace"><div class="capabilities hidden" id="capabilities"></div><section class="runtime-area hidden" id="runtime-area" aria-live="polite"></section><div class="transcript" id="transcript" tabindex="0" aria-label="Session transcript"></div><pre class="raw-view hidden" id="raw-view" tabindex="0" aria-label="Raw terminal output"></pre><button class="scroll-fab hidden" id="scroll-bottom" type="button" aria-label="Scroll to bottom">${ICONS.arrowDown}</button></section></main>
-    <div class="composer-dock"><section class="activity-dock hidden" id="activity-dock" aria-label="Session activity"><div id="activity-content" class="activity-content hidden"><div class="activity-todos" id="activity-todos"></div><div class="activity-details hidden" id="activity-details"></div></div></section><form class="composer" id="composer"><div class="command-menu hidden" id="command-menu" role="listbox" aria-label="Slash commands"></div><div class="composer-ctx"></div><div class="composer-working hidden" id="composer-working" role="status" aria-live="polite"><span class="working-spinner" aria-hidden="true">${SPINNER_FRAMES[0]}</span><span class="shimmer shimmer-accent" id="composer-working-text">${shimmerMarkup("Working…")}</span></div><div class="composer-input"><textarea id="prompt" rows="1" placeholder="Message this session…" aria-label="Message this session" aria-autocomplete="list" aria-controls="command-menu" aria-expanded="false"></textarea></div><div class="attachment-tray hidden" id="attachment-tray" aria-label="Attached images"></div><div class="composer-tools"><input id="image-input" type="file" accept="image/png,image/jpeg,image/webp,image/gif" multiple hidden><button type="button" class="ghost-btn attach-btn" id="attach-images" aria-label="Attach images">＋ Image</button><div class="composer-meta" id="composer-meta"><button type="button" class="ghost-btn" id="model-open">Model</button><button type="button" class="ghost-btn" id="effort-open">Effort</button><span id="ctx-label"></span><span id="cost-label"></span></div><button type="button" class="abort-btn hidden" id="abort">Stop</button><button type="submit" class="send-btn" id="send">Send</button></div></form>
+    <div class="composer-dock"><section class="activity-dock hidden" id="activity-dock" aria-label="Session activity"><div id="activity-content" class="activity-content hidden"><div class="activity-todos" id="activity-todos"></div><div class="activity-details hidden" id="activity-details"></div></div></section><form class="composer" id="composer"><div class="command-menu hidden" id="command-menu" role="listbox" aria-label="Slash commands"></div><div class="composer-ctx"></div><div class="composer-working hidden" id="composer-working" role="status" aria-live="polite"><span class="working-spinner" aria-hidden="true">${SPINNER_FRAMES[0]}</span><span class="shimmer shimmer-accent" id="composer-working-text">${shimmerMarkup("Working…")}</span></div><div class="composer-input"><div id="prompt" contenteditable="true" role="textbox" aria-multiline="true" data-placeholder="Message this session…" aria-label="Message this session" aria-autocomplete="list" aria-controls="command-menu" aria-expanded="false"></div></div><div class="attachment-tray hidden" id="attachment-tray" aria-label="Attached images"></div><div class="composer-tools"><input id="image-input" type="file" accept="image/png,image/jpeg,image/webp,image/gif" multiple hidden><button type="button" class="ghost-btn attach-btn" id="attach-images" aria-label="Attach images" title="Upload images">＋</button><div class="composer-meta" id="composer-meta"><button type="button" class="ghost-btn" id="model-open">Model</button><button type="button" class="ghost-btn" id="effort-open">Effort</button><span id="ctx-label"></span><span id="cost-label"></span></div><button type="button" class="abort-btn hidden" id="abort">Stop</button><button type="submit" class="send-btn" id="send" aria-label="Send message"></button></div></form>
   </div>`;
   requiredElement<HTMLElement>("#activity-content").insertAdjacentHTML("beforebegin",
     `<button type="button" class="todo-pull-tab" id="todo-toggle" aria-expanded="false" aria-controls="activity-content"><span id="todo-toggle-label">Activity</span><svg width="12" height="12" viewBox="0 0 12 12" fill="none" stroke="currentColor" aria-hidden="true"><path d="m3 7 3-3 3 3"/></svg></button>`);
@@ -1254,7 +1254,8 @@ function renderShell(): void {
       void enableNotifications();
     },
   );
-  const prompt = requiredElement<HTMLTextAreaElement>("#prompt");
+  const prompt = requiredElement<HTMLDivElement>("#prompt");
+  resizePrompt();
   const imageInput = requiredElement<HTMLInputElement>("#image-input");
   requiredElement<HTMLButtonElement>("#attach-images").addEventListener(
     "click",
@@ -1265,17 +1266,54 @@ function renderShell(): void {
     imageInput.value = "";
     void addImageFiles(files);
   });
-  prompt.addEventListener("paste", (event: ClipboardEvent) => {
-    const files = Array.from(event.clipboardData?.items ?? [])
-      .filter((item) => item.kind === "file" && item.type.startsWith("image/"))
-      .map((item) => item.getAsFile())
-      .filter((file): file is File => file !== null);
-    if (!files.length) return;
+  prompt.addEventListener("beforeinput", (event: InputEvent) => {
+    if (
+      !event.inputType.startsWith("insertFromPaste") &&
+      event.inputType !== "insertFromDrop"
+    )
+      return;
     event.preventDefault();
-    void addImageFiles(files);
+    if (!prompt.isContentEditable) return;
+    const files = imageFilesFromTransfer(event.dataTransfer);
+    if (files.length) {
+      void addImageFiles(files);
+      return;
+    }
+    const text =
+      event.dataTransfer?.getData("text/plain") ?? event.data ?? "";
+    if (text) document.execCommand("insertText", false, text);
+  });
+  prompt.addEventListener("paste", (event: ClipboardEvent) => {
+    event.preventDefault();
+    if (!prompt.isContentEditable) return;
+    const files = imageFilesFromTransfer(event.clipboardData);
+    if (files.length) {
+      void addImageFiles(files);
+      return;
+    }
+    // Inserting only plain text keeps clipboard markup out of the draft while
+    // using the browser editing command (and its native undo history).
+    const text = event.clipboardData?.getData("text/plain") ?? "";
+    if (text) document.execCommand("insertText", false, text);
+  });
+  prompt.addEventListener("dragover", (event: DragEvent) => {
+    if (prompt.isContentEditable) event.preventDefault();
+  });
+  prompt.addEventListener("drop", (event: DragEvent) => {
+    event.preventDefault();
+    if (!prompt.isContentEditable) return;
+    const transfer = event.dataTransfer;
+    const files = imageFilesFromTransfer(transfer);
+    if (files.length) {
+      void addImageFiles(files);
+      return;
+    }
+    const text = transfer?.getData("text/plain") ?? "";
+    if (text && placePromptCaret(prompt, event.clientX, event.clientY))
+      document.execCommand("insertText", false, text);
   });
   prompt.addEventListener("input", () => {
-    drafts.set(activeId, prompt.value);
+    drafts.set(activeId, prompt.innerText);
     dismissedCommandDraft = null;
     dismissedMoveDraft = null;
     commandSelection = 0;
@@ -1285,7 +1323,7 @@ function renderShell(): void {
   prompt.addEventListener("keydown", (event: KeyboardEvent) => {
     const menu = requiredElement<HTMLElement>("#command-menu");
     const menuOpen = !menu.classList.contains("hidden");
-    const moveValue = moveDraft(prompt.value);
+    const moveValue = moveDraft(prompt.innerText);
     const isMove = moveValue !== null;
     // Only a completion for the active session/cwd may drive keyboard
     // selection: a stale one would fill a path from another directory.
@@ -1293,7 +1331,7 @@ function renderShell(): void {
       isMove && moveCompletion?.context === activeMoveContext()
         ? moveCompletion.suggestions
         : [];
-    const matches = isMove ? [] : matchingCommands(prompt.value);
+    const matches = isMove ? [] : matchingCommands(prompt.innerText);
     const optionCount = isMove ? moveSuggestions.length : matches.length;
     if (menuOpen && optionCount > 0) {
       if (event.key === "ArrowDown" || event.key === "ArrowUp") {
@@ -1316,8 +1354,8 @@ function renderShell(): void {
       }
       if (event.key === "Escape") {
         event.preventDefault();
-        dismissedCommandDraft = prompt.value;
-        dismissedMoveDraft = prompt.value;
+        dismissedCommandDraft = prompt.innerText;
+        dismissedMoveDraft = prompt.innerText;
         renderCommandMenu();
         return;
       }
@@ -1327,7 +1365,7 @@ function renderShell(): void {
         !isMove &&
         event.key === "Enter" &&
         !event.shiftKey &&
-        `/${matches[commandSelection]?.name}` !== prompt.value.trim()
+        `/${matches[commandSelection]?.name}` !== prompt.innerText.trim()
       ) {
         event.preventDefault();
         selectCommand(matches[commandSelection]);
@@ -1335,8 +1373,8 @@ function renderShell(): void {
       }
     } else if (menuOpen && event.key === "Escape") {
       event.preventDefault();
-      dismissedCommandDraft = prompt.value;
-      dismissedMoveDraft = prompt.value;
+      dismissedCommandDraft = prompt.innerText;
+      dismissedMoveDraft = prompt.innerText;
       renderCommandMenu();
       return;
     }
@@ -1794,21 +1832,32 @@ function queueMoveCompletion(draft: string): void {
   }, 120);
 }
 
+function focusPromptEnd(prompt: HTMLDivElement): void {
+  prompt.focus();
+  const selection = window.getSelection();
+  if (!selection) return;
+  const range = document.createRange();
+  range.selectNodeContents(prompt);
+  range.collapse(false);
+  selection.removeAllRanges();
+  selection.addRange(range);
+}
+
 function applyMoveSelection(path: string): void {
-  const prompt = requiredElement<HTMLTextAreaElement>("#prompt");
-  prompt.value = `/move ${path}`;
-  drafts.set(activeId, prompt.value);
+  const prompt = requiredElement<HTMLDivElement>("#prompt");
+  prompt.innerText = `/move ${path}`;
+  drafts.set(activeId, prompt.innerText);
   dismissedCommandDraft = null;
   dismissedMoveDraft = null;
   commandSelection = 0;
   resizePrompt();
   renderCommandMenu();
-  prompt.focus();
+  focusPromptEnd(prompt);
 }
 
 function hideCommandMenu(
   menu: HTMLElement,
-  prompt: HTMLTextAreaElement,
+  prompt: HTMLDivElement,
 ): void {
   menu.replaceChildren();
   menu.classList.add("hidden");
@@ -1818,10 +1867,10 @@ function hideCommandMenu(
 
 function renderMoveMenu(
   menu: HTMLElement,
-  prompt: HTMLTextAreaElement,
+  prompt: HTMLDivElement,
   draft: string,
 ): void {
-  if (dismissedMoveDraft === prompt.value) {
+  if (dismissedMoveDraft === prompt.innerText) {
     hideCommandMenu(menu, prompt);
     return;
   }
@@ -1933,27 +1982,27 @@ function matchingCommands(value: string): SlashCommand[] {
 
 function selectCommand(command: SlashCommand | undefined): void {
   if (!command) return;
-  const prompt = requiredElement<HTMLTextAreaElement>("#prompt");
-  prompt.value = `/${command.name}`;
-  drafts.set(activeId, prompt.value);
-  dismissedCommandDraft = prompt.value;
+  const prompt = requiredElement<HTMLDivElement>("#prompt");
+  prompt.innerText = `/${command.name}`;
+  drafts.set(activeId, prompt.innerText);
+  dismissedCommandDraft = prompt.innerText;
   commandSelection = 0;
   resizePrompt();
   renderCommandMenu();
-  prompt.focus();
+  focusPromptEnd(prompt);
 }
 
 function renderCommandMenu(): void {
   const menu = document.querySelector<HTMLElement>("#command-menu");
-  const prompt = document.querySelector<HTMLTextAreaElement>("#prompt");
+  const prompt = document.querySelector<HTMLDivElement>("#prompt");
   if (!menu || !prompt) return;
-  const moveValue = moveDraft(prompt.value);
+  const moveValue = moveDraft(prompt.innerText);
   if (moveValue !== null) {
     renderMoveMenu(menu, prompt, moveValue);
     return;
   }
   menu.setAttribute("aria-label", "Slash commands");
-  const matches = matchingCommands(prompt.value);
+  const matches = matchingCommands(prompt.innerText);
   if (matches.length === 0) {
     hideCommandMenu(menu, prompt);
     return;
@@ -1985,9 +2034,63 @@ function renderCommandMenu(): void {
     });
 }
 
+type CaretPositionDocument = Document & {
+  caretPositionFromPoint?: (
+    x: number,
+    y: number,
+  ) => { offsetNode: Node; offset: number } | null;
+  caretRangeFromPoint?: (x: number, y: number) => Range | null;
+};
+
+function imageFilesFromTransfer(transfer: DataTransfer | null): File[] {
+  if (!transfer) return [];
+  const itemFiles = Array.from(transfer.items)
+    .filter((item) => item.kind === "file")
+    .map((item) => item.getAsFile())
+    .filter((file): file is File => file !== null)
+    .filter((file) => file.type.toLowerCase().startsWith("image/"));
+  return itemFiles.length
+    ? itemFiles
+    : Array.from(transfer.files).filter((file) =>
+        file.type.toLowerCase().startsWith("image/"),
+      );
+}
+
+function placePromptCaret(
+  prompt: HTMLDivElement,
+  x: number,
+  y: number,
+): boolean {
+  prompt.focus();
+  const doc = prompt.ownerDocument as CaretPositionDocument;
+  const position = doc.caretPositionFromPoint?.(x, y);
+  let range: Range | null = null;
+  if (position && prompt.contains(position.offsetNode)) {
+    range = doc.createRange();
+    range.setStart(position.offsetNode, position.offset);
+    range.collapse(true);
+  } else {
+    const pointRange = doc.caretRangeFromPoint?.(x, y);
+    if (pointRange && prompt.contains(pointRange.startContainer)) {
+      range = pointRange;
+      range.collapse(true);
+    }
+  }
+  if (range) {
+    const selection = doc.getSelection();
+    if (!selection) return false;
+    selection.removeAllRanges();
+    selection.addRange(range);
+    return true;
+  }
+  const selection = doc.getSelection();
+  return Boolean(selection?.anchorNode && prompt.contains(selection.anchorNode));
+}
+
 function resizePrompt(): void {
-  const prompt = document.querySelector<HTMLTextAreaElement>("#prompt");
+  const prompt = document.querySelector<HTMLDivElement>("#prompt");
   if (!prompt) return;
+  prompt.classList.toggle("is-empty", prompt.innerText.trim().length === 0);
   prompt.style.height = "auto";
   prompt.style.height = `${Math.min(prompt.scrollHeight, 180)}px`;
 }
@@ -2033,16 +2136,16 @@ function selectSlot(id: SlotId): void {
     }, 0);
     return;
   }
-  const oldPrompt = document.querySelector<HTMLTextAreaElement>("#prompt");
+  const oldPrompt = document.querySelector<HTMLDivElement>("#prompt");
   if (activeId) attachmentsBySlot.set(activeId, attachedImages);
-  if (oldPrompt) drafts.set(activeId, oldPrompt.value);
+  if (oldPrompt) drafts.set(activeId, oldPrompt.innerText);
   activeId = id;
   attachedImages = attachmentsBySlot.get(id) ?? [];
   attachmentRevision += 1;
   localStorage.setItem("omp-mobile-active-slot", id);
   activeState = cache.get(id) || null;
   if (oldPrompt) {
-    oldPrompt.value = draftFor(id);
+    oldPrompt.innerText = draftFor(id);
     resizePrompt();
   }
   transcriptNearBottom = true;
@@ -4926,15 +5029,16 @@ function renderActive(): void {
   renderRuntime(state);
   renderAttachments();
   syncTopBar();
-  const prompt = requiredElement<HTMLTextAreaElement>("#prompt");
-  prompt.placeholder = pendingInteraction
+  const prompt = requiredElement<HTMLDivElement>("#prompt");
+  prompt.dataset.placeholder = pendingInteraction
     ? "Resolve the pending dialog in live terminal controls…"
     : activeId
       ? "Message this session…"
       : "Start or select a session…";
-  prompt.disabled = pendingInteraction;
+  prompt.contentEditable = String(!pendingInteraction);
+  prompt.setAttribute("aria-disabled", String(pendingInteraction));
   if (document.activeElement !== prompt) {
-    prompt.value = draftFor();
+    prompt.innerText = draftFor();
     resizePrompt();
   }
   renderCommandMenu();
@@ -4998,8 +5102,9 @@ function renderActive(): void {
   }
   const sendButton = requiredElement<HTMLButtonElement>("#send");
   const forceReady =
-    hasPendingMessages && active && !prompt.value.trim();
-  sendButton.textContent = forceReady ? "Force" : "Send";
+    hasPendingMessages && active && !prompt.innerText.trim();
+  sendButton.innerHTML = `<svg width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="${forceReady ? "m13 2-8 12h6l-1 8 9-13h-6l1-7" : "M12 19V5m-6 6 6-6 6 6"}"/></svg>`;
+  sendButton.title = forceReady ? "Force queued messages now" : "Send message";
   sendButton.setAttribute(
     "aria-label",
     forceReady ? "Force queued messages now" : "Send message",
@@ -5209,8 +5314,8 @@ function reconcileActiveSlot(): void {
     }
     return;
   }
-  const prompt = document.querySelector<HTMLTextAreaElement>("#prompt");
-  if (activeId && liveIds.has(activeId)) drafts.set(activeId, prompt?.value ?? "");
+  const prompt = document.querySelector<HTMLDivElement>("#prompt");
+  if (activeId && liveIds.has(activeId)) drafts.set(activeId, prompt?.innerText ?? "");
   if (activeId && liveIds.has(activeId))
     attachmentsBySlot.set(activeId, attachedImages);
   // Falling back to another runtime (or none) changes the session identity:
@@ -5223,7 +5328,7 @@ function reconcileActiveSlot(): void {
   activeState = activeId ? cache.get(activeId) ?? null : null;
   stateError = null;
   if (prompt) {
-    prompt.value = activeId ? draftFor(activeId) : "";
+    prompt.innerText = activeId ? draftFor(activeId) : "";
     resizePrompt();
   }
   transcriptNearBottom = true;
@@ -5610,9 +5715,9 @@ function handleSendSuccess(targetId: SlotId, draftAtSend: string): void {
   if (!drafts.has(targetId) || drafts.get(targetId) === draftAtSend) {
     drafts.set(targetId, "");
   }
-  const livePrompt = document.querySelector<HTMLTextAreaElement>("#prompt");
-  if (activeId === targetId && livePrompt && livePrompt.value === draftAtSend) {
-    livePrompt.value = "";
+  const livePrompt = document.querySelector<HTMLDivElement>("#prompt");
+  if (activeId === targetId && livePrompt && livePrompt.innerText === draftAtSend) {
+    livePrompt.innerText = "";
     drafts.set(targetId, "");
     resizePrompt();
     dismissedCommandDraft = null;
@@ -5642,11 +5747,11 @@ async function forcePendingMessages(
   }
 }
 function sendPrompt(): void {
-  const prompt = requiredElement<HTMLTextAreaElement>("#prompt");
-  const text = prompt.value.trim();
+  const prompt = requiredElement<HTMLDivElement>("#prompt");
+  const text = prompt.innerText.trim();
   const targetId = activeId;
   const targetState = activeState;
-  const draftAtSend = prompt.value;
+  const draftAtSend = prompt.innerText;
   const imagesToSend = [...attachedImages];
   if (targetState?.runtime?.interaction) {
     showToast(
@@ -5965,7 +6070,7 @@ let effortSliderDragging = false;
 /** True while the composer owns focus; effort controls must not steal it. */
 function composerFocused(): boolean {
   const active = document.activeElement;
-  return active instanceof HTMLTextAreaElement && active.id === "prompt";
+  return active instanceof HTMLDivElement && active.id === "prompt";
 }
 
 function closeEffortPopover(): void {
@@ -6144,9 +6249,9 @@ async function savePins(next: string[]): Promise<void> {
   }
 }
 function selectDirectory(dirPath: string): void {
-  const prompt = requiredElement<HTMLTextAreaElement>("#prompt");
+  const prompt = requiredElement<HTMLDivElement>("#prompt");
   const command = `/move ${dirPath}`;
-  prompt.value = command;
+  prompt.innerText = command;
   drafts.set(activeId, command);
   dismissedCommandDraft = null;
   dismissedMoveDraft = null;
@@ -6154,7 +6259,7 @@ function selectDirectory(dirPath: string): void {
   resizePrompt();
   renderCommandMenu();
   closeModal();
-  prompt.focus();
+  focusPromptEnd(prompt);
 }
 type DirTreeNode = {
   path: string;

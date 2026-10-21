@@ -25,6 +25,7 @@
     "@oh-my-pi/pi-coding-agent": "18.12.1",
     "@types/bun": "latest",
     "happy-dom": "^21.0.4",
+    "playwright": "^1.64.1",
     "typescript": "^5.8.0"
   }
 }
