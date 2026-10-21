@@ -1710,6 +1710,13 @@ function bindSidebarSwipe(chat: HTMLElement, direction: 1 | -1, activate: () => 
         target.closest(direction === -1
           ? "input, textarea, select, [contenteditable]"
           : "a, button, input, textarea, select, pre, code, [contenteditable]")) return;
+    // Reserve the whole gesture for nested horizontal scrollers, even at an edge.
+    if (direction === 1 && target instanceof Element) {
+      for (let element: Element | null = target; element && element !== chat; element = element.parentElement) {
+        if (element.scrollWidth > element.clientWidth &&
+            /^(auto|scroll)$/.test(window.getComputedStyle(element).overflowX)) return;
+      }
+    }
     const touch = event.touches[0];
     start = { id: touch.identifier, x: touch.clientX, y: touch.clientY };
   }, { passive: true });
