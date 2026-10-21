@@ -525,7 +525,7 @@ export function createInteractionBridge(pi: ExtensionAPI): {
     putPending(`approval:${sessionId}:${id}`, sessionId, {
       id: `approval:${id}`,
       kind: "approval",
-      title: `Approval required: ${safeName}`,
+      title: limitText(`Approval required: ${safeName}`, MAX_INTERACTION_TITLE_CHARS).text,
       body,
       toolCallId: id,
       transport: "terminal",
