@@ -9,6 +9,17 @@ import {
 import { join } from "node:path";
 import type { ExtensionAPI, ExtensionContext } from "@oh-my-pi/pi-coding-agent";
 import { getSessionAccentHex, type SessionAccentInputs } from "./session-accent";
+import type {
+  MobileHistory,
+  MobileImage,
+  MobileInteractionAction,
+  MobileMessage,
+  MobileNotice,
+  MobilePart,
+  MobileRuntime,
+  MobileAskDisplay,
+} from "./parity-types";
+import { createInteractionBridge } from "./interactions";
 
 /**
  * In-process OMP mobile bridge.
@@ -37,8 +48,11 @@ type Action = {
   value?: unknown;
   path?: unknown;
   confirmed?: unknown;
+  images?: unknown;
+  choice?: unknown;
+  feedback?: unknown;
+  role?: unknown;
 };
-
 type MobileModel = {
   provider: string;
   id: string;
@@ -95,8 +109,10 @@ type MobileState = {
     isLight?: boolean;
     tokens: Record<string, string>;
   } | null;
-  messages: ChatMessage[];
+  messages: MobileMessage[];
   commands: MobileSlashCommand[];
+  runtime?: MobileRuntime;
+  history?: MobileHistory;
   capabilities: MobileCapabilities;
   cwd: string;
   pendingApproval: number;
@@ -123,12 +139,20 @@ type CommandPrepareResponse = {
   command: string;
 };
 
-const MAX_BODY_BYTES = 64 * 1024;
+const MAX_BODY_BYTES = 4 * 1024 * 1024;
 const MAX_MESSAGES = 80;
 const MAX_PARTS_PER_MESSAGE = 60;
 const MAX_TEXT_CHARS = 8000;
 const MAX_THINKING_CHARS = 4000;
 const MAX_TOOL_OUTPUT_CHARS = 6000;
+const MAX_TRANSCRIPT_CONTENT_CHARS = 600 * 1024;
+const MAX_STATE_INLINE_DETAILS_CHARS = 512;
+const MAX_STATE_IMAGE_BASE64_CHARS = 48 * 1024;
+const MAX_PROMPT_IMAGES = 8;
+const MAX_PROMPT_IMAGE_BASE64_CHARS = 3 * 1024 * 1024;
+const MAX_MESSAGE_TRANSFER_CACHE_BYTES = 32 * 1024 * 1024;
+const MAX_MESSAGE_TRANSFER_CACHE_ENTRIES = 64;
+const MESSAGE_TRANSFER_TTL_MS = 2 * 60 * 1000;
 
 type AskOption = { label: string; description?: string };
 type AskQuestion = {
@@ -145,32 +169,7 @@ type AskAnswer = {
   note?: string;
   timedOut?: boolean;
 };
-type AskDisplay = {
-  status: "pending" | "completed" | "redirected";
-  questions: AskQuestion[];
-  answers?: Array<AskAnswer | null>;
-};
-type ChatPart =
-  | { kind: "text"; text: string }
-  | { kind: "thinking"; text: string }
-  | {
-      kind: "tool";
-      id: string;
-      name: string;
-      summary: string;
-      output?: string;
-      ask?: AskDisplay;
-      isError?: boolean;
-      /** Desktop-style subagent rows for `task` tool calls. */
-      task?: TaskActivity;
-    };
-
-type ChatMessage = {
-  role: string;
-  entryId: string;
-  timestamp: string | null;
-  parts: ChatPart[];
-};
+type AskDisplay = MobileAskDisplay;
 
 type ActivityTodoStatus =
   | "pending"
@@ -672,14 +671,14 @@ function extractContentText(content: unknown): string | undefined {
         pieces.push(item);
       } else if (item && typeof item === "object") {
         const obj = item as Record<string, unknown>;
-        if (obj.type === "image") {
-          pieces.push("[image]");
-        } else if (typeof obj.text === "string") {
-          pieces.push(obj.text);
-        } else if (typeof obj.content === "string") {
-          pieces.push(obj.content);
-        } else if (typeof obj.output === "string") {
-          pieces.push(obj.output);
+        if (obj.type !== "image") {
+          if (typeof obj.text === "string") {
+            pieces.push(obj.text);
+          } else if (typeof obj.content === "string") {
+            pieces.push(obj.content);
+          } else if (typeof obj.output === "string") {
+            pieces.push(obj.output);
+          }
         }
       }
     }
@@ -1220,19 +1219,140 @@ function askDisplay(
   };
 }
 
-function transcript(
+type TranscriptOptions = {
+  beforeId?: string;
+  entryId?: string;
+  limit?: number;
+  full?: boolean;
+  imageBudget?: number;
+};
+
+type TranscriptProjection = {
+  messages: MobileMessage[];
+  history: MobileHistory;
+  found?: boolean;
+};
+
+function supportedImageMime(value: unknown): string | undefined {
+  if (typeof value !== "string") return undefined;
+  const mimeType = value.toLowerCase();
+  return mimeType === "image/png" ||
+    mimeType === "image/jpeg" ||
+    mimeType === "image/webp" ||
+    mimeType === "image/gif"
+    ? mimeType
+    : undefined;
+}
+
+function validRasterData(mimeType: string, data: string): boolean {
+  if (
+    data.length === 0 ||
+    data.length % 4 !== 0 ||
+    !/^(?:[A-Za-z0-9+/]{4})*(?:[A-Za-z0-9+/]{2}==|[A-Za-z0-9+/]{3}=)?$/.test(
+      data,
+    )
+  )
+    return false;
+  const encodedHeader = data.slice(0, 24);
+  const encodedTail = data.slice(-4);
+  if (
+    Buffer.from(encodedHeader, "base64").toString("base64") !== encodedHeader ||
+    Buffer.from(encodedTail, "base64").toString("base64") !== encodedTail
+  )
+    return false;
+  const bytes = Buffer.from(encodedHeader, "base64");
+  if (
+    mimeType === "image/png" &&
+    bytes.length >= 8 &&
+    bytes.subarray(0, 8).equals(Buffer.from([137, 80, 78, 71, 13, 10, 26, 10]))
+  )
+    return true;
+  if (
+    mimeType === "image/jpeg" &&
+    bytes.length >= 3 &&
+    bytes[0] === 0xff &&
+    bytes[1] === 0xd8 &&
+    bytes[2] === 0xff
+  )
+    return true;
+  if (
+    mimeType === "image/gif" &&
+    bytes.length >= 6 &&
+    (bytes.toString("ascii", 0, 6) === "GIF87a" ||
+      bytes.toString("ascii", 0, 6) === "GIF89a")
+  )
+    return true;
+  return (
+    mimeType === "image/webp" &&
+    bytes.length >= 12 &&
+    bytes.toString("ascii", 0, 4) === "RIFF" &&
+    bytes.toString("ascii", 8, 12) === "WEBP"
+  );
+}
+function normalizePromptImages(value: unknown): MobileImage[] {
+  const invalid = (message: string): never => {
+    throw Object.assign(new Error(message), { status: 400 });
+  };
+  if (value === undefined) return [];
+  if (!Array.isArray(value)) return invalid("prompt images must be an array");
+  if (value.length > MAX_PROMPT_IMAGES)
+    return invalid(`at most ${MAX_PROMPT_IMAGES} images are allowed`);
+  let encodedChars = 0;
+  return value.map((item): MobileImage => {
+    if (!item || typeof item !== "object" || Array.isArray(item))
+      return invalid("prompt image must be an object");
+    const raw = item as Record<string, unknown>;
+    const mimeType = supportedImageMime(raw.mimeType);
+    const data = asString(raw.data);
+    if (raw.type !== "image" || !mimeType || !data || "sourceId" in raw)
+      return invalid("prompt image must contain raster image data");
+    encodedChars += data.length;
+    if (encodedChars > MAX_PROMPT_IMAGE_BASE64_CHARS)
+      return invalid("prompt image data exceeds the 3 MiB encoded-data limit");
+    if (!validRasterData(mimeType, data))
+      return invalid(`prompt image is not valid ${mimeType} base64 data`);
+    return { type: "image", mimeType, data };
+  });
+}
+
+function safeToolDetails(value: unknown, includeLarge = false): unknown {
+  const sanitize = (item: unknown): unknown => {
+    if (Array.isArray(item)) return item.map(sanitize);
+    if (!item || typeof item !== "object") return item;
+    const hidden = /(?:signature|providerpayload|providermetadata|credentialid)/i;
+    const result: Record<string, unknown> = {};
+    for (const [key, nested] of Object.entries(item)) {
+      if (!hidden.test(key)) result[key] = sanitize(nested);
+    }
+    return result;
+  };
+  const details = sanitize(value);
+  if (includeLarge) return details;
+  try {
+    const encoded = JSON.stringify(details);
+    if (encoded && encoded.length > MAX_STATE_INLINE_DETAILS_CHARS)
+      return {
+        omitted:
+          "Large tool details are available by opening this message's full output.",
+      };
+  } catch {
+    return { omitted: "Tool details unavailable in the compact snapshot." };
+  }
+  return details;
+}
+
+export function transcript(
   branch: unknown,
   taskActivity: Map<string, TaskActivity> = new Map(),
-): ChatMessage[] {
-  if (!Array.isArray(branch)) return [];
-
+  options: TranscriptOptions = {},
+): TranscriptProjection {
+  const entries = Array.isArray(branch) ? branch : [];
   const toolCalls = new Map<
     string,
     { name: string; arguments?: Record<string, unknown> }
   >();
   const toolResultIds = new Set<string>();
-
-  for (const entry of branch) {
+  for (const entry of entries) {
     if (!entry || typeof entry !== "object") continue;
     const item = entry as Record<string, unknown>;
     if (
@@ -1242,254 +1362,861 @@ function transcript(
     )
       continue;
     const raw = item.message as Record<string, unknown>;
-
     const role = asString(raw.role);
     const toolCallId = asString(raw.toolCallId);
-    if (role === "toolResult" || toolCallId) {
-      if (toolCallId) toolResultIds.add(toolCallId);
-    }
-
+    if ((role === "toolResult" || toolCallId) && toolCallId)
+      toolResultIds.add(toolCallId);
     if (Array.isArray(raw.content)) {
       for (const block of raw.content) {
         if (!block || typeof block !== "object") continue;
-        const b = block as Record<string, unknown>;
-        const bType = asString(b.type);
+        const content = block as Record<string, unknown>;
+        const type = asString(content.type);
         if (
-          bType === "toolCall" ||
-          bType === "tool_call" ||
-          bType === "tool_use"
-        ) {
-          const id = asString(b.id) ?? asString(b.toolCallId);
-          const name =
-            asString(b.name) ?? asString(b.toolName) ?? asString(b.tool) ?? "";
-          const args = parseToolArguments(
-            b.arguments ?? b.args ?? b.input,
-          );
-          if (id) {
-            toolCalls.set(id, { name, arguments: args });
-          }
-        } else if (bType === "toolResult") {
-          const id = asString(b.toolCallId) ?? asString(b.id);
-          if (id) toolResultIds.add(id);
-        }
+          type !== "toolCall" &&
+          type !== "tool_call" &&
+          type !== "tool_use"
+        )
+          continue;
+        const id = asString(content.id) ?? asString(content.toolCallId);
+        if (!id) continue;
+        toolCalls.set(id, {
+          name:
+            asString(content.name) ??
+            asString(content.toolName) ??
+            asString(content.tool) ??
+            "tool",
+          arguments: parseToolArguments(
+            content.arguments ?? content.args ?? content.input,
+          ),
+        });
       }
     }
-
     if (Array.isArray(raw.tool_calls)) {
-      for (const tc of raw.tool_calls) {
-        if (!tc || typeof tc !== "object") continue;
-        const t = tc as Record<string, unknown>;
-        const id = asString(t.id);
-        const fn = t.function as Record<string, unknown> | undefined;
-        const name = asString(fn?.name) ?? asString(t.name) ?? "";
-        const args = parseToolArguments(
-          fn?.arguments ?? t.arguments ?? t.args ?? t.input,
-        );
-        if (id) {
-          toolCalls.set(id, { name, arguments: args });
-        }
+      for (const call of raw.tool_calls) {
+        if (!call || typeof call !== "object") continue;
+        const value = call as Record<string, unknown>;
+        const id = asString(value.id);
+        if (!id) continue;
+        const fn =
+          value.function && typeof value.function === "object"
+            ? (value.function as Record<string, unknown>)
+            : undefined;
+        toolCalls.set(id, {
+          name: asString(fn?.name) ?? asString(value.name) ?? "tool",
+          arguments: parseToolArguments(
+            fn?.arguments ??
+              value.arguments ??
+              value.args ??
+              value.input,
+          ),
+        });
       }
     }
   }
 
-  const messages: ChatMessage[] = [];
-
-  for (let index = 0; index < branch.length; index += 1) {
-    const entry = branch[index];
+  const visible: Array<{
+    item: Record<string, unknown>;
+    index: number;
+    entryId: string;
+    timestamp: string | null;
+  }> = [];
+  for (let index = 0; index < entries.length; index += 1) {
+    const entry = entries[index];
     if (!entry || typeof entry !== "object") continue;
     const item = entry as Record<string, unknown>;
-    if (
-      item.type !== "message" ||
-      !item.message ||
-      typeof item.message !== "object"
-    )
-      continue;
-    const raw = item.message as Record<string, unknown>;
-    const rawRole = asString(raw.role);
+    const type = asString(item.type);
+    if (!type) continue;
     const entryId = asString(item.id) ?? `entry-${index}`;
     const timestamp = asString(item.timestamp) ?? null;
-
-    if (rawRole === "toolResult" || raw.toolCallId !== undefined) {
-      const toolCallId = asString(raw.toolCallId) ?? asString(raw.id) ?? "";
-      const known = toolCallId ? toolCalls.get(toolCallId) : undefined;
-      const name =
-        asString(raw.toolName) ?? asString(raw.name) ?? known?.name ?? "tool";
-      const args =
-        known?.arguments ??
-        parseToolArguments(raw.arguments ?? raw.args ?? raw.input);
-      const summary = formatToolCallSummary(name, args);
-      const rawOutput = extractContentText(
-        raw.content ?? raw.output ?? raw.result ?? raw.error,
-      );
-      const output =
-        rawOutput !== undefined
-          ? truncateText(rawOutput, MAX_TOOL_OUTPUT_CHARS)
-          : undefined;
-      const isError =
-        raw.isError === true ||
-        (raw.error !== undefined &&
-          raw.error !== null &&
-          raw.error !== false) ||
-        (typeof raw.details === "object" &&
-          (raw.details as Record<string, unknown>)?.error === true);
-
-      const ask = askDisplay(name, args, raw.details, true);
-      const task =
-        taskActivity.get(toolCallId) ??
-        taskActivityFromDetails(raw.details);
-      const part: ChatPart = {
-        kind: "tool",
-        id: toolCallId,
-        name,
-        summary,
-        ...(output !== undefined ? { output } : {}),
-        ...(ask ? { ask } : {}),
-        ...(isError ? { isError: true } : {}),
-        ...(task && task.agents.length > 0 ? { task } : {}),
-      };
-
-      messages.push({
-        role: "toolResult",
-        entryId,
-        timestamp,
-        parts: [part],
-      });
+    if (type === "message") {
+      if (!item.message || typeof item.message !== "object") continue;
+      const message = item.message as Record<string, unknown>;
+      const role = asString(message.role);
+      if (
+        message.synthetic === true ||
+        role === "developer" ||
+        role === "system"
+      )
+        continue;
+      if (
+        (role === "custom" || role === "hookMessage") &&
+        message.display !== true
+      )
+        continue;
+      const content = message.content;
+      const hasContent =
+        typeof content === "string"
+          ? content.length > 0
+          : Array.isArray(content)
+            ? content.length > 0
+            : content !== undefined && content !== null;
+      const hasToolCalls =
+        Array.isArray(message.tool_calls) && message.tool_calls.length > 0;
+      const hasUsage =
+        !!message.usage &&
+        typeof message.usage === "object" &&
+        !Array.isArray(message.usage);
+      if (
+        role === "toolResult" ||
+        message.toolCallId !== undefined ||
+        role === "bashExecution" ||
+        role === "pythonExecution" ||
+        role === "custom" ||
+        role === "hookMessage" ||
+        (role === "fileMention" &&
+          Array.isArray(message.files) &&
+          message.files.length > 0) ||
+        (role === "user" && hasContent) ||
+        (role === "assistant" &&
+          (hasContent ||
+            hasToolCalls ||
+            hasUsage ||
+            (Array.isArray(message.reactions) &&
+              message.reactions.length > 0) ||
+            typeof message.reaction === "string" ||
+            message.stopReason === "error" ||
+            message.stopReason === "aborted"))
+      )
+        visible.push({ item, index, entryId, timestamp });
       continue;
     }
+    if (
+      type === "compaction" ||
+      type === "branch_summary" ||
+      type === "reset_boundary" ||
+      type === "model_usage" ||
+      type === "model_change" ||
+      type === "service_tier_change" ||
+      type === "thinking_level_change" ||
+      type === "mode_change" ||
+      type === "ttsr_injection" ||
+      type === "title_change" ||
+      type === "label" ||
+      type === "credential_pin"
+    )
+      visible.push({ item, index, entryId, timestamp });
+    if (type === "custom_message" && item.display === true)
+      visible.push({ item, index, entryId, timestamp });
+  }
 
-    const role = rawRole ?? "assistant";
-    const parts: ChatPart[] = [];
-    const content = raw.content;
+  const total = visible.length;
+  let end = total;
+  let found = true;
+  if (options.entryId) {
+    const index = visible.findIndex((entry) => entry.entryId === options.entryId);
+    if (index < 0) {
+      found = false;
+      end = 0;
+    } else {
+      end = index + 1;
+    }
+  } else if (options.beforeId) {
+    const index = visible.findIndex((entry) => entry.entryId === options.beforeId);
+    if (index < 0) {
+      found = false;
+      end = 0;
+    } else {
+      end = index;
+    }
+  }
+  const limit =
+    options.entryId !== undefined
+      ? 1
+      : Math.max(1, Math.min(80, Math.floor(options.limit ?? MAX_MESSAGES)));
+  const start = Math.max(0, end - limit);
+  const selected = found ? visible.slice(start, end) : [];
+  const full = options.full === true;
+  const imageBudget = { used: 0, max: options.imageBudget ?? 512 * 1024 };
+  const contentBudget = { used: 0 };
+  const omittedEntries = new Set<string>();
 
-    if (typeof content === "string") {
-      if (content.length > 0) {
-        parts.push({
-          kind: "text",
-          text: truncateText(content, MAX_TEXT_CHARS),
-        });
+  function projectText(
+    text: string,
+    maxChars: number,
+    entryId: string,
+  ): string {
+    if (full) return text;
+    if (text.length > maxChars) omittedEntries.add(entryId);
+    const content = truncateText(text, maxChars);
+    const remaining = MAX_TRANSCRIPT_CONTENT_CHARS - contentBudget.used;
+    if (remaining <= 0) {
+      if (omittedEntries.has(entryId)) return "";
+      omittedEntries.add(entryId);
+      return "[Additional content omitted from snapshot; open full message]";
+    }
+    if (content.length <= remaining) {
+      contentBudget.used += content.length;
+      return content;
+    }
+    const marker = "\n[…snapshot limit reached; open full message]";
+    const prefixLength = Math.max(0, remaining - marker.length);
+    const bounded = `${content.slice(0, prefixLength)}${marker}`;
+    contentBudget.used += bounded.length;
+    omittedEntries.add(entryId);
+    return bounded;
+  }
+  function projectLabel(
+    text: string,
+    maxChars: number,
+    entryId: string,
+  ): string {
+    if (full) return text;
+    if (text.length > maxChars) omittedEntries.add(entryId);
+    return truncateText(text, maxChars);
+  }
+  function projectTask(
+    task: TaskActivity | undefined,
+    entryId: string,
+  ): TaskActivity | undefined {
+    if (!task || full || task.agents.length <= 4) return task;
+    omittedEntries.add(entryId);
+    return { ...task, agents: task.agents.slice(0, 4) };
+  }
+
+  function projectDetails(value: unknown, entryId: string): unknown {
+    const details = safeToolDetails(value, full);
+    if (
+      !full &&
+      details &&
+      typeof details === "object" &&
+      !Array.isArray(details) &&
+      "omitted" in details
+    )
+      omittedEntries.add(entryId);
+    return details;
+  }
+  function projectMessage(
+    role: string,
+    entryId: string,
+    timestamp: string | null,
+    parts: MobilePart[],
+  ): MobileMessage {
+    if (!full && parts.length > MAX_PARTS_PER_MESSAGE)
+      omittedEntries.add(entryId);
+    return {
+      role,
+      entryId,
+      timestamp,
+      parts: full ? parts : parts.slice(0, MAX_PARTS_PER_MESSAGE),
+      ...(full
+        ? { full: true }
+        : omittedEntries.has(entryId)
+          ? { full: false }
+          : {}),
+    };
+  }
+
+  function imagePart(
+    value: unknown,
+    sourceId: string,
+    label?: string,
+  ): MobilePart | undefined {
+    if (!value || typeof value !== "object") return undefined;
+    const raw = value as Record<string, unknown>;
+    const mimeType = supportedImageMime(raw.mimeType);
+    const data = asString(raw.data);
+    if (!mimeType || !data || !validRasterData(mimeType, data))
+      return undefined;
+    if (
+      full ||
+      (data.length <= MAX_STATE_IMAGE_BASE64_CHARS &&
+        imageBudget.used + data.length <= imageBudget.max)
+    ) {
+      imageBudget.used += full ? 0 : data.length;
+      return {
+        kind: "image",
+        image: { type: "image", mimeType, data },
+        ...(label ? { label } : {}),
+      };
+    }
+    omittedEntries.add(sourceId);
+    return {
+      kind: "image",
+      image: { type: "image", mimeType, data: "", sourceId },
+      label: label ?? "Image — load full message",
+    };
+  }
+
+  function contentParts(
+    content: unknown,
+    entryId: string,
+    isAssistant: boolean,
+  ): MobilePart[] {
+    const parts: MobilePart[] = [];
+    const blocks = Array.isArray(content) ? content : [content];
+    for (const block of blocks) {
+      if (!full && parts.length >= MAX_PARTS_PER_MESSAGE) {
+        omittedEntries.add(entryId);
+        break;
       }
-    } else if (Array.isArray(content)) {
-      for (const block of content) {
-        if (parts.length >= MAX_PARTS_PER_MESSAGE) break;
-        if (typeof block === "string") {
-          if (block.length > 0) {
-            parts.push({
-              kind: "text",
-              text: truncateText(block, MAX_TEXT_CHARS),
-            });
-          }
-        } else if (block && typeof block === "object") {
-          const b = block as Record<string, unknown>;
-          const type = asString(b.type);
-          const thinkingText =
-            asString(b.thinking) ??
-            asString(b.thought) ??
-            asString(b.reasoning) ??
-            asString(b.reasoning_content);
-          if (
-            type === "thinking" ||
-            type === "thought" ||
-            type === "reasoning" ||
-            thinkingText !== undefined
-          ) {
-            const text = thinkingText ?? asString(b.text) ?? "";
-            if (text) {
-              parts.push({
-                kind: "thinking",
-                text: truncateText(text, MAX_THINKING_CHARS),
-              });
-            }
-          } else if (type === "text" || b.text !== undefined) {
-            const text = asString(b.text) ?? "";
-            if (text) {
-              parts.push({
-                kind: "text",
-                text: truncateText(text, MAX_TEXT_CHARS),
-              });
-            }
-          } else if (type === "image") {
-            parts.push({
-              kind: "text",
-              text: "[image]",
-            });
-          } else if (
-            type === "toolCall" ||
-            type === "tool_call" ||
-            type === "tool_use"
-          ) {
-            const id = asString(b.id) ?? asString(b.toolCallId) ?? "";
-            if (id && !toolResultIds.has(id)) {
-              const name =
-                asString(b.name) ??
-                asString(b.toolName) ??
-                asString(b.tool) ??
-                "tool";
-              const args = parseToolArguments(
-                b.arguments ?? b.args ?? b.input,
-              );
-              const summary = formatToolCallSummary(name, args);
-              const ask = askDisplay(name, args, undefined, false);
-              const task = taskActivity.get(id);
-              parts.push({
-                kind: "tool",
-                id,
-                name,
-                summary,
-                ...(ask ? { ask } : {}),
-                ...(task && task.agents.length > 0 ? { task } : {}),
-              });
-            }
-          }
-        }
+      if (typeof block === "string") {
+        if (block)
+          parts.push({
+            kind: "text",
+            text: projectText(block, MAX_TEXT_CHARS, entryId),
+          });
+        continue;
       }
-    } else if (content && typeof content === "object") {
-      const b = content as Record<string, unknown>;
-      const type = asString(b.type);
-      const thinkingText =
-        asString(b.thinking) ??
-        asString(b.thought) ??
-        asString(b.reasoning) ??
-        asString(b.reasoning_content);
+      if (!block || typeof block !== "object") continue;
+      const value = block as Record<string, unknown>;
+      const type = asString(value.type);
+      if (type === "image") {
+        const part = imagePart(value, entryId);
+        if (part) parts.push(part);
+        continue;
+      }
+      if (type === "redactedThinking") continue;
+      const thinking =
+        asString(value.thinking) ??
+        asString(value.thought) ??
+        asString(value.reasoning) ??
+        asString(value.reasoning_content);
       if (
         type === "thinking" ||
         type === "thought" ||
         type === "reasoning" ||
-        thinkingText !== undefined
+        (isAssistant && thinking !== undefined)
       ) {
-        const text = thinkingText ?? asString(b.text) ?? "";
-        if (text) {
+        const text = thinking ?? asString(value.text) ?? "";
+        if (text)
           parts.push({
             kind: "thinking",
-            text: truncateText(text, MAX_THINKING_CHARS),
+            text: projectText(text, MAX_THINKING_CHARS, entryId),
           });
-        }
-      } else if (type === "image") {
+        continue;
+      }
+      if (
+        type === "toolCall" ||
+        type === "tool_call" ||
+        type === "tool_use"
+      ) {
+        const id = asString(value.id) ?? asString(value.toolCallId) ?? "";
+        if (!id || toolResultIds.has(id)) continue;
+        const name =
+          asString(value.name) ??
+          asString(value.toolName) ??
+          asString(value.tool) ??
+          "tool";
+        const args = parseToolArguments(
+          value.arguments ?? value.args ?? value.input,
+        );
+        const ask = askDisplay(name, args, undefined, false);
+        const task = taskActivity.get(id);
+        parts.push({
+          kind: "tool",
+          id,
+          name,
+          summary: formatToolCallSummary(name, args),
+          ...(args ? { details: projectDetails(args, entryId) } : {}),
+          ...(ask ? { ask } : {}),
+          ...(task && task.agents.length > 0
+            ? { task: projectTask(task, entryId) }
+            : {}),
+          ...(full ? { full: true } : {}),
+        });
+        continue;
+      }
+      if (type === "anthropicServerTool") {
+        const name = asString(value.name) ?? "provider tool";
+        parts.push({
+          kind: "custom",
+          title: name,
+          text: "Provider-executed tool",
+        });
+        continue;
+      }
+      const text = asString(value.text) ?? asString(value.content);
+      if (text) {
         parts.push({
           kind: "text",
-          text: "[image]",
+          text: projectText(text, MAX_TEXT_CHARS, entryId),
         });
-      } else {
-        const text = asString(b.text) ?? asString(b.content);
-        if (text) {
+      }
+    }
+    return parts;
+  }
+
+  function usageText(value: Record<string, unknown>): string | undefined {
+    const tokens =
+      value.usage && typeof value.usage === "object"
+        ? (value.usage as Record<string, unknown>)
+        : value;
+    const labels: string[] = [];
+    const provider =
+      asString(value.upstreamProvider) ?? asString(value.provider);
+    const model = asString(value.upstreamModel) ?? asString(value.model);
+    if (provider || model)
+      labels.push(`served by ${[provider, model].filter(Boolean).join("/")}`);
+    const serviceTier = asString(value.serviceTier);
+    if (serviceTier) labels.push(`tier ${serviceTier}`);
+    const role = asString(value.role);
+    if (role && role !== "default") labels.push(`role ${role}`);
+    const purpose = asString(value.purpose);
+    if (purpose) labels.push(purpose);
+    for (const [key, label] of [
+      ["input", "in"],
+      ["output", "out"],
+      ["cacheRead", "cache read"],
+      ["cacheWrite", "cache write"],
+    ] as const) {
+      const count = tokens[key];
+      if (typeof count === "number" && Number.isFinite(count))
+        labels.push(`${label} ${count.toLocaleString()}`);
+    }
+    const costValue = tokens.cost;
+    const cost =
+      costValue && typeof costValue === "object"
+        ? (costValue as Record<string, unknown>).total
+        : undefined;
+    if (typeof cost === "number" && Number.isFinite(cost))
+      labels.push(`$${cost.toFixed(4)}`);
+    return labels.length > 0 ? labels.join(" · ") : undefined;
+  }
+
+  function project(entry: (typeof selected)[number]): MobileMessage | undefined {
+    const { item, index, entryId, timestamp } = entry;
+    const type = asString(item.type);
+    const parts: MobilePart[] = [];
+    let role = "notice";
+    if (type === "message") {
+      const raw = item.message as Record<string, unknown>;
+      const rawRole = asString(raw.role) ?? "assistant";
+      role = rawRole;
+      if (
+        rawRole === "toolResult" ||
+        raw.toolCallId !== undefined
+      ) {
+        const toolCallId = asString(raw.toolCallId) ?? asString(raw.id) ?? "";
+        const known = toolCallId ? toolCalls.get(toolCallId) : undefined;
+        const name =
+          asString(raw.toolName) ?? asString(raw.name) ?? known?.name ?? "tool";
+        const args =
+          known?.arguments ??
+          parseToolArguments(raw.arguments ?? raw.args ?? raw.input);
+        const detail =
+          raw.details && typeof raw.details === "object"
+            ? (raw.details as Record<string, unknown>)
+            : undefined;
+        const displayDetails =
+          raw.details !== undefined && args !== undefined
+            ? { arguments: args, result: raw.details }
+            : raw.details ?? args;
+        const ask = askDisplay(name, args, raw.details, true);
+        const rawOutput = extractContentText(
+          raw.content ?? raw.output ?? raw.result ?? raw.error,
+        );
+        const output =
+          rawOutput === undefined
+            ? undefined
+            : projectText(rawOutput, MAX_TOOL_OUTPUT_CHARS, entryId);
+        const task =
+          taskActivity.get(toolCallId) ??
+          taskActivityFromDetails(raw.details);
+        const isError =
+          raw.isError === true ||
+          (raw.error !== undefined &&
+            raw.error !== null &&
+            raw.error !== false) ||
+          detail?.error === true;
+        const images = Array.isArray(raw.content)
+          ? raw.content.flatMap((block, blockIndex): MobileImage[] => {
+              if (!full && blockIndex >= MAX_PARTS_PER_MESSAGE) {
+                omittedEntries.add(entryId);
+                return [];
+              }
+              if (!block || typeof block !== "object") return [];
+              const part = imagePart(block, entryId);
+              return part?.kind === "image" ? [part.image] : [];
+            })
+          : [];
+        parts.push({
+          kind: "tool",
+          id: toolCallId,
+          name,
+          summary: formatToolCallSummary(name, args),
+          ...(output !== undefined ? { output } : {}),
+          ...(ask ? { ask } : {}),
+          ...(isError ? { isError: true } : {}),
+          ...(task && task.agents.length > 0
+            ? { task: projectTask(task, entryId) }
+            : {}),
+          ...(images.length > 0 ? { images } : {}),
+          ...(displayDetails !== undefined
+            ? { details: projectDetails(displayDetails, entryId) }
+            : {}),
+          ...(full ? { full: true } : {}),
+        });
+        return projectMessage(role, entryId, timestamp, parts);
+      }
+      if (rawRole === "bashExecution" || rawRole === "pythonExecution") {
+        const language = rawRole === "bashExecution" ? "bash" : "python";
+        const images = Array.isArray(raw.images)
+          ? raw.images.flatMap((image, imageIndex): MobileImage[] => {
+              if (!full && imageIndex >= MAX_PARTS_PER_MESSAGE) {
+                omittedEntries.add(entryId);
+                return [];
+              }
+              const part = imagePart(image, entryId);
+              return part?.kind === "image" ? [part.image] : [];
+            })
+          : [];
+        parts.push({
+          kind: "execution",
+          language,
+          code: projectText(
+            (language === "bash"
+              ? asString(raw.command)
+              : asString(raw.code)) ?? "",
+            MAX_TEXT_CHARS,
+            entryId,
+          ),
+          output: projectText(
+            asString(raw.output) ?? "",
+            MAX_TOOL_OUTPUT_CHARS,
+            entryId,
+          ),
+          ...(typeof raw.exitCode === "number"
+            ? { exitCode: raw.exitCode }
+            : {}),
+          ...(raw.cancelled === true ? { cancelled: true } : {}),
+          ...(raw.truncated === true ? { truncated: true } : {}),
+          ...(images.length > 0 ? { images } : {}),
+          ...(raw.meta !== undefined
+            ? { details: projectDetails(raw.meta, entryId) }
+            : {}),
+        });
+        return projectMessage(role, entryId, timestamp, parts);
+      }
+      if (rawRole === "fileMention") {
+        const rawFiles = Array.isArray(raw.files) ? raw.files : [];
+        if (!full && rawFiles.length > MAX_PARTS_PER_MESSAGE)
+          omittedEntries.add(entryId);
+        const files = rawFiles
+          .slice(0, full ? rawFiles.length : MAX_PARTS_PER_MESSAGE)
+          .flatMap((file): Array<{ path: string; text?: string }> => {
+            if (!file || typeof file !== "object") return [];
+            const row = file as Record<string, unknown>;
+            const path = asString(row.path);
+            if (!path) return [];
+            const text =
+              asString(row.content) ??
+              (row.skippedReason === "tooLarge"
+                ? "[File content omitted: too large]"
+                : row.skippedReason === "binary"
+                  ? "[File content omitted: binary]"
+                  : undefined);
+            return [
+              {
+                path: projectText(path, 2048, entryId),
+                ...(text
+                  ? { text: projectText(text, MAX_TOOL_OUTPUT_CHARS, entryId) }
+                  : {}),
+              },
+            ];
+          });
+        if (files.length > 0) parts.push({ kind: "files", files });
+        for (const file of rawFiles.slice(
+          0,
+          full ? rawFiles.length : MAX_PARTS_PER_MESSAGE,
+        )) {
+          if (!file || typeof file !== "object") continue;
+          const row = file as Record<string, unknown>;
+          if (row.image) {
+            const part = imagePart(row.image, entryId);
+            if (part) parts.push(part);
+          }
+        }
+        return parts.length > 0
+          ? projectMessage(role, entryId, timestamp, parts)
+          : undefined;
+      }
+      if (rawRole === "custom" || rawRole === "hookMessage") {
+        const content = raw.content;
+        const text =
+          typeof content === "string"
+            ? content
+            : extractContentText(content) ?? "";
+        const customType = asString(raw.customType) ?? "Custom message";
+        parts.push({
+          kind: "custom",
+          title: projectLabel(customType, 200, entryId),
+          text: projectText(text, MAX_TEXT_CHARS, entryId),
+          ...(raw.details !== undefined
+            ? { details: projectDetails(raw.details, entryId) }
+            : {}),
+        });
+        parts.push(...contentParts(content, entryId, false).filter((part) => part.kind === "image"));
+        return projectMessage(role, entryId, timestamp, parts);
+      }
+      parts.push(...contentParts(raw.content, entryId, rawRole === "assistant"));
+      if (Array.isArray(raw.tool_calls)) {
+        const knownParts = new Set(
+          parts.flatMap((part) => (part.kind === "tool" ? [part.id] : [])),
+        );
+        for (const call of raw.tool_calls) {
+          if (!call || typeof call !== "object") continue;
+          const value = call as Record<string, unknown>;
+          const id = asString(value.id);
+          if (!id || knownParts.has(id) || toolResultIds.has(id)) continue;
+          const fn =
+            value.function && typeof value.function === "object"
+              ? (value.function as Record<string, unknown>)
+              : undefined;
+          const name = asString(fn?.name) ?? asString(value.name) ?? "tool";
+          const args = parseToolArguments(
+            fn?.arguments ?? value.arguments ?? value.args ?? value.input,
+          );
+          const ask = askDisplay(name, args, undefined, false);
+          const task = taskActivity.get(id);
           parts.push({
-            kind: "text",
-            text: truncateText(text, MAX_TEXT_CHARS),
+            kind: "tool",
+            id,
+            name,
+            summary: formatToolCallSummary(name, args),
+            ...(args ? { details: projectDetails(args, entryId) } : {}),
+            ...(ask ? { ask } : {}),
+            ...(task && task.agents.length > 0
+              ? { task: projectTask(task, entryId) }
+              : {}),
+            ...(full ? { full: true } : {}),
+          });
+          knownParts.add(id);
+        }
+      }
+      if (rawRole === "assistant") {
+        const stopReason = asString(raw.stopReason);
+        const errorMessage = asString(raw.errorMessage);
+        const errorId =
+          typeof raw.errorId === "number" && Number.isFinite(raw.errorId)
+            ? raw.errorId
+            : 0;
+        const silentAbort =
+          (errorId & 0x02000000) !== 0 ||
+          errorMessage === "__omp.silent_abort__";
+        const userInterrupt =
+          (errorId & 0x04000000) !== 0 ||
+          errorMessage === "Interrupted by user";
+        if (stopReason === "error") {
+          const status =
+            typeof raw.errorStatus === "number"
+              ? ` (HTTP ${raw.errorStatus})`
+              : "";
+          parts.push({
+            kind: "notice",
+            tone: "error",
+            title: "Provider error",
+            body: projectText(
+              `${errorMessage ?? "The provider request failed."}${status}`,
+              1200,
+              entryId,
+            ),
+          });
+        } else if (
+          stopReason === "aborted" &&
+          !silentAbort &&
+          !userInterrupt
+        ) {
+          parts.push({
+            kind: "notice",
+            tone: "warning",
+            title: "Operation aborted",
+            ...(errorMessage && errorMessage !== "Request was aborted"
+              ? { body: projectText(errorMessage, 1200, entryId) }
+              : {}),
+          });
+        }
+        const served = usageText(raw);
+        if (served)
+          parts.push({
+            kind: "usage",
+            text: projectText(served, MAX_TEXT_CHARS, entryId),
+          });
+        if (Array.isArray(raw.reactions)) {
+          for (const reaction of raw.reactions) {
+            if (typeof reaction === "string" && reaction.trim())
+              parts.push({
+                kind: "notice",
+                tone: "info",
+                title: "Reaction",
+                body: projectText(reaction, 1200, entryId),
+              });
+          }
+        } else if (typeof raw.reaction === "string" && raw.reaction.trim()) {
+          parts.push({
+            kind: "notice",
+            tone: "info",
+            title: "Reaction",
+            body: projectText(raw.reaction, 1200, entryId),
           });
         }
       }
+      if (parts.length === 0) return undefined;
+      return projectMessage(role, entryId, timestamp, parts);
     }
 
-    if (parts.length === 0) continue;
-
-    messages.push({
-      role,
-      entryId,
-      timestamp,
-      parts: parts.slice(0, MAX_PARTS_PER_MESSAGE),
-    });
+    if (type === "custom_message") {
+      role = "custom";
+      const content = item.content;
+      const text =
+        typeof content === "string"
+          ? content
+          : extractContentText(content) ?? "";
+      parts.push({
+        kind: "custom",
+        title: projectLabel(
+          asString(item.customType) ?? "Custom message",
+          200,
+          entryId,
+        ),
+        text: projectText(text, MAX_TEXT_CHARS, entryId),
+        ...(item.details !== undefined
+          ? { details: projectDetails(item.details, entryId) }
+          : {}),
+      });
+      parts.push(...contentParts(content, entryId, false).filter((part) => part.kind === "image"));
+    } else if (type === "compaction" || type === "branch_summary") {
+      role = "summary";
+      const title =
+        type === "compaction" ? "Context compacted" : "Branch summary";
+      const text =
+        asString(item.shortSummary) ??
+        asString(item.summary) ??
+        "Summary unavailable.";
+      parts.push({
+        kind: "summary",
+        title,
+        text: projectText(text, MAX_TEXT_CHARS, entryId),
+        ...(typeof item.tokensBefore === "number"
+          ? { tokensBefore: item.tokensBefore }
+          : {}),
+      });
+    } else if (type === "model_usage") {
+      const usage = usageText(item);
+      parts.push({
+        kind: "usage",
+        text: usage
+          ? projectText(usage, MAX_TEXT_CHARS, entryId)
+          : "Usage marker with no token details",
+      });
+      const errorMessage = asString(item.errorMessage);
+      if (item.stopReason === "error") {
+        parts.push({
+          kind: "notice",
+          tone: "error",
+          title: "Provider error",
+          body: projectText(
+            errorMessage ?? "The provider request failed.",
+            1200,
+            entryId,
+          ),
+        });
+      } else if (
+        item.stopReason === "aborted" &&
+        errorMessage !== "Interrupted by user" &&
+        errorMessage !== "__omp.silent_abort__"
+      ) {
+        parts.push({
+          kind: "notice",
+          tone: "warning",
+          title: "Operation aborted",
+          ...(errorMessage && errorMessage !== "Request was aborted"
+            ? { body: projectText(errorMessage, 1200, entryId) }
+            : {}),
+        });
+      }
+    } else {
+      const notice = (
+        title: string,
+        body?: string,
+        tone: "info" | "warning" | "error" | "success" = "info",
+      ): void => {
+        parts.push({
+          kind: "notice",
+          tone,
+          title: projectLabel(title, 200, entryId),
+          ...(body ? { body: projectText(body, 1200, entryId) } : {}),
+        });
+      };
+      switch (type) {
+        case "reset_boundary":
+          notice("Conversation reset");
+          break;
+        case "model_change": {
+          const model = asString(item.model);
+          const roleName = asString(item.role);
+          const fallback = item.resolvedModelIsFallback === true;
+          notice(
+            fallback ? "Fallback model selected" : "Model changed",
+            [model, roleName && roleName !== "default" ? `role ${roleName}` : ""]
+              .filter(Boolean)
+              .join(" · "),
+          );
+          break;
+        }
+        case "service_tier_change":
+          notice(
+            "Service tier changed",
+            item.serviceTier === null
+              ? "Default service tier"
+              : asString(item.serviceTier),
+          );
+          break;
+        case "thinking_level_change":
+          notice(
+            "Thinking level changed",
+            asString(item.thinkingLevel) ?? "Default",
+          );
+          break;
+        case "mode_change":
+          notice("Mode changed", asString(item.mode));
+          break;
+        case "ttsr_injection": {
+          const names = Array.isArray(item.injectedRules)
+            ? item.injectedRules.filter(
+                (name): name is string => typeof name === "string",
+              )
+            : [];
+          notice(
+            "Time-traveling rules injected",
+            names.length > 0 ? names.join(", ") : undefined,
+          );
+          break;
+        }
+        case "title_change":
+          notice("Session title changed", asString(item.title));
+          break;
+        case "label":
+          notice("Session bookmark", asString(item.label) ?? "Bookmark removed");
+          break;
+        case "credential_pin":
+          notice(
+            "Provider account pinned",
+            asString(item.provider),
+          );
+          break;
+      }
+    }
+    if (parts.length === 0) return undefined;
+    return projectMessage(role, entryId, timestamp, parts);
   }
 
-  return messages.slice(-MAX_MESSAGES);
+  const messages = selected.flatMap((entry): MobileMessage[] => {
+    const message = project(entry);
+    return message
+      ? [{ ...message, ...(full ? { full: true } : {}) }]
+      : [];
+  });
+  return {
+    messages,
+    history: {
+      total,
+      shown: messages.length,
+      hasMore: start > 0,
+    },
+    ...(options.entryId !== undefined || options.beforeId !== undefined
+      ? { found }
+      : {}),
+  };
 }
 
 async function readBody(request: Request): Promise<string> {
@@ -1548,6 +2275,7 @@ export default function registerMobileRemote(pi: ExtensionAPI): void {
     );
     return;
   }
+  const interactionBridge = createInteractionBridge(pi);
 
   const stateDir =
     process.env.OMP_MOBILE_STATE_DIR ??
@@ -1572,7 +2300,7 @@ export default function registerMobileRemote(pi: ExtensionAPI): void {
   let actionTail: Promise<unknown> = Promise.resolve();
   let agentActive = false;
   let turnNumber = 0;
-  let streamingMessage: { role: string } | undefined;
+  let streamingMessage: unknown;
   let streamingSequence = 0;
   let completion: CompletionMarker | undefined;
   let pendingMessageSequence = 0;
@@ -1588,6 +2316,118 @@ export default function registerMobileRemote(pi: ExtensionAPI): void {
   let workingSince: number | undefined;
   const runningTools = new Map<string, string>();
   const liveTaskDetails = new Map<string, unknown>();
+  type MessageTransfer = {
+    generation: string;
+    entryId: string;
+    encoded: string;
+    byteLength: number;
+    expiresAt: number;
+  };
+  const messageTransfers = new Map<string, MessageTransfer>();
+  let messageTransferCacheBytes = 0;
+
+  function clearMessageTransfers(): void {
+    messageTransfers.clear();
+    messageTransferCacheBytes = 0;
+  }
+
+  function pruneMessageTransfers(now: number): void {
+    for (const [id, transfer] of messageTransfers) {
+      if (transfer.expiresAt > now) continue;
+      messageTransfers.delete(id);
+      messageTransferCacheBytes -= transfer.byteLength;
+    }
+  }
+
+  function storeMessageTransfer(
+    entryId: string,
+    encoded: string,
+    byteLength: number,
+  ): string | undefined {
+    if (byteLength > MAX_MESSAGE_TRANSFER_CACHE_BYTES) return undefined;
+    const now = Date.now();
+    pruneMessageTransfers(now);
+    while (
+      messageTransfers.size >= MAX_MESSAGE_TRANSFER_CACHE_ENTRIES ||
+      messageTransferCacheBytes + byteLength > MAX_MESSAGE_TRANSFER_CACHE_BYTES
+    ) {
+      const oldest = messageTransfers.entries().next().value;
+      if (!oldest) break;
+      messageTransfers.delete(oldest[0]);
+      messageTransferCacheBytes -= oldest[1].byteLength;
+    }
+    const transferId = crypto.randomUUID();
+    messageTransfers.set(transferId, {
+      generation,
+      entryId,
+      encoded,
+      byteLength,
+      expiresAt: now + MESSAGE_TRANSFER_TTL_MS,
+    });
+    messageTransferCacheBytes += byteLength;
+    return transferId;
+  }
+
+  function getMessageTransfer(
+    transferId: string,
+    entryId: string,
+  ): MessageTransfer | undefined {
+    const now = Date.now();
+    pruneMessageTransfers(now);
+    const transfer = messageTransfers.get(transferId);
+    if (
+      !transfer ||
+      transfer.generation !== generation ||
+      transfer.entryId !== entryId
+    )
+      return undefined;
+    messageTransfers.delete(transferId);
+    messageTransfers.set(transferId, transfer);
+    return transfer;
+  }
+  let runtimeNoticeSequence = 0;
+  let runtimeNotices: MobileNotice[] = [];
+  let runtimeStatus: MobileRuntime["status"];
+  let runtimeGoal: MobileRuntime["goal"];
+  let queueAvailabilityNoticed = false;
+
+  function addRuntimeNotice(
+    tone: MobileNotice["tone"],
+    title: string,
+    body?: string,
+  ): void {
+    runtimeNotices.push({
+      id: `${generation}:notice:${++runtimeNoticeSequence}`,
+      tone,
+      title: truncateText(title, 200),
+      ...(body ? { body: truncateText(body, 1200) } : {}),
+      timestamp: Date.now(),
+    });
+    if (runtimeNotices.length > 24) runtimeNotices = runtimeNotices.slice(-24);
+  }
+
+  function resetRuntimeState(): void {
+    runtimeNoticeSequence = 0;
+    runtimeNotices = [];
+    runtimeStatus = undefined;
+    runtimeGoal = undefined;
+    queueAvailabilityNoticed = false;
+  }
+
+  function runtimeSnapshot(now = Date.now()): MobileRuntime {
+    if (
+      runtimeStatus &&
+      !runtimeStatus.active &&
+      runtimeStatus.until !== undefined &&
+      runtimeStatus.until <= now
+    )
+      runtimeStatus = undefined;
+    return {
+      notices: runtimeNotices,
+      ...(runtimeStatus ? { status: runtimeStatus } : {}),
+      ...(runtimeGoal ? { goal: runtimeGoal } : {}),
+    };
+  }
 
   function resetWorkingState(): void {
     workingIntent = undefined;
@@ -1693,15 +2533,16 @@ export default function registerMobileRemote(pi: ExtensionAPI): void {
   function observeSession(ctx: ExtensionContext): void {
     const signature = `${ctx.sessionManager.getSessionId()}\n${ctx.sessionManager.getSessionFile() ?? ""}`;
     if (sessionSignature === signature) return;
-    const isInitial = sessionSignature === undefined;
     sessionSignature = signature;
     generationSequence += 1;
     generation = `${instanceId}:${ctx.sessionManager.getSessionId()}:${generationSequence}`;
-    if (!isInitial) {
-      pendingApprovals = new Set();
-      resetCompletion();
-      pendingMobileMessages = [];
-    }
+    pendingApprovals = new Set();
+    resetCompletion();
+    pendingMobileMessages = [];
+    resetRuntimeState();
+    interactionBridge.reset();
+    clearMessageTransfers();
+    interactionBridge.observe(ctx);
   }
 
   function observeAgentStart(ctx: ExtensionContext): void {
@@ -1780,7 +2621,7 @@ export default function registerMobileRemote(pi: ExtensionAPI): void {
       terminal: true,
       approval: false,
       summary: latestSummary(ctx.sessionManager.getBranch()) !== undefined,
-      events: false,
+      events: true,
       moveReason: canStageCommand ? undefined : editor.reason,
       approvalReason:
         "Approval dialogs remain owned by the terminal session; no remote approval action is exposed.",
@@ -2017,6 +2858,22 @@ export default function registerMobileRemote(pi: ExtensionAPI): void {
     const hasPendingMessages = ctx.hasPendingMessages();
     const now = Date.now();
     const activitySnapshot = buildActivity(ctx, branch, now);
+    interactionBridge.observe(ctx);
+    const interaction = interactionBridge.snapshot(ctx);
+    const transcriptSnapshot = transcript(
+      streamingMessage
+        ? [
+            ...branch,
+            {
+              type: "message",
+              id: `stream-${generation}-${streamingSequence}`,
+              message: streamingMessage,
+            },
+          ]
+        : branch,
+      activitySnapshot.tasks,
+      { limit: MAX_MESSAGES },
+    );
     pendingMobileMessages = pendingMobileMessages.filter(
       (message) => hasPendingMessages || now - message.submittedAt < 5000,
     );
@@ -2026,6 +2883,17 @@ export default function registerMobileRemote(pi: ExtensionAPI): void {
         text: truncateText(message.text, MAX_TEXT_CHARS),
         status: hasPendingMessages ? "queued" : "sending",
       }));
+    if (!hasPendingMessages) queueAvailabilityNoticed = false;
+    else if (!queueAvailabilityNoticed) {
+      addRuntimeNotice(
+        "info",
+        "Queue text unavailable",
+        "This OMP extension API reports whether messages are queued but does not expose their text. Mobile-submitted prompts are listed separately; use the live terminal to inspect other queued messages.",
+      );
+      queueAvailabilityNoticed = true;
+    }
+    const runtime = runtimeSnapshot(now);
+    if (interaction) runtime.interaction = interaction;
     const state: MobileState = {
       apiVersion: 1,
       generation,
@@ -2047,19 +2915,9 @@ export default function registerMobileRemote(pi: ExtensionAPI): void {
       cost: branchCost(branch),
       theme: themeSnapshot(ctx),
       commands: commandsForSnapshot(),
-      messages: transcript(
-        streamingMessage
-          ? [
-              ...branch,
-              {
-                type: "message",
-                id: `stream-${generation}-${streamingSequence}`,
-                message: streamingMessage,
-              },
-            ]
-          : branch,
-        activitySnapshot.tasks,
-      ),
+      messages: transcriptSnapshot.messages,
+      history: transcriptSnapshot.history,
+      runtime,
       capabilities: capabilities(ctx),
       cwd: ctx.sessionManager.getCwd(),
       pendingApproval: pendingApprovals.size,
@@ -2086,14 +2944,30 @@ export default function registerMobileRemote(pi: ExtensionAPI): void {
     agentActive: boolean;
     title?: string;
     completion?: CompletionMarker;
+    pendingAction?: {
+      id: string;
+      kind: "approval" | "ask" | "plan" | "dialog";
+      title: string;
+    };
   } {
     observeSession(ctx);
+    interactionBridge.observe(ctx);
+    const interaction = interactionBridge.snapshot(ctx);
     const title = ctx.sessionManager.getSessionName();
     return {
       accent: sessionAccent(ctx),
       agentActive,
       ...(title ? { title: title.slice(0, 200) } : {}),
       ...(completion ? { completion } : {}),
+      ...(interaction
+        ? {
+            pendingAction: {
+              id: interaction.id,
+              kind: interaction.kind,
+              title: interaction.title,
+            },
+          }
+        : {}),
     };
   }
 
@@ -2119,6 +2993,54 @@ export default function registerMobileRemote(pi: ExtensionAPI): void {
       throw Object.assign(new Error("action type is required"), {
         status: 400,
       });
+    interactionBridge.observe(ctx);
+    if (type === "interaction") {
+      const id = asString(action.id);
+      const choice = asString(action.choice);
+      const feedback =
+        action.feedback === undefined ? undefined : asString(action.feedback);
+      const role = action.role === undefined ? undefined : asString(action.role);
+      if (
+        !id ||
+        !choice ||
+        (action.feedback !== undefined && feedback === undefined) ||
+        (action.role !== undefined && role === undefined)
+      )
+        throw Object.assign(new Error("interaction id and choice are required"), {
+          status: 400,
+        });
+      const interactionAction: MobileInteractionAction = {
+        type: "interaction",
+        generation,
+        id,
+        choice,
+        ...(feedback !== undefined ? { feedback } : {}),
+        ...(role !== undefined ? { role } : {}),
+      };
+      if (await interactionBridge.handleAction(ctx, interactionAction))
+        return snapshot(ctx);
+      throw Object.assign(
+        new Error("interaction is no longer available or cannot be resolved remotely"),
+        { status: 409, code: "interaction_unavailable" },
+      );
+    }
+    const pendingInteraction = interactionBridge.snapshot(ctx);
+    if (
+      type !== "abort" &&
+      type !== "force" &&
+      pendingInteraction
+    ) {
+      const owner =
+        pendingInteraction.transport === "terminal"
+          ? "the desktop terminal"
+          : "the OMP dialog";
+      throw Object.assign(
+        new Error(
+          `A ${pendingInteraction.kind} interaction is pending in ${owner}.`,
+        ),
+        { status: 409, code: "pending_dialog" },
+      );
+    }
     if (
       type !== "abort" &&
       type !== "force" &&
@@ -2132,16 +3054,26 @@ export default function registerMobileRemote(pi: ExtensionAPI): void {
     switch (type) {
       case "prompt": {
         const text = asString(action.text);
-        if (!text)
-          throw Object.assign(new Error("prompt text is required"), {
+        const images = normalizePromptImages(action.images);
+        if (!text && images.length === 0)
+          throw Object.assign(new Error("prompt text or image is required"), {
             status: 400,
           });
         pendingMobileMessages.push({
           id: `${generation}:${++pendingMessageSequence}`,
-          text,
+          text: text ?? "[image attachment]",
           submittedAt: Date.now(),
         });
-        pi.sendUserMessage(text);
+        if (pendingMobileMessages.length > MAX_MESSAGES)
+          pendingMobileMessages = pendingMobileMessages.slice(-MAX_MESSAGES);
+        const content =
+          images.length > 0
+            ? [
+                ...(text ? [{ type: "text" as const, text }] : []),
+                ...images,
+              ]
+            : text!;
+        pi.sendUserMessage(content);
         break;
       }
       case "force": {
@@ -2367,7 +3299,148 @@ export default function registerMobileRemote(pi: ExtensionAPI): void {
               return json({ error: "origin rejected" }, 403);
             if (expectedToken && requestToken(request) !== expectedToken)
               return json({ error: "unauthorized" }, 401);
+            observeSession(ctx);
             const url = new URL(request.url);
+            if (request.method === "GET" && url.pathname === "/history") {
+              const rawLimit = url.searchParams.get("limit");
+              const beforeId = url.searchParams.get("before") ?? undefined;
+              if (
+                (rawLimit !== null && !/^[1-9]\d*$/.test(rawLimit)) ||
+                (beforeId !== undefined &&
+                  (beforeId.length === 0 ||
+                    Buffer.byteLength(beforeId, "utf8") > MAX_STRING_BYTES))
+              )
+                return json({ error: "invalid history query" }, 400);
+              const limit =
+                rawLimit === null ? MAX_MESSAGES : Number(rawLimit);
+              if (!Number.isSafeInteger(limit) || limit > MAX_MESSAGES)
+                return json(
+                  { error: `history limit must be between 1 and ${MAX_MESSAGES}` },
+                  400,
+                );
+              const branch = ctx.sessionManager.getBranch();
+              const tasks = buildActivity(ctx, branch, Date.now()).tasks;
+              const page = transcript(branch, tasks, {
+                ...(beforeId ? { beforeId } : {}),
+                limit,
+              });
+              if (beforeId && page.found === false)
+                return json({ error: "history cursor was not found" }, 404);
+              return json({
+                generation,
+                messages: page.messages,
+                history: page.history,
+              });
+            }
+            if (request.method === "GET" && url.pathname === "/message") {
+              const entryId = url.searchParams.get("id");
+              const rawOffset = url.searchParams.get("offset");
+              const transferId = url.searchParams.get("transferId");
+              const offset = rawOffset === null ? undefined : Number(rawOffset);
+              if (
+                !entryId ||
+                Buffer.byteLength(entryId, "utf8") > MAX_STRING_BYTES ||
+                (rawOffset !== null && !/^(0|[1-9]\d*)$/.test(rawOffset)) ||
+                (offset !== undefined && !Number.isSafeInteger(offset)) ||
+                (transferId !== null &&
+                  !/^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/.test(
+                    transferId,
+                  )) ||
+                (transferId !== null && (offset === undefined || offset === 0)) ||
+                (offset !== undefined && offset > 0 && transferId === null)
+              )
+                return json({ error: "message id, offset, or transfer id is invalid" }, 400);
+
+              const chunkSize = 256 * 1024;
+              const chunkResponse = (
+                id: string,
+                encoded: string,
+                chunkOffset: number,
+              ): Response => {
+                if (chunkOffset > encoded.length)
+                  return json({ error: "message chunk offset is out of range" }, 416);
+                if (
+                  chunkOffset > 0 &&
+                  chunkOffset < encoded.length &&
+                  encoded.charCodeAt(chunkOffset - 1) >= 0xd800 &&
+                  encoded.charCodeAt(chunkOffset - 1) <= 0xdbff &&
+                  encoded.charCodeAt(chunkOffset) >= 0xdc00 &&
+                  encoded.charCodeAt(chunkOffset) <= 0xdfff
+                )
+                  return json({ error: "message chunk offset splits a character" }, 400);
+                let end = Math.min(encoded.length, chunkOffset + chunkSize);
+                if (
+                  end < encoded.length &&
+                  encoded.charCodeAt(end - 1) >= 0xd800 &&
+                  encoded.charCodeAt(end - 1) <= 0xdbff
+                )
+                  end -= 1;
+                return json({
+                  generation,
+                  transferId: id,
+                  chunk: encoded.slice(chunkOffset, end),
+                  nextOffset: end < encoded.length ? end : null,
+                  total: encoded.length,
+                });
+              };
+
+              if (offset !== undefined && offset > 0) {
+                if (transferId === null)
+                  return json({ error: "transfer id is required for this offset" }, 400);
+                const transfer = getMessageTransfer(transferId, entryId);
+                if (!transfer)
+                  return json(
+                    {
+                      error:
+                        "full message transfer expired or does not match this session entry; restart from offset 0",
+                    },
+                    409,
+                  );
+                return chunkResponse(transferId, transfer.encoded, offset);
+              }
+
+              const branch = ctx.sessionManager.getBranch();
+              const messageEntries =
+                streamingMessage === undefined
+                  ? branch
+                  : [
+                      ...branch,
+                      {
+                        type: "message",
+                        id: `stream-${generation}-${streamingSequence}`,
+                        message: streamingMessage,
+                      },
+                    ];
+              const tasks = buildActivity(ctx, branch, Date.now()).tasks;
+              const result = transcript(messageEntries, tasks, {
+                entryId,
+                full: true,
+                imageBudget: 0,
+              });
+              const message = result.messages[0];
+              if (!result.found || !message)
+                return json({ error: "message not found" }, 404);
+              const encoded = JSON.stringify(message);
+              const byteLength = Buffer.byteLength(encoded, "utf8");
+              if (byteLength > MAX_MESSAGE_TRANSFER_CACHE_BYTES)
+                return json(
+                  {
+                    error:
+                      "full message exceeds the 32 MiB transfer limit; retrieve a smaller session entry",
+                  },
+                  413,
+                );
+              if (offset === undefined && encoded.length <= chunkSize)
+                return json({ generation, message });
+              const newTransferId = storeMessageTransfer(
+                entryId,
+                encoded,
+                byteLength,
+              );
+              if (!newTransferId)
+                return json({ error: "message transfer cache is unavailable" }, 503);
+              return chunkResponse(newTransferId, encoded, 0);
+            }
             if (request.method === "GET" && url.pathname === "/state")
               return json(snapshot(ctx));
             if (request.method === "GET" && url.pathname === "/status")
@@ -2510,6 +3583,132 @@ export default function registerMobileRemote(pi: ExtensionAPI): void {
   pi.on("agent_end", (event, ctx) => {
     if ("isTerminal" in event && event.isTerminal === false) return;
     observeAgentEnd(ctx);
+  });
+  pi.on("auto_retry_start", (event, ctx) => {
+    observeSession(ctx);
+    const detail = `Attempt ${event.attempt} of ${event.maxAttempts}: ${event.errorMessage}`;
+    runtimeStatus = {
+      kind: "retry",
+      label: "Retrying request",
+      detail: truncateText(detail, 800),
+      active: true,
+    };
+    addRuntimeNotice("warning", "Provider request retrying", detail);
+  });
+  pi.on("auto_retry_end", (event, ctx) => {
+    observeSession(ctx);
+    const detail =
+      event.finalError ??
+      (event.success ? "A later attempt succeeded." : "Retry attempts ended.");
+    runtimeStatus = {
+      kind: "retry",
+      label: event.success ? "Retry succeeded" : "Retry failed",
+      detail: truncateText(detail, 800),
+      until: Date.now() + 20_000,
+      active: false,
+    };
+    if (!event.success)
+      addRuntimeNotice("error", "Provider retry failed", detail);
+  });
+  pi.on("retry_fallback_applied", (event, ctx) => {
+    observeSession(ctx);
+    const detail = `${event.from} → ${event.to} (${event.role})`;
+    runtimeStatus = {
+      kind: "fallback",
+      label: "Using fallback model",
+      detail: truncateText(detail, 800),
+      until: Date.now() + 30_000,
+      active: false,
+    };
+    addRuntimeNotice("warning", "Fallback model selected", detail);
+  });
+  pi.on("retry_fallback_succeeded", (event, ctx) => {
+    observeSession(ctx);
+    const detail = `${event.model} (${event.role})`;
+    runtimeStatus = {
+      kind: "fallback",
+      label: "Fallback request succeeded",
+      detail: truncateText(detail, 800),
+      until: Date.now() + 20_000,
+      active: false,
+    };
+    addRuntimeNotice("success", "Fallback request succeeded", detail);
+  });
+  pi.on("auto_compaction_start", (event, ctx) => {
+    observeSession(ctx);
+    const detail = `${event.reason} · ${event.action}`;
+    runtimeStatus = {
+      kind: "compaction",
+      label: "Compacting context",
+      detail,
+      active: true,
+    };
+    addRuntimeNotice("info", "Context compaction started", detail);
+  });
+  pi.on("auto_compaction_end", (event, ctx) => {
+    observeSession(ctx);
+    const detail =
+      event.errorMessage ??
+      (event.aborted
+        ? "Compaction was aborted."
+        : event.skipped
+          ? "Compaction was not needed."
+          : event.result
+            ? "Context compaction completed."
+            : "Context compaction ended.");
+    runtimeStatus = {
+      kind: "compaction",
+      label: event.errorMessage
+        ? "Compaction failed"
+        : event.aborted
+          ? "Compaction aborted"
+          : "Context compacted",
+      detail: truncateText(detail, 800),
+      until: Date.now() + 20_000,
+      active: false,
+    };
+    if (event.errorMessage)
+      addRuntimeNotice("error", "Context compaction failed", detail);
+  });
+  pi.on("ttsr_triggered", (event, ctx) => {
+    observeSession(ctx);
+    addRuntimeNotice(
+      "info",
+      "Time-traveling rules triggered",
+      `${event.rules.length} rule${event.rules.length === 1 ? "" : "s"} matched.`,
+    );
+  });
+  pi.on("todo_reminder", (event, ctx) => {
+    observeSession(ctx);
+    const todos = event.todos
+      .map((todo) => todo.content)
+      .filter((content) => content.trim().length > 0);
+    addRuntimeNotice(
+      "warning",
+      `Unfinished todo reminder (${event.attempt}/${event.maxAttempts})`,
+      todos.join("\n"),
+    );
+  });
+  pi.on("goal_updated", (event, ctx) => {
+    observeSession(ctx);
+    if (!event.goal) {
+      runtimeGoal = undefined;
+      addRuntimeNotice("info", "Goal cleared");
+      return;
+    }
+    const goal = event.goal;
+    const details = [
+      goal.status,
+      `${goal.tokensUsed.toLocaleString()} tokens used`,
+      goal.tokenBudget !== undefined
+        ? `${Math.max(0, goal.tokenBudget - goal.tokensUsed).toLocaleString()} remaining`
+        : "",
+    ].filter(Boolean);
+    runtimeGoal = {
+      text: truncateText(goal.objective, 800),
+      detail: details.join(" · "),
+    };
+    addRuntimeNotice("info", "Goal updated", goal.objective);
   });
   pi.on("turn_start", (_event, ctx) => observeSession(ctx));
   pi.on("turn_end", (_event, ctx) => observeSession(ctx));

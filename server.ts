@@ -32,6 +32,12 @@ import {
   type SlotSummary,
   type TerminalSnapshot,
 } from "./shared";
+import type {
+  MobileHistory,
+  MobileImage,
+  MobileNotice,
+  MobileRuntime,
+} from "./parity-types";
 import {
   createNotificationService,
   type NotificationService,
@@ -55,7 +61,8 @@ const SESSIONS_ROOT = resolve(
   process.env.OMP_DESKTOP_SESSIONS_DIR ?? join(HOME, ".omp/agent/sessions"),
 );
 const MAX_BODY = 128 * 1024;
-const MAX_IPC = 4 * 1024 * 1024;
+const MAX_PROMPT_BODY = 4 * 1024 * 1024;
+const MAX_IPC = 32 * 1024 * 1024;
 const MAX_METADATA = 64 * 1024;
 const MAX_ENTRIES = 250;
 const MAX_DESKTOP_BODY = 8 * 1024 * 1024;
@@ -187,9 +194,12 @@ function hiddenPath(candidate: string): boolean {
     );
 }
 
-function readBody(request: Request): Promise<string> {
+function readBody(
+  request: Request,
+  maxBytes = MAX_BODY,
+): Promise<string> {
   return request.arrayBuffer().then((buffer) => {
-    if (buffer.byteLength > MAX_BODY) throw new Error("request body too large");
+    if (buffer.byteLength > maxBytes) throw new Error("request body too large");
     return new TextDecoder().decode(buffer);
   });
 }
@@ -934,7 +944,11 @@ async function terminalAction(id: string, request: Request): Promise<Response> {
     body.type !== "write" ||
     body.confirmed !== true ||
     typeof body.text !== "string" ||
-    body.text.length > TERMINAL_WRITE_LIMIT
+    body.text.length > TERMINAL_WRITE_LIMIT ||
+    (body.interactionId !== undefined &&
+      (typeof body.interactionId !== "string" ||
+        body.interactionId.length === 0 ||
+        body.interactionId.length > 512))
   )
     return errorResponse(
       400,
@@ -946,6 +960,15 @@ async function terminalAction(id: string, request: Request): Promise<Response> {
       capabilities: { reconnect: true },
     });
   if (!info) return errorResponse(404, "unknown runtime");
+  if (!info.alive)
+    return errorResponse(503, "runtime is not running", {
+      capabilities: { reconnect: true },
+    });
+  const stream = await ensureStream(info);
+  if (!stream)
+    return errorResponse(503, "terminal stream unavailable", {
+      capabilities: TERMINAL_UNAVAILABLE,
+    });
   const raw = await readExtensionState(id);
   if (!raw)
     return errorResponse(503, "extension unavailable", {
@@ -958,8 +981,24 @@ async function terminalAction(id: string, request: Request): Promise<Response> {
     return errorResponse(409, "session changed; refresh before writing", {
       generation: raw.generation,
     });
-  if (!(await sendRuntimeInput(id, body.text)))
+  if (body.interactionId !== undefined) {
+    const interaction = normaliseRuntime(raw.runtime)?.interaction;
+    if (interaction?.id !== body.interactionId)
+      return errorResponse(
+        409,
+        "pending interaction changed; reopen the terminal controls before writing",
+      );
+  }
+  if (stream.closed || stream.socket.readyState !== WebSocket.OPEN)
+    return errorResponse(503, "terminal stream unavailable", {
+      capabilities: TERMINAL_UNAVAILABLE,
+    });
+  try {
+    stream.socket.send(JSON.stringify({ type: "input", data: body.text }));
+  } catch {
     return errorResponse(503, "terminal write failed");
+  }
+  touchStream(stream);
   return json({ ok: true, generation: body.generation });
 }
 
@@ -1138,15 +1177,267 @@ function normaliseActivity(value: unknown): SessionActivity | undefined {
   };
 }
 
-function normaliseState(raw: Record<string, unknown>): SlotState | undefined {
+function boundedJsonValue(value: unknown, depth = 0): unknown {
+  if (
+    value === null ||
+    typeof value === "boolean" ||
+    (typeof value === "number" && Number.isFinite(value))
+  )
+    return value;
+  if (typeof value === "string") return value.slice(0, 8000);
+  if (depth >= 6) return undefined;
+  if (Array.isArray(value))
+    return value
+      .slice(0, 40)
+      .map((item) => boundedJsonValue(item, depth + 1))
+      .filter((item) => item !== undefined);
+  if (value && typeof value === "object") {
+    const object = value as Record<string, unknown>;
+    return Object.fromEntries(
+      Object.entries(object)
+        .slice(0, 40)
+        .flatMap(([key, item]) => {
+          if (!key || key.length > 100) return [];
+          const safe = boundedJsonValue(item, depth + 1);
+          return safe === undefined ? [] : [[key, safe]];
+        }),
+    );
+  }
+  return undefined;
+}
+
+function normaliseRuntime(value: unknown): MobileRuntime | undefined {
+  if (!value || typeof value !== "object" || Array.isArray(value))
+    return undefined;
+  const raw = value as Record<string, unknown>;
+  const notices: MobileNotice[] = [];
+  if (Array.isArray(raw.notices)) {
+    for (const entry of raw.notices.slice(-50)) {
+      if (!entry || typeof entry !== "object" || Array.isArray(entry))
+        continue;
+      const notice = entry as Record<string, unknown>;
+      const tone = notice.tone;
+      if (
+        typeof notice.id !== "string" ||
+        notice.id.length === 0 ||
+        notice.id.length > 200 ||
+        (tone !== "info" &&
+          tone !== "warning" &&
+          tone !== "error" &&
+          tone !== "success") ||
+        typeof notice.title !== "string" ||
+        !notice.title.trim() ||
+        notice.title.length > 200 ||
+        finiteNumber(notice.timestamp) === undefined
+      )
+        continue;
+      notices.push({
+        id: notice.id,
+        tone,
+        title: notice.title.trim(),
+        ...(typeof notice.body === "string"
+          ? { body: notice.body.slice(0, 4000) }
+          : {}),
+        timestamp: notice.timestamp as number,
+      });
+    }
+  }
+  const result: MobileRuntime = { notices };
+  const interaction = raw.interaction;
+  if (interaction && typeof interaction === "object" && !Array.isArray(interaction)) {
+    const pending = interaction as Record<string, unknown>;
+    const kind = pending.kind;
+    const transport = pending.transport;
+    if (
+      typeof pending.id === "string" &&
+      pending.id.length > 0 &&
+      pending.id.length <= 512 &&
+      (kind === "approval" ||
+        kind === "ask" ||
+        kind === "plan" ||
+        kind === "dialog") &&
+      typeof pending.title === "string" &&
+      pending.title.trim() &&
+      pending.title.length <= 256 &&
+      (transport === "native" || transport === "terminal") &&
+      finiteNumber(pending.createdAt) !== undefined
+    ) {
+      const options = Array.isArray(pending.options)
+        ? pending.options.slice(0, 32).flatMap((entry) => {
+            if (
+              !entry ||
+              typeof entry !== "object" ||
+              Array.isArray(entry)
+            )
+              return [];
+            const option = entry as Record<string, unknown>;
+            if (
+              typeof option.id !== "string" ||
+              !option.id ||
+              option.id.length > 200 ||
+              typeof option.label !== "string" ||
+              !option.label.trim() ||
+              option.label.length > 200
+            )
+              return [];
+            return [{
+              id: option.id,
+              label: option.label.trim(),
+              ...(typeof option.disabled === "boolean"
+                ? { disabled: option.disabled }
+                : {}),
+            }];
+          })
+        : undefined;
+      const tiers = Array.isArray(pending.tiers)
+        ? pending.tiers.slice(0, 24).flatMap((entry) => {
+            if (
+              !entry ||
+              typeof entry !== "object" ||
+              Array.isArray(entry)
+            )
+              return [];
+            const tier = entry as Record<string, unknown>;
+            if (
+              typeof tier.role !== "string" ||
+              !tier.role ||
+              tier.role.length > 100
+            )
+              return [];
+            return [{
+              role: tier.role,
+              ...(typeof tier.provider === "string"
+                ? { provider: tier.provider.slice(0, 200) }
+                : {}),
+              ...(typeof tier.model === "string"
+                ? { model: tier.model.slice(0, 200) }
+                : {}),
+              ...(typeof tier.label === "string"
+                ? { label: tier.label.slice(0, 200) }
+                : {}),
+            }];
+          })
+        : undefined;
+      const questions = Array.isArray(pending.questions)
+        ? pending.questions
+            .slice(0, 32)
+            .map((question) => boundedJsonValue(question))
+            .filter((question) => question !== undefined)
+        : undefined;
+      result.interaction = {
+        id: pending.id,
+        kind,
+        title: pending.title.trim(),
+        ...(typeof pending.body === "string"
+          // The bridge already bounds plan reviews to 1 MiB and disables
+          // native choices when incomplete. Do not silently truncate that review.
+          ? { body: pending.body.slice(0, 1_048_576) }
+          : {}),
+        ...(typeof pending.toolCallId === "string"
+          ? { toolCallId: pending.toolCallId.slice(0, 200) }
+          : {}),
+        ...(options ? { options } : {}),
+        ...(tiers ? { tiers } : {}),
+        ...(questions ? { questions } : {}),
+        transport,
+        createdAt: pending.createdAt as number,
+      };
+    }
+  }
+  const status = raw.status;
+  if (status && typeof status === "object" && !Array.isArray(status)) {
+    const phase = status as Record<string, unknown>;
+    if (
+      (phase.kind === "retry" ||
+        phase.kind === "compaction" ||
+        phase.kind === "fallback" ||
+        phase.kind === "working") &&
+      typeof phase.label === "string" &&
+      phase.label.trim() &&
+      phase.label.length <= 200 &&
+      typeof phase.active === "boolean"
+    ) {
+      result.status = {
+        kind: phase.kind,
+        label: phase.label.trim(),
+        ...(typeof phase.detail === "string"
+          ? { detail: phase.detail.slice(0, 4000) }
+          : {}),
+        ...(finiteNumber(phase.until) !== undefined
+          ? { until: phase.until as number }
+          : {}),
+        active: phase.active,
+      };
+    }
+  }
+  const goal = raw.goal;
+  if (
+    goal &&
+    typeof goal === "object" &&
+    !Array.isArray(goal) &&
+    typeof (goal as Record<string, unknown>).text === "string"
+  ) {
+    const target = goal as Record<string, unknown>;
+    result.goal = {
+      text: (target.text as string).slice(0, 2000),
+      ...(typeof target.detail === "string"
+        ? { detail: target.detail.slice(0, 4000) }
+        : {}),
+    };
+  }
+  if (Array.isArray(raw.queue)) {
+    result.queue = raw.queue.slice(0, 40).flatMap((entry) => {
+      if (!entry || typeof entry !== "object" || Array.isArray(entry))
+        return [];
+      const item = entry as Record<string, unknown>;
+      if (typeof item.text !== "string") return [];
+      return [{
+        text: item.text.slice(0, 2000),
+        ...(typeof item.kind === "string"
+          ? { kind: item.kind.slice(0, 100) }
+          : {}),
+      }];
+    });
+  }
+  return result;
+}
+
+function normaliseHistory(value: unknown): MobileHistory | undefined {
+  if (!value || typeof value !== "object" || Array.isArray(value))
+    return undefined;
+  const history = value as Record<string, unknown>;
+  const total = finiteNumber(history.total, 0, 1_000_000_000);
+  const shown = finiteNumber(history.shown, 0, 80);
+  if (
+    total === undefined ||
+    shown === undefined ||
+    !Number.isInteger(total) ||
+    !Number.isInteger(shown) ||
+    total < shown ||
+    typeof history.hasMore !== "boolean"
+  )
+    return undefined;
+  return { total, shown, hasMore: history.hasMore };
+}
+
+export function normaliseState(raw: Record<string, unknown>): SlotState | undefined {
   const generationValue = raw.generation ?? raw.sessionGeneration;
-  if (generationValue === undefined || generationValue === null)
+  if (
+    (typeof generationValue !== "string" &&
+      (typeof generationValue !== "number" ||
+        !Number.isSafeInteger(generationValue))) ||
+    String(generationValue).length === 0 ||
+    String(generationValue).length > 200
+  )
     return undefined;
   const messages = Array.isArray(raw.messages)
     ? (raw.messages
-        .slice(-500)
+        .slice(-80)
         .filter(
-          (message) => message && typeof message === "object",
+          (message) =>
+            message !== null &&
+            typeof message === "object" &&
+            !Array.isArray(message),
         ) as SlotState["messages"])
     : [];
   const pendingMessages = Array.isArray(raw.pendingMessages)
@@ -1233,6 +1524,8 @@ function normaliseState(raw: Record<string, unknown>): SlotState | undefined {
       ? (raw.editor as Record<string, unknown>)
       : undefined;
   const activity = normaliseActivity(raw.activity);
+  const runtime = normaliseRuntime(raw.runtime);
+  const history = normaliseHistory(raw.history);
   return {
     apiVersion: API_VERSION,
     generation: String(generationValue),
@@ -1247,6 +1540,8 @@ function normaliseState(raw: Record<string, unknown>): SlotState | undefined {
       ? { agentActive: raw.agentActive }
       : {}),
     ...(activity ? { activity } : {}),
+    ...(runtime ? { runtime } : {}),
+    ...(history ? { history } : {}),
     theme: raw.theme ?? null,
     commands,
     messages,
@@ -1322,10 +1617,454 @@ async function getSlotState(
   }
 }
 
+const MAX_PROMPT_IMAGES = 8;
+const MAX_PROMPT_IMAGE_BASE64 = 3 * 1024 * 1024;
+const MAX_FULL_MESSAGE_BYTES = 32 * 1024 * 1024;
+const FULL_MESSAGE_CHUNK_CHARS = 256 * 1024;
+const MAX_MESSAGE_TRANSFERS = 256;
+const MESSAGE_TRANSFER_TTL_MS = 5 * 60 * 1000;
+type MessageTransfer = {
+  slot: string;
+  messageId: string;
+  generation: string;
+  expiresAt: number;
+};
+const messageTransfers = new Map<string, MessageTransfer>();
+function isMessageTransferId(value: unknown): value is string {
+  return (
+    typeof value === "string" &&
+    /^[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i.test(
+      value,
+    )
+  );
+}
+function pruneMessageTransfers(now = Date.now()): void {
+  for (const [transferId, transfer] of messageTransfers) {
+    if (transfer.expiresAt <= now) messageTransfers.delete(transferId);
+  }
+}
+const RASTER_IMAGE_MIME_TYPES: Record<string, true> = {
+  "image/png": true,
+  "image/jpeg": true,
+  "image/webp": true,
+  "image/gif": true,
+};
+
+export function validatePromptImages(value: unknown):
+  | { images?: MobileImage[] }
+  | { error: string } {
+  if (value === undefined) return {};
+  if (!Array.isArray(value) || value.length === 0 || value.length > MAX_PROMPT_IMAGES)
+    return { error: `images must contain 1-${MAX_PROMPT_IMAGES} raster attachments` };
+  const images: MobileImage[] = [];
+  let totalBase64Length = 0;
+  for (const entry of value) {
+    if (!entry || typeof entry !== "object" || Array.isArray(entry))
+      return { error: "image attachment is invalid" };
+    const image = entry as Record<string, unknown>;
+    if (
+      image.type !== "image" ||
+      typeof image.mimeType !== "string" ||
+      RASTER_IMAGE_MIME_TYPES[image.mimeType] !== true ||
+      typeof image.data !== "string" ||
+      image.data.length === 0 ||
+      "sourceId" in image
+    )
+      return { error: "image attachment requires raster MIME type and base64 data" };
+    const data = image.data;
+    if (
+      data.length % 4 !== 0 ||
+      !/^(?:[A-Za-z0-9+/]{4})*(?:[A-Za-z0-9+/]{2}==|[A-Za-z0-9+/]{3}=)?$/.test(data)
+    )
+      return { error: "image attachment is not valid base64" };
+    totalBase64Length += Buffer.byteLength(data, "ascii");
+    if (totalBase64Length > MAX_PROMPT_IMAGE_BASE64)
+      return { error: "image attachments exceed the 3 MiB base64 limit" };
+    const signature = Buffer.from(data.slice(0, 24), "base64");
+    const validSignature =
+      image.mimeType === "image/png"
+        ? signature.length >= 8 &&
+          signature.subarray(0, 8).equals(
+            Buffer.from([137, 80, 78, 71, 13, 10, 26, 10]),
+          )
+        : image.mimeType === "image/jpeg"
+          ? signature.length >= 3 &&
+            signature[0] === 0xff &&
+            signature[1] === 0xd8 &&
+            signature[2] === 0xff
+          : image.mimeType === "image/gif"
+            ? signature.length >= 6 &&
+              ["GIF87a", "GIF89a"].includes(signature.toString("ascii", 0, 6))
+            : signature.length >= 12 &&
+              signature.toString("ascii", 0, 4) === "RIFF" &&
+              signature.toString("ascii", 8, 12) === "WEBP";
+    if (!validSignature)
+      return { error: "image data does not match its raster MIME type" };
+    images.push({ type: "image", mimeType: image.mimeType, data });
+  }
+  return { images };
+}
+
+export type InteractionActionValidation =
+  | {
+      ok: true;
+      action: Extract<SlotAction, { type: "interaction" }>;
+    }
+  | { ok: false; status: number; message: string };
+
+export function validateInteractionAction(
+  state: SlotState,
+  body: Record<string, unknown>,
+): InteractionActionValidation {
+  if (body.generation !== state.generation)
+    return { ok: false, status: 409, message: "session changed; refresh before responding" };
+  const allowedKeys: Record<string, true> = {
+    generation: true,
+    type: true,
+    id: true,
+    choice: true,
+    feedback: true,
+    role: true,
+  };
+  if (
+    body.type !== "interaction" ||
+    Object.keys(body).some((key) => allowedKeys[key] !== true)
+  )
+    return {
+      ok: false,
+      status: 400,
+      message: "interaction action contains unsupported fields",
+    };
+  if (
+    typeof body.id !== "string" ||
+    body.id.length === 0 ||
+    body.id.length > 512 ||
+    typeof body.choice !== "string" ||
+    body.choice.length === 0 ||
+    body.choice.length > 200 ||
+    (body.feedback !== undefined &&
+      (typeof body.feedback !== "string" || body.feedback.length > 8000)) ||
+    (body.role !== undefined &&
+      (typeof body.role !== "string" || body.role.length > 100))
+  )
+    return {
+      ok: false,
+      status: 400,
+      message: "interaction action fields are invalid",
+    };
+  const pending = state.runtime?.interaction;
+  if (!pending || pending.id !== body.id)
+    return {
+      ok: false,
+      status: 409,
+      message: "pending interaction changed; refresh before responding",
+    };
+  if (pending.kind !== "plan" || pending.transport !== "native")
+    return {
+      ok: false,
+      status: 409,
+      message:
+        "this interaction must be completed through its owning terminal controls",
+    };
+  if (
+    !pending.options?.some(
+      (option) => option.id === body.choice && option.disabled !== true,
+    ) ||
+    (body.role !== undefined &&
+      !pending.tiers?.some((tier) => tier.role === body.role))
+  )
+    return {
+      ok: false,
+      status: 400,
+      message: "interaction choice or role is not available",
+    };
+  return {
+    ok: true,
+    action: {
+      generation: state.generation,
+      type: "interaction",
+      id: body.id,
+      choice: body.choice,
+      ...(typeof body.feedback === "string"
+        ? { feedback: body.feedback }
+        : {}),
+      ...(typeof body.role === "string" ? { role: body.role } : {}),
+    },
+  };
+}
+
+function ipcJsonObject(response: IpcResponse): Record<string, unknown> | undefined {
+  if (response.status < 200 || response.status >= 300) return undefined;
+  try {
+    const value: unknown = JSON.parse(response.body);
+    return value && typeof value === "object" && !Array.isArray(value)
+      ? (value as Record<string, unknown>)
+      : undefined;
+  } catch {
+    return undefined;
+  }
+}
+
+async function historyResponse(
+  slot: string,
+  request: Request,
+): Promise<Response> {
+  const url = new URL(request.url);
+  const params = url.searchParams;
+  if (
+    [...params.keys()].some((key) => key !== "before" && key !== "limit") ||
+    params.getAll("before").length > 1 ||
+    params.getAll("limit").length > 1
+  )
+    return errorResponse(400, "history query is invalid");
+  const before = params.get("before");
+  if (before !== null && (!before || before.length > 512))
+    return errorResponse(400, "history before entry id is invalid");
+  const rawLimit = params.get("limit");
+  const limit = rawLimit === null ? 80 : Number(rawLimit);
+  if (
+    (rawLimit !== null && !/^[1-9]\d*$/.test(rawLimit)) ||
+    !Number.isInteger(limit) ||
+    limit < 1 ||
+    limit > 80
+  )
+    return errorResponse(400, "history limit must be an integer from 1 to 80");
+  const current = await getSlotState(slot);
+  if (!current.state)
+    return errorResponse(503, current.error ?? "extension unavailable", {
+      capabilities: { reconnect: true },
+    });
+  const query = new URLSearchParams({ limit: String(limit) });
+  if (before !== null) query.set("before", before);
+  try {
+    const response = await ipcRequest(
+      join(IPC_ROOT, `${slot}.sock`),
+      "GET",
+      `/history?${query}`,
+    );
+    if (response.status === 409)
+      return errorResponse(409, "session changed; refresh history", {
+        generation: current.state.generation,
+      });
+    const value = ipcJsonObject(response);
+    if (!value)
+      return errorResponse(
+        response.status >= 400 && response.status <= 599 ? response.status : 502,
+        response.status >= 400 ? response.body.slice(0, 300) : "invalid extension history",
+      );
+    if (typeof value.generation !== "string" || value.generation !== current.state.generation)
+      return errorResponse(409, "session changed; refresh history", {
+        generation: current.state.generation,
+      });
+    const history = normaliseHistory(value.history);
+    if (
+      !history ||
+      !Array.isArray(value.messages) ||
+      value.messages.length > limit ||
+      value.messages.some(
+        (message) =>
+          !message ||
+          typeof message !== "object" ||
+          Array.isArray(message) ||
+          typeof (message as Record<string, unknown>).entryId !== "string" ||
+          !Array.isArray((message as Record<string, unknown>).parts),
+      )
+    )
+      return errorResponse(502, "extension returned invalid history");
+    return json({
+      generation: current.state.generation,
+      messages: value.messages,
+      history,
+    });
+  } catch (error) {
+    return errorResponse(
+      503,
+      error instanceof Error ? error.message : "extension unavailable",
+      { capabilities: { reconnect: true } },
+    );
+  }
+}
+
+async function messageResponse(
+  slot: string,
+  request: Request,
+): Promise<Response> {
+  const params = new URL(request.url).searchParams;
+  if (
+    [...params.keys()].some(
+      (key) => key !== "id" && key !== "offset" && key !== "transferId",
+    ) ||
+    params.getAll("id").length !== 1 ||
+    params.getAll("offset").length > 1 ||
+    params.getAll("transferId").length > 1
+  )
+    return errorResponse(400, "message query is invalid");
+  const id = params.get("id");
+  if (!id || id.length > 512)
+    return errorResponse(400, "message id is invalid");
+  const rawOffset = params.get("offset");
+  const offset =
+    rawOffset === null
+      ? undefined
+      : /^(0|[1-9]\d*)$/.test(rawOffset) &&
+          Number.isSafeInteger(Number(rawOffset)) &&
+          Number(rawOffset) <= MAX_FULL_MESSAGE_BYTES
+        ? Number(rawOffset)
+        : Number.NaN;
+  if (Number.isNaN(offset))
+    return errorResponse(400, "message offset must be a non-negative integer");
+  const rawTransferId = params.get("transferId");
+  if (rawTransferId !== null && !isMessageTransferId(rawTransferId))
+    return errorResponse(400, "message transferId is invalid");
+  if (
+    (offset === undefined && rawTransferId !== null) ||
+    (offset === 0 && rawTransferId !== null) ||
+    (offset !== undefined && offset > 0 && rawTransferId === null)
+  )
+    return errorResponse(400, "message transferId does not match the offset");
+  const transferId = rawTransferId ?? "";
+  const current = await getSlotState(slot);
+  if (!current.state)
+    return errorResponse(503, current.error ?? "extension unavailable", {
+      capabilities: { reconnect: true },
+    });
+  if (offset !== undefined && offset > 0) {
+    const now = Date.now();
+    pruneMessageTransfers(now);
+    const transfer = messageTransfers.get(transferId);
+    if (!transfer)
+      return errorResponse(409, "message transfer expired; restart message load", {
+        generation: current.state.generation,
+      });
+    if (transfer.slot !== slot || transfer.messageId !== id)
+      return errorResponse(409, "message transfer does not match this message");
+    if (transfer.generation !== current.state.generation)
+      return errorResponse(409, "session changed; restart message load", {
+        generation: current.state.generation,
+      });
+    transfer.expiresAt = now + MESSAGE_TRANSFER_TTL_MS;
+    messageTransfers.delete(transferId);
+    messageTransfers.set(transferId, transfer);
+  }
+  try {
+    const query = new URLSearchParams({ id });
+    if (offset !== undefined) query.set("offset", String(offset));
+    if (rawTransferId !== null) query.set("transferId", rawTransferId);
+    const response = await ipcRequest(
+      join(IPC_ROOT, `${slot}.sock`),
+      "GET",
+      `/message?${query}`,
+    );
+    if (response.status === 404)
+      return errorResponse(404, "message not found");
+    if (response.status === 409)
+      return errorResponse(409, "session changed; refresh message", {
+        generation: current.state.generation,
+      });
+    const value = ipcJsonObject(response);
+    if (!value)
+      return errorResponse(
+        response.status >= 400 && response.status <= 599 ? response.status : 502,
+        response.status >= 400 ? response.body.slice(0, 300) : "invalid extension message",
+      );
+    if (typeof value.generation !== "string" || value.generation !== current.state.generation)
+      return errorResponse(409, "session changed; refresh message", {
+        generation: current.state.generation,
+      });
+    if (typeof value.chunk === "string") {
+      if (offset === undefined)
+        return errorResponse(502, "extension returned a chunk without an offset request");
+      const responseTransferId = value.transferId;
+      if (
+        !isMessageTransferId(responseTransferId) ||
+        (offset > 0 && responseTransferId !== transferId)
+      )
+        return errorResponse(502, "extension returned an invalid message transferId");
+      const start = offset;
+      const total = value.total;
+      const nextOffset = value.nextOffset;
+      if (
+        !Number.isSafeInteger(total) ||
+        (total as number) < 0 ||
+        (total as number) > MAX_FULL_MESSAGE_BYTES ||
+        value.chunk.length > FULL_MESSAGE_CHUNK_CHARS ||
+        (nextOffset !== null &&
+          (!Number.isSafeInteger(nextOffset) ||
+            (nextOffset as number) !== start + value.chunk.length ||
+            (nextOffset as number) > (total as number))) ||
+        (nextOffset === null && start + value.chunk.length !== total)
+      )
+        return errorResponse(502, "extension returned invalid full-message chunk");
+      if (offset === 0) {
+        const now = Date.now();
+        pruneMessageTransfers(now);
+        const existing = messageTransfers.get(responseTransferId);
+        if (
+          existing &&
+          (existing.slot !== slot ||
+            existing.messageId !== id ||
+            existing.generation !== current.state.generation)
+        )
+          return errorResponse(502, "extension reused a message transferId");
+        messageTransfers.delete(responseTransferId);
+        messageTransfers.set(responseTransferId, {
+          slot,
+          messageId: id,
+          generation: current.state.generation,
+          expiresAt: now + MESSAGE_TRANSFER_TTL_MS,
+        });
+        while (messageTransfers.size > MAX_MESSAGE_TRANSFERS) {
+          const oldest = messageTransfers.keys().next().value;
+          if (oldest === undefined) break;
+          messageTransfers.delete(oldest);
+        }
+      }
+      return json({
+        generation: current.state.generation,
+        transferId: responseTransferId,
+        chunk: value.chunk,
+        nextOffset,
+        total,
+      });
+    }
+    if (offset !== undefined)
+      return errorResponse(502, "extension did not honor the message offset");
+    if (
+      !value.message ||
+      typeof value.message !== "object" ||
+      Array.isArray(value.message) ||
+      (value.message as Record<string, unknown>).entryId !== id
+    )
+      return errorResponse(502, "extension returned invalid full message");
+    const serialized = JSON.stringify(value.message);
+    const messageBytes = Buffer.byteLength(serialized, "utf8");
+    if (messageBytes > MAX_FULL_MESSAGE_BYTES)
+      return errorResponse(413, "full message exceeds the 32 MiB transport limit");
+    if (serialized.length > FULL_MESSAGE_CHUNK_CHARS)
+      return errorResponse(502, "extension did not chunk the full message");
+    return json({ generation: current.state.generation, message: value.message });
+  } catch (error) {
+    const message =
+      error instanceof Error ? error.message : "extension unavailable";
+    return errorResponse(
+      message.includes("response too large")
+        ? 413
+        : 503,
+      message.includes("response too large")
+        ? "full message exceeds the 32 MiB transport limit"
+        : message,
+      { capabilities: { reconnect: true } },
+    );
+  }
+}
+
 async function slotAction(slot: string, request: Request): Promise<Response> {
   let body: Record<string, unknown>;
   try {
-    body = parseJson(await readBody(request));
+    const rawBody = await readBody(request, MAX_PROMPT_BODY);
+    body = parseJson(rawBody);
+    if (body.type !== "prompt" && Buffer.byteLength(rawBody) > MAX_BODY)
+      return errorResponse(400, "request body too large for this action");
   } catch (error) {
     return errorResponse(
       400,
@@ -1355,13 +2094,33 @@ async function slotAction(slot: string, request: Request): Promise<Response> {
 
   const type = body.type;
   let stagesInEditor = false;
+  let interactionAction:
+    | Extract<SlotAction, { type: "interaction" }>
+    | undefined;
   if (type === "prompt") {
+    const promptKeys: Record<string, true> = {
+      generation: true,
+      type: true,
+      text: true,
+      images: true,
+    };
+    if (Object.keys(body).some((key) => promptKeys[key] !== true))
+      return errorResponse(400, "prompt contains unsupported fields");
     if (
       typeof body.text !== "string" ||
       body.text.length === 0 ||
       body.text.length > 100_000
     )
       return errorResponse(400, "prompt text is invalid");
+    const attachments = validatePromptImages(body.images);
+    if ("error" in attachments)
+      return errorResponse(400, attachments.error);
+    if (attachments.images) body.images = attachments.images;
+  } else if (type === "interaction") {
+    const validation = validateInteractionAction(current.state, body);
+    if (!validation.ok)
+      return errorResponse(validation.status, validation.message);
+    interactionAction = validation.action;
   } else if (type === "abort" || type === "force") {
     // No additional fields.
   } else if (type === "model") {
@@ -1430,7 +2189,8 @@ async function slotAction(slot: string, request: Request): Promise<Response> {
     return errorResponse(400, "unsupported action");
   }
 
-  const action: SlotAction = body as unknown as SlotAction;
+  const action: SlotAction =
+    interactionAction ?? (body as unknown as SlotAction);
   try {
     const response = await ipcRequest(
       join(IPC_ROOT, `${slot}.sock`),
@@ -1645,7 +2405,40 @@ const MIME: Record<string, string> = {
   ".woff": "font/woff",
   ".woff2": "font/woff2",
 };
+let katexFontsRoot: string | null | undefined;
+
 async function staticResponse(pathname: string): Promise<Response> {
+  const fontMatch =
+    /^\/vendor\/katex\/fonts\/([A-Za-z0-9_-]+\.(?:woff2?|ttf))$/.exec(pathname);
+  if (fontMatch) {
+    if (katexFontsRoot === undefined) {
+      try {
+        katexFontsRoot = join(
+          dirname(Bun.resolveSync("katex/package.json", ROOT)),
+          "dist",
+          "fonts",
+        );
+      } catch {
+        katexFontsRoot = null;
+      }
+    }
+    if (!katexFontsRoot) return errorResponse(404, "not found");
+    const filename = fontMatch[1];
+    const target = join(katexFontsRoot, filename);
+    try {
+      const stat = await fs.lstat(target);
+      if (!stat.isFile() || stat.size > 2 * 1024 * 1024)
+        return errorResponse(404, "not found");
+      return new Response(await fs.readFile(target), {
+        headers: {
+          "content-type": MIME[extname(filename)] ?? "application/octet-stream",
+          "cache-control": "public, max-age=31536000, immutable",
+        },
+      });
+    } catch {
+      return errorResponse(404, "not found");
+    }
+  }
   if (pathname === "/client.js" && clientBundle)
     return new Response(clientBundle, {
       headers: { "content-type": MIME[".js"], "cache-control": "no-cache" },
@@ -1826,6 +2619,17 @@ async function handle(request: Request): Promise<Response> {
   const deleteMatch = /^\/api\/slots\/([^/]+)$/.exec(url.pathname);
   if (deleteMatch && request.method === "DELETE" && isSlotId(deleteMatch[1]))
     return withCors(await deleteSlot(deleteMatch[1]), request);
+  const contentMatch =
+    /^\/api\/slots\/([^/]+)\/(history|message)$/.exec(url.pathname);
+  if (contentMatch && isSlotId(contentMatch[1])) {
+    const response =
+      request.method !== "GET"
+        ? errorResponse(405, "method not allowed")
+        : contentMatch[2] === "history"
+          ? await historyResponse(contentMatch[1], request)
+          : await messageResponse(contentMatch[1], request);
+    return withCors(response, request);
+  }
   const stateMatch = /^\/api\/slots\/([^/]+)\/state$/.exec(url.pathname);
   if (request.method === "GET" && stateMatch && isSlotId(stateMatch[1])) {
     const result = await getSlotState(stateMatch[1]);
@@ -1912,7 +2716,10 @@ async function loadToken(): Promise<void> {
  */
 async function notificationSlotIds(): Promise<string[]> {
   const runtimes = await listDesktopRuntimes();
-  if (!runtimes) return knownSlotIds;
+  if (!runtimes) {
+    if (knownSlotIds.length > 0) return knownSlotIds;
+    throw new Error("desktop daemon unavailable");
+  }
   knownSlotIds = runtimes.map((runtime) => runtime.id);
   return knownSlotIds;
 }

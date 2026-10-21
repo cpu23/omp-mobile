@@ -22,10 +22,19 @@ export type CompletionNotice = {
   title: string;
   completedAt: number;
 };
+export type ActionNeededKind = "approval" | "ask" | "plan" | "dialog";
+export type ActionNeededNotice = {
+  identity: string;
+  kind: ActionNeededKind;
+  title: string;
+  actionTitle: string;
+  createdAt: number;
+};
 export type NotificationSlotStatus = {
   slot: NotificationSlot;
   unread: CompletionNotice[];
   latest?: CompletionNotice;
+  actionNeeded?: ActionNeededNotice & { unread: boolean };
 };
 export type NotificationStatus = {
   enabled: boolean;
@@ -38,7 +47,10 @@ type StoredSlot = {
   initialized?: boolean;
   lastObserved?: string;
   seen: string[];
+  seenActions: string[];
+  acknowledgedActions: string[];
   unread: CompletionNotice[];
+  actionNeeded?: ActionNeededNotice;
 };
 type StoredState = {
   version: 1;
@@ -94,7 +106,13 @@ const DEFAULT_STATE_FILE = join(
 const DEFAULT_INTERVAL = 3000;
 
 function blankSlot(): StoredSlot {
-  return { initialized: false, seen: [], unread: [] };
+  return {
+    initialized: false,
+    seen: [],
+    seenActions: [],
+    acknowledgedActions: [],
+    unread: [],
+  };
 }
 function blankState(): StoredState {
   return {
@@ -355,6 +373,44 @@ async function loadState(path: string): Promise<StoredState> {
       if (!isSlotId(slot)) continue;
       const stored = value.slots?.[slot] as Partial<StoredSlot> | undefined;
       if (!stored || typeof stored !== "object") continue;
+      const pending = stored.actionNeeded;
+      let actionNeeded: ActionNeededNotice | undefined;
+      if (pending && typeof pending === "object") {
+        const candidate = pending as Record<string, unknown>;
+        if (
+          typeof candidate.identity === "string" &&
+          candidate.identity.length > 0 &&
+          candidate.identity.length <= MAX_IDENTITY &&
+          (candidate.kind === "approval" ||
+            candidate.kind === "ask" ||
+            candidate.kind === "plan" ||
+            candidate.kind === "dialog") &&
+          typeof candidate.title === "string" &&
+          candidate.title.length > 0 &&
+          candidate.title.length <= MAX_TITLE &&
+          typeof candidate.actionTitle === "string" &&
+          candidate.actionTitle.length > 0 &&
+          candidate.actionTitle.length <= MAX_TITLE &&
+          typeof candidate.createdAt === "number" &&
+          Number.isFinite(candidate.createdAt)
+        ) {
+          actionNeeded = {
+            identity: candidate.identity,
+            kind: candidate.kind,
+            title: candidate.title,
+            actionTitle: candidate.actionTitle,
+            createdAt: candidate.createdAt,
+          };
+        }
+      }
+      const acknowledgedActions = Array.isArray(stored.acknowledgedActions)
+        ? stored.acknowledgedActions
+            .filter(
+              (item) =>
+                typeof item === "string" && item.length <= MAX_IDENTITY,
+            )
+            .slice(-MAX_SEEN)
+        : [];
       result.slots[slot] = {
         initialized:
           typeof stored.initialized === "boolean"
@@ -369,6 +425,15 @@ async function loadState(path: string): Promise<StoredState> {
               .filter((item) => typeof item === "string")
               .slice(-MAX_SEEN)
           : [],
+        seenActions: Array.isArray(stored.seenActions)
+          ? stored.seenActions
+              .filter(
+                (item) =>
+                  typeof item === "string" && item.length <= MAX_IDENTITY,
+              )
+              .slice(-MAX_SEEN)
+          : [],
+        acknowledgedActions: acknowledgedActions.slice(-MAX_SEEN),
         unread: Array.isArray(stored.unread)
           ? (stored.unread
               .filter(
@@ -380,6 +445,7 @@ async function loadState(path: string): Promise<StoredState> {
               )
               .slice(-MAX_UNREAD) as CompletionNotice[])
           : [],
+        ...(actionNeeded ? { actionNeeded } : {}),
       };
     }
     return result;
@@ -489,16 +555,30 @@ export function createNotificationService(
     await pushLoad;
     return pushLoad;
   };
-  const send = async (slot: NotificationSlot, notice: CompletionNotice) => {
+  const send = async (
+    slot: NotificationSlot,
+    notice: CompletionNotice | ActionNeededNotice,
+  ) => {
     await ensurePush();
     if (!push || !state.subscriptions.length) return;
-    const payload = JSON.stringify({
-      type: "completion",
-      slot,
-      title: notice.title,
-      identity: notice.identity,
-      completedAt: notice.completedAt,
-    });
+    const payload =
+      "completedAt" in notice
+        ? JSON.stringify({
+            type: "completion",
+            slot,
+            title: notice.title,
+            identity: notice.identity,
+            completedAt: notice.completedAt,
+          })
+        : JSON.stringify({
+            type: "action-needed",
+            slot,
+            title: notice.title,
+            actionTitle: notice.actionTitle,
+            identity: notice.identity,
+            kind: notice.kind,
+            createdAt: notice.createdAt,
+          });
     const expired: string[] = [];
     await Promise.all(
       state.subscriptions.map(async (subscription) => {
@@ -522,11 +602,8 @@ export function createNotificationService(
     }
   };
   /**
-   * Runtime ids to poll. `undefined` means discovery itself failed, which must
-   * not be mistaken for "no runtimes exist". The gateway's `listSlots` is
-   * authoritative when provided; otherwise extension sockets are scanned.
-   * Either way an empty list is treated as "no data" — the desktop daemon
-   * being unreachable must never forget unread notifications.
+   * `undefined` means discovery failed. A successful empty result is
+   * authoritative; the gateway keeps its last known ids through daemon outages.
    */
   const discoverSlots = async (): Promise<string[] | undefined> => {
     if (options.listSlots) {
@@ -552,13 +629,18 @@ export function createNotificationService(
       return undefined;
     }
   };
-  /** Forget slots the daemon no longer lists, never their unread notices. */
+  /** Clear inactive action prompts while retaining their independent completion notices. */
   const pruneSlots = (active: readonly string[]): boolean => {
-    if (active.length === 0) return false;
     const live = new Set(active);
     let changed = false;
     for (const slot of Object.keys(state.slots)) {
-      if (!live.has(slot) && state.slots[slot].unread.length === 0) {
+      const stored = state.slots[slot];
+      if (live.has(slot)) continue;
+      if (stored.actionNeeded) {
+        delete stored.actionNeeded;
+        changed = true;
+      }
+      if (stored.unread.length === 0) {
         delete state.slots[slot];
         changed = true;
       }
@@ -566,7 +648,7 @@ export function createNotificationService(
     let overflow = Object.keys(state.slots).length - MAX_TRACKED_SLOTS;
     for (const slot of Object.keys(state.slots)) {
       if (overflow <= 0) break;
-      if (live.has(slot)) continue;
+      if (live.has(slot) || state.slots[slot].unread.length > 0) continue;
       delete state.slots[slot];
       overflow -= 1;
       changed = true;
@@ -595,36 +677,85 @@ export function createNotificationService(
             : undefined;
         const identity = asString(completion?.identity, MAX_IDENTITY);
         const title = asString(raw.title, MAX_TITLE) ?? slot;
+        let changed = false;
+        let completionNotice: CompletionNotice | undefined;
         if (!entry.initialized) {
           entry.initialized = true;
+          changed = true;
           if (identity) {
             entry.lastObserved = identity;
             if (!entry.seen.includes(identity)) entry.seen.push(identity);
           }
-          await save();
-          continue;
+        } else if (identity && entry.lastObserved !== identity) {
+          entry.lastObserved = identity;
+          changed = true;
+          if (!entry.seen.includes(identity)) {
+            entry.seen.push(identity);
+            if (entry.seen.length > MAX_SEEN)
+              entry.seen = entry.seen.slice(-MAX_SEEN);
+            const completedAt =
+              typeof completion?.completedAt === "number" &&
+              Number.isFinite(completion.completedAt)
+                ? completion.completedAt
+                : Date.now();
+            completionNotice = { identity, title, completedAt };
+            entry.unread.push(completionNotice);
+            if (entry.unread.length > MAX_UNREAD)
+              entry.unread = entry.unread.slice(-MAX_UNREAD);
+          }
         }
-        if (!identity) continue;
-        if (entry.lastObserved === identity) continue;
-        entry.lastObserved = identity;
-        if (entry.seen.includes(identity)) {
-          await save();
-          continue;
+
+        const pending =
+          raw.pendingAction &&
+          typeof raw.pendingAction === "object" &&
+          !Array.isArray(raw.pendingAction)
+            ? (raw.pendingAction as Record<string, unknown>)
+            : undefined;
+        const pendingIdentity = asString(pending?.id, MAX_IDENTITY);
+        const pendingKind = pending?.kind;
+        const pendingTitle = asString(pending?.title, MAX_TITLE);
+        let actionPushNotice: ActionNeededNotice | undefined;
+        if (
+          pendingIdentity &&
+          (pendingKind === "approval" ||
+            pendingKind === "ask" ||
+            pendingKind === "plan" ||
+            pendingKind === "dialog") &&
+          pendingTitle
+        ) {
+          const prior = entry.actionNeeded;
+          const actionNotice: ActionNeededNotice = {
+            identity: pendingIdentity,
+            kind: pendingKind,
+            title,
+            actionTitle: pendingTitle,
+            createdAt:
+              prior?.identity === pendingIdentity ? prior.createdAt : Date.now(),
+          };
+          if (prior?.identity !== pendingIdentity) {
+            entry.actionNeeded = actionNotice;
+            if (!entry.seenActions.includes(pendingIdentity)) {
+              entry.seenActions.push(pendingIdentity);
+              if (entry.seenActions.length > MAX_SEEN)
+                entry.seenActions = entry.seenActions.slice(-MAX_SEEN);
+              actionPushNotice = actionNotice;
+            }
+            changed = true;
+          } else if (
+            prior.title !== actionNotice.title ||
+            prior.actionTitle !== actionNotice.actionTitle ||
+            prior.kind !== actionNotice.kind
+          ) {
+            entry.actionNeeded = actionNotice;
+            changed = true;
+          }
+        } else if (entry.actionNeeded) {
+          delete entry.actionNeeded;
+          changed = true;
         }
-        entry.seen.push(identity);
-        if (entry.seen.length > MAX_SEEN)
-          entry.seen = entry.seen.slice(-MAX_SEEN);
-        const completedAt =
-          typeof completion?.completedAt === "number" &&
-          Number.isFinite(completion.completedAt)
-            ? completion.completedAt
-            : Date.now();
-        const notice: CompletionNotice = { identity, title, completedAt };
-        entry.unread.push(notice);
-        if (entry.unread.length > MAX_UNREAD)
-          entry.unread = entry.unread.slice(-MAX_UNREAD);
-        await save();
-        await send(slot, notice);
+        if (changed) await save();
+        if (completionNotice) await send(slot, completionNotice);
+        if (actionPushNotice) await send(slot, actionPushNotice);
       }
       if (pruneSlots(active)) await save();
     })().finally(() => {
@@ -661,11 +792,26 @@ export function createNotificationService(
           slot,
           unread: [...item.unread],
           latest: item.unread[item.unread.length - 1],
+          ...(item.actionNeeded
+            ? {
+                actionNeeded: {
+                  ...item.actionNeeded,
+                  unread: !item.acknowledgedActions.includes(
+                    item.actionNeeded.identity,
+                  ),
+                },
+              }
+            : {}),
         });
       };
       for (const slot of activeSlots) collect(slot);
       for (const slot of Object.keys(state.slots)) {
-        if (seen.has(slot) || state.slots[slot].unread.length === 0) continue;
+        const item = state.slots[slot];
+        if (
+          seen.has(slot) ||
+          (item.unread.length === 0 && !item.actionNeeded)
+        )
+          continue;
         collect(slot);
       }
       return {
@@ -673,7 +819,10 @@ export function createNotificationService(
         ...(push && publicKey ? { publicKey } : {}),
         slots,
         totalUnread: slots.reduce(
-          (total, item) => total + item.unread.length,
+          (total, item) =>
+            total +
+            item.unread.length +
+            (item.actionNeeded?.unread ? 1 : 0),
           0,
         ),
       };
@@ -705,12 +854,22 @@ export function createNotificationService(
     async ack(slot, identity) {
       await ensureLoaded();
       if (!isSlotId(slot) || !asString(identity, MAX_IDENTITY))
-        throw new Error("completion identity is invalid");
+        throw new Error("notification identity is invalid");
       const entry = state.slots[slot];
-      if (entry)
+      if (entry) {
         entry.unread = entry.unread.filter(
           (item) => item.identity !== identity,
         );
+        if (
+          entry.actionNeeded?.identity === identity &&
+          !entry.acknowledgedActions.includes(identity)
+        ) {
+          entry.acknowledgedActions.push(identity);
+          if (entry.acknowledgedActions.length > MAX_SEEN)
+            entry.acknowledgedActions =
+              entry.acknowledgedActions.slice(-MAX_SEEN);
+        }
+      }
       await save();
     },
   };
