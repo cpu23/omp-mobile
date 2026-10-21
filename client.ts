@@ -1837,6 +1837,17 @@ function queueMoveCompletion(draft: string): void {
   }, 120);
 }
 
+function focusPromptEnd(prompt: HTMLDivElement): void {
+  prompt.focus();
+  const selection = window.getSelection();
+  if (!selection) return;
+  const range = document.createRange();
+  range.selectNodeContents(prompt);
+  range.collapse(false);
+  selection.removeAllRanges();
+  selection.addRange(range);
+}
+
 function applyMoveSelection(path: string): void {
   const prompt = requiredElement<HTMLDivElement>("#prompt");
   prompt.innerText = `/move ${path}`;
@@ -1846,7 +1857,7 @@ function applyMoveSelection(path: string): void {
   commandSelection = 0;
   resizePrompt();
   renderCommandMenu();
-  prompt.focus();
+  focusPromptEnd(prompt);
 }
 
 function hideCommandMenu(
@@ -1983,7 +1994,7 @@ function selectCommand(command: SlashCommand | undefined): void {
   commandSelection = 0;
   resizePrompt();
   renderCommandMenu();
-  prompt.focus();
+  focusPromptEnd(prompt);
 }
 
 function renderCommandMenu(): void {
@@ -6469,7 +6480,7 @@ function selectDirectory(dirPath: string): void {
   resizePrompt();
   renderCommandMenu();
   closeModal();
-  prompt.focus();
+  focusPromptEnd(prompt);
 }
 type DirTreeNode = {
   path: string;
