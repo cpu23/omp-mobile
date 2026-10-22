@@ -700,18 +700,6 @@ textarea:focus-visible {
   padding: 8px 12px;
 }
 
-.message-head {
-  color: var(--dim);
-  display: flex;
-  gap: 8px;
-  align-items: center;
-  font: 10px var(--mono);
-  text-transform: uppercase;
-  letter-spacing: 0.07em;
-  margin-bottom: 6px;
-  user-select: none;
-}
-
 .message-body {
   line-height: 1.55;
   font-size: 13px;
@@ -2808,7 +2796,6 @@ pre,
 .part-custom,
 .part-execution,
 .part-files,
-.part-usage,
 .part-unsupported {
   min-width: 0;
   border: 1px solid var(--line);
@@ -3140,8 +3127,6 @@ pre,
   overflow-wrap: anywhere;
 }
 
-.image-load,
-.full-message-load,
 .history-load {
   min-height: 44px;
   white-space: normal;
@@ -3267,12 +3252,6 @@ pre,
 
 .part-file {
   border-top: 1px solid var(--line);
-}
-
-.part-usage {
-  color: var(--muted);
-  font: 11px/1.5 var(--mono);
-  overflow-wrap: anywhere;
 }
 
 .history-controls {
@@ -3525,7 +3504,6 @@ pre,
   .part-custom,
   .part-execution,
   .part-files,
-  .part-usage,
   .part-unsupported {
     padding: 9px 10px;
   }

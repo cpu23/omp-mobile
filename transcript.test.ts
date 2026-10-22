@@ -1,5 +1,10 @@
 import { expect, test } from "bun:test";
 import { transcript } from "./extension";
+import {
+  isRoutineNotice,
+  normalizeTranscriptParts,
+  type MobilePart,
+} from "./parity-types";
 
 test("compact text advertises recoverable full content without dropping its tail", () => {
   const text = `Beginning\n${"x".repeat(300_000)}\nFull output sentinel`;
@@ -32,6 +37,153 @@ test("errors, visible custom notices and executions survive while hidden control
   expect(shell?.kind === "execution" ? [shell.code, shell.output, shell.exitCode] : undefined).toEqual(["printf hello", "hello", 0]);
   const tool = projection.messages[3]?.parts.find((part) => part.kind === "tool");
   expect(tool?.kind === "tool" ? tool.output : undefined).toBe("File contents");
+});
+
+test("routine routing and thinking metadata is omitted without matching ordinary prose", () => {
+  const messageText =
+    "The model was served by a local proxy; thinking level changed earlier.";
+  const projection = transcript([
+    {
+      type: "model_usage",
+      id: "routing-only",
+      upstreamProvider: "provider",
+      upstreamModel: "model",
+      serviceTier: "priority",
+      role: "default",
+      purpose: "background routing",
+    },
+    {
+      type: "model_change",
+      id: "model-change",
+      model: "next-model",
+      role: "default",
+      resolvedModelIsFallback: true,
+    },
+    { type: "service_tier_change", id: "tier-change", serviceTier: "priority" },
+    {
+      type: "thinking_level_change",
+      id: "thinking-change",
+      thinkingLevel: "high",
+    },
+    {
+      type: "ttsr_injection",
+      id: "rules-injected",
+      injectedRules: ["personal-rule"],
+    },
+    {
+      type: "message",
+      id: "assistant",
+      message: {
+        role: "assistant",
+        content: [{ type: "text", text: messageText }],
+        provider: "provider",
+        upstreamModel: "model",
+        serviceTier: "priority",
+        purpose: "background routing",
+        usage: {
+          input: 12,
+          output: 3,
+          cacheRead: 4,
+          cacheWrite: 5,
+          cost: { total: 0.01234 },
+        },
+      },
+    },
+    {
+      type: "model_usage",
+      id: "usage",
+      upstreamProvider: "upstream-provider",
+      upstreamModel: "upstream-model",
+      provider: "provider",
+      model: "model",
+      serviceTier: "priority",
+      role: "default",
+      purpose: "background routing",
+      usage: { input: 8, output: 2 },
+    },
+    {
+      type: "model_usage",
+      id: "failure",
+      provider: "provider",
+      model: "model",
+      stopReason: "error",
+      errorMessage: "Provider rejected the request",
+    },
+  ]);
+
+  expect(projection.messages.map((message) => message.entryId)).toEqual([
+    "assistant",
+    "failure",
+  ]);
+  expect(projection.history.total).toBe(2);
+  const assistant = projection.messages[0];
+  expect(assistant?.parts.find((part) => part.kind === "text")).toMatchObject({
+    kind: "text",
+    text: messageText,
+  });
+  expect(assistant?.parts.some((part) => part.kind === "usage")).toBe(false);
+  expect(projection.messages[1]?.parts).toContainEqual(
+    expect.objectContaining({
+      kind: "notice",
+      title: "Provider error",
+      body: "Provider rejected the request",
+    }),
+  );
+  expect(projection.messages[1]?.parts.some((part) => part.kind === "usage")).toBe(
+    false,
+  );
+});
+
+test("legacy transcript normalization hides usage rows and routine notices without touching prose", () => {
+  const routineTitles = [
+    "Model changed",
+    "Fallback model selected",
+    "Service tier changed",
+    "Thinking level changed",
+    "Time-traveling rules injected",
+    "Time-traveling rules triggered",
+  ];
+  const parts: MobilePart[] = [
+    {
+      kind: "text",
+      text: "Served by is ordinary content; thinking level changed in this sentence.",
+    },
+    {
+      kind: "thinking",
+      text: "Reasoning keeps ordinary references to served-by routing and thinking level.",
+    },
+    ...routineTitles.map(
+      (title): MobilePart => ({
+        kind: "notice",
+        tone: "info",
+        title,
+        body: "routine metadata",
+      }),
+    ),
+    {
+      kind: "usage",
+      text: "served by p/m · tier priority · role default · background routing · in 12 · cache read 3 · $0.1000",
+    },
+    {
+      kind: "usage",
+      text: "served by p/m · tier priority · role default",
+    },
+    {
+      kind: "notice",
+      tone: "error",
+      title: "Provider error",
+      body: "The provider request failed.",
+    },
+  ];
+
+  expect(normalizeTranscriptParts(parts)).toEqual([
+    parts[0],
+    parts[1],
+    parts.at(-1),
+  ]);
+  expect(isRoutineNotice("Model changed")).toBe(true);
+  expect(isRoutineNotice("Time-traveling rules triggered")).toBe(true);
+  expect(isRoutineNotice("The transcript says Model changed")).toBe(false);
 });
 
 test("history pages recover the oldest visible messages without skipping a boundary", () => {

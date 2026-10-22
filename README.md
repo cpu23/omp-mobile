@@ -53,11 +53,14 @@ local; share only the Mobile gateway over HTTPS.
 ### Unreleased
 
 - Render rule/system-violation notices, provider failures, retry/fallback/compaction state, goals, custom messages,
-  execution output, summaries, file mentions and message usage.
+  execution output, summaries and file mentions.
 - Surface pending `ask`, approvals and terminal-owned dialogs with live phone controls; render native plan reviews
   with refinement feedback and execution-tier choices when supplied by OMP.
 - Display images, Mermaid, sanitized SVG, math and table-derived charts; attach images from the composer.
 - Load older history and recover full output/images instead of silently truncating; notify when a session needs action.
+- Load full message content and images automatically, and simplify transcript cards: hide role/time headers and routine
+  served-by/model-routing/default-role metadata, thinking-level-change notices, and time-traveling rule trigger/injection
+  notices and per-message token/cache/cost rows while retaining important failures and tool output.
 
 See [UI coverage and host limits](docs/guide.md#transcript-and-interaction-coverage) before upgrading live sessions.
 

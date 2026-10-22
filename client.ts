@@ -34,6 +34,7 @@ import type {
   MobilePart,
   MobileRuntime,
 } from "./parity-types";
+import { isRoutineNotice, normalizeTranscriptParts } from "./parity-types";
 import { appendRichContent } from "./rich-content";
 import {
   askAnswerFromDraft,
@@ -280,6 +281,7 @@ type HistoryCache = {
 const olderHistoryBySlot = new Map<SlotId, HistoryCache>();
 const fullMessageCache = new Map<string, MobileMessage>();
 const fullMessageRequests = new Set<string>();
+const fullMessageFailures = new Set<string>();
 let attachedImages: MobileImage[] = [];
 const attachmentsBySlot = new Map<SlotId, MobileImage[]>();
 let terminalControlVisible = false;
@@ -2505,7 +2507,7 @@ function projectParts(
             parts.push({
               kind: "image",
               image,
-              label: image.data ? "Image" : "Image — load full message",
+              label: "Image",
             });
           } else {
             parts.push({
@@ -2554,7 +2556,7 @@ function projectParts(
         parts.push({
           kind: "image",
           image,
-          label: image.data ? "Image" : "Image — load full message",
+          label: "Image",
         });
       } else {
         parts.push({
@@ -3059,7 +3061,6 @@ type PreparedTranscriptMessage = {
   msgKey: string;
   entryId?: string;
   role: string;
-  timestamp: string | null;
   liveMessage: boolean;
   needsFull: boolean;
   parts: ChatPart[];
@@ -3406,14 +3407,10 @@ function appendMobileImage(
     open.addEventListener("click", () => openImageViewer(image, label));
     figure.append(open);
   } else {
-    const load = document.createElement("button");
-    load.type = "button";
-    load.className = "ghost-btn image-load";
-    load.textContent = "Load full image";
-    load.addEventListener("click", () => {
-      void loadFullMessage(image.sourceId || entryId);
-    });
-    figure.append(load);
+    const loading = document.createElement("span");
+    loading.textContent = "Loading image…";
+    figure.append(loading);
+    void loadFullMessage(image.sourceId || entryId);
   }
   const caption = document.createElement("figcaption");
   caption.textContent = label;
@@ -3445,6 +3442,8 @@ function clearFullMessagesForSlot(slotId: SlotId): void {
     if (key.startsWith(prefix)) fullMessageCache.delete(key);
   for (const key of fullMessageRequests)
     if (key.startsWith(prefix)) fullMessageRequests.delete(key);
+  for (const key of fullMessageFailures)
+    if (key.startsWith(prefix)) fullMessageFailures.delete(key);
 }
 
 async function loadFullMessage(entryId: string): Promise<void> {
@@ -3452,7 +3451,7 @@ async function loadFullMessage(entryId: string): Promise<void> {
   const generation = activeState?.generation;
   if (!slotId || !generation) return;
   const key = fullMessageKey(slotId, generation, entryId);
-  if (fullMessageCache.has(key) || fullMessageRequests.has(key)) return;
+  if (fullMessageCache.has(key) || fullMessageRequests.has(key) || fullMessageFailures.has(key)) return;
   fullMessageRequests.add(key);
   try {
     const path =
@@ -3545,6 +3544,7 @@ async function loadFullMessage(entryId: string): Promise<void> {
     fullMessageCache.set(key, message);
     renderActive();
   } catch (error: unknown) {
+    fullMessageFailures.add(key);
     showToast(
       hasAuth(error) ? "Access token rejected" : `Could not load full message: ${errorMessage(error)}`,
       true,
@@ -3703,7 +3703,6 @@ function sameTranscriptSnapshot(
     if (
       left.msgKey !== right.msgKey ||
       left.entryId !== right.entryId ||
-      left.timestamp !== right.timestamp ||
       left.liveMessage !== right.liveMessage ||
       left.needsFull !== right.needsFull ||
       left.parts.length !== right.parts.length ||
@@ -3785,9 +3784,9 @@ function renderMessages(
   const prepared: PreparedTranscriptMessage[] = [];
   // Compare rendered inputs; renderActive updates theme and status chrome separately.
   messages.forEach((message, messageIndex) => {
-    const parts = Array.isArray(message.parts)
-      ? message.parts
-      : projectParts(message, toolCalls);
+    const parts = normalizeTranscriptParts(
+      Array.isArray(message.parts) ? message.parts : projectParts(message, toolCalls),
+    );
     const actions = (message.actions ?? []).map((action) => ({
       label: action.label || action.title || "Open",
       url: typeof action.url === "string" ? action.url : undefined,
@@ -3812,7 +3811,6 @@ function renderMessages(
         `msg-${messageIndex}`,
       entryId: asString(message.entryId) ?? asString(message.id),
       role,
-      timestamp: asString(message.timestamp) ?? null,
       liveMessage: active && messageIndex === messages.length - 1,
       needsFull,
       parts,
@@ -3902,30 +3900,10 @@ function renderMessages(
   }
 
   prepared.forEach(
-    ({ msgKey, entryId, role, timestamp, liveMessage, needsFull, parts, actions }) => {
+    ({ msgKey, entryId, role, liveMessage, needsFull, parts, actions }) => {
       const article = document.createElement("article");
       article.className = `message ${role}`;
       article.dataset.msgKey = msgKey;
-      if (timestamp || !["assistant", "user"].includes(role)) {
-        const head = document.createElement("div");
-        head.className = "message-head";
-        const roleLabel = document.createElement("span");
-        roleLabel.textContent = role;
-        head.append(roleLabel);
-        if (timestamp) {
-          const time = document.createElement("time");
-          time.dateTime = timestamp;
-          const parsed = Date.parse(timestamp);
-          time.textContent = Number.isFinite(parsed)
-            ? new Date(parsed).toLocaleTimeString([], {
-                hour: "numeric",
-                minute: "2-digit",
-              })
-            : timestamp;
-          head.append(time);
-        }
-        article.append(head);
-      }
       parts.forEach((part, partIndex) => {
       if (!part || typeof part !== "object") return;
       if (part.kind === "text") {
@@ -4157,11 +4135,6 @@ function renderMessages(
           files.append(item);
         }
         article.append(files);
-      } else if (part.kind === "usage") {
-        const usage = document.createElement("section");
-        usage.className = "part part-usage";
-        usage.textContent = part.text;
-        article.append(usage);
       } else {
         const unsupported = document.createElement("section");
         unsupported.className = "part part-unsupported";
@@ -4184,20 +4157,7 @@ function renderMessages(
             "Full content cannot be fetched because this message has no history identifier.";
           article.append(note);
         } else if (activeState?.generation) {
-          const key = fullMessageKey(activeId, activeState.generation, entryId);
-          if (!fullMessageCache.has(key)) {
-            const load = document.createElement("button");
-            load.type = "button";
-            load.className = "ghost-btn full-message-load";
-            load.disabled = fullMessageRequests.has(key);
-            load.textContent = load.disabled
-              ? "Loading full message…"
-              : "Load full message and images";
-            load.addEventListener("click", () => {
-              void loadFullMessage(entryId);
-            });
-            article.append(load);
-          }
+          void loadFullMessage(entryId);
         }
       }
 
@@ -4723,6 +4683,7 @@ function renderRuntime(state: ClientState | null): void {
   if (!state) return;
 
   for (const notice of runtime?.notices ?? []) {
+    if (isRoutineNotice(notice.title)) continue;
     const card = document.createElement("section");
     card.className = `runtime-card runtime-notice tone-${notice.tone}`;
     const title = document.createElement("strong");

@@ -72,3 +72,32 @@ export type MobileInteractionAction = {
   answers?: MobileAskSubmissionAnswer[];
   role?: string;
 };
+
+const ROUTINE_NOTICE_TITLES: Record<string, true> = {
+  "Model changed": true,
+  "Fallback model selected": true,
+  "Service tier changed": true,
+  "Thinking level changed": true,
+  "Time-traveling rules injected": true,
+  "Time-traveling rules triggered": true,
+};
+
+/** Exact structured notice titles that are routine transcript/runtime metadata. */
+export function isRoutineNotice(title: string): boolean {
+  return ROUTINE_NOTICE_TITLES[title] === true;
+}
+
+/** Removes structured metadata and per-message usage rows without inspecting prose. */
+export function normalizeTranscriptParts(parts: MobilePart[]): MobilePart[] {
+  let normalized: MobilePart[] | undefined;
+  for (let index = 0; index < parts.length; index += 1) {
+    const part = parts[index];
+    if (!part) continue;
+    if (part.kind === "usage" || (part.kind === "notice" && isRoutineNotice(part.title))) {
+      normalized ??= parts.slice(0, index);
+      continue;
+    }
+    normalized?.push(part);
+  }
+  return normalized ?? parts;
+}
