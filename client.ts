@@ -5469,10 +5469,10 @@ function renderActive(): void {
       range.value = String(idx);
       popover.style.setProperty(
         "--effort-fill",
-        `calc(${fraction * 100}% + ${32 * (1 - fraction)}px)`,
+        `calc(${fraction * 100}% + ${1 - fraction} * var(--effort-cap-size))`,
       );
-      range.setAttribute("aria-valuetext", val);
-      currentLabel.textContent = val;
+      range.setAttribute("aria-valuetext", effortDisplayName(val));
+      currentLabel.textContent = effortDisplayName(val);
     }
   }
 
@@ -6268,6 +6268,20 @@ function openModelModal(): void {
     selected?.scrollIntoView({ block: "nearest" });
   }, 20);
 }
+const EFFORT_DISPLAY_NAMES: Record<string, string> = {
+  off: "Off",
+  minimal: "Minimal",
+  low: "Low",
+  medium: "Medium",
+  high: "High",
+  xhigh: "Extra High",
+  max: "Max",
+};
+
+function effortDisplayName(value: string): string {
+  return EFFORT_DISPLAY_NAMES[value] ?? value;
+}
+
 let effortPopoverDocClickListener: ((event: MouseEvent) => void) | null = null;
 // Set while the popover slider is under an active pointer; the state re-sync
 // in renderActive must not clobber the value the finger is picking.
@@ -6286,6 +6300,7 @@ function closeEffortPopover(): void {
     effortPopoverDocClickListener = null;
   }
   const popover = document.querySelector("#effort-popover");
+  document.querySelector("#effort-backdrop")?.remove();
   if (popover) popover.remove();
 }
 function toggleEffortPopover(): void {
@@ -6313,25 +6328,35 @@ function toggleEffortPopover(): void {
   const popover = document.createElement("div");
   popover.id = "effort-popover";
   popover.className = "effort-popover";
-  popover.innerHTML = `<span class="effort-current" id="effort-current">${esc(initialValue)}</span><div class="effort-track"><div class="effort-rail" aria-hidden="true"><div class="effort-stops">${values.map(() => "<span></span>").join("")}</div><div class="effort-fill"></div></div><input id="effort-range" type="range" class="effort-range" min="0" max="${values.length - 1}" step="1" value="${index}" aria-label="Reasoning effort" aria-valuetext="${esc(initialValue)}"></div>`;
+  popover.innerHTML = `<p class="effort-heading"><span class="effort-current" id="effort-current">${esc(effortDisplayName(initialValue))}</span> effort</p><div class="effort-track"><div class="effort-rail" aria-hidden="true"><div class="effort-stops">${values.map(() => "<span></span>").join("")}</div><div class="effort-fill"></div></div><input id="effort-range" type="range" class="effort-range" min="0" max="${values.length - 1}" step="1" value="${index}" aria-label="Reasoning effort" aria-valuetext="${esc(effortDisplayName(initialValue))}"></div>`;
 
+  const backdrop = document.createElement("button");
+  backdrop.type = "button";
+  backdrop.id = "effort-backdrop";
+  backdrop.className = "effort-backdrop";
+  backdrop.setAttribute("aria-label", "Close thinking slider");
+  backdrop.addEventListener("pointerdown", (event) => event.preventDefault());
+  backdrop.addEventListener("click", closeEffortPopover);
   const dock = document.querySelector(".composer-dock");
   if (dock) {
     dock.prepend(popover);
+    dock.prepend(backdrop);
   } else {
     document.body.append(popover);
+    document.body.append(backdrop);
   }
 
   const range = requiredElement<HTMLInputElement>("#effort-range", popover);
+  const thumbSize = Number.parseFloat(getComputedStyle(range).getPropertyValue("--effort-thumb-size"));
   const currentLabel = requiredElement<HTMLElement>("#effort-current", popover);
   const updateRange = (): void => {
     const fraction =
       values.length > 1 ? Number(range.value) / (values.length - 1) : 0;
     popover.style.setProperty(
       "--effort-fill",
-      `calc(${fraction * 100}% + ${32 * (1 - fraction)}px)`,
+      `calc(${fraction * 100}% + ${1 - fraction} * var(--effort-cap-size))`,
     );
-    range.setAttribute("aria-valuetext", values[Number(range.value)] ?? "");
+    range.setAttribute("aria-valuetext", effortDisplayName(values[Number(range.value)] ?? ""));
   };
   updateRange();
 
@@ -6339,7 +6364,7 @@ function toggleEffortPopover(): void {
     updateRange();
     const val = values[Number(range.value)];
     if (val !== undefined) {
-      currentLabel.textContent = val;
+      currentLabel.textContent = effortDisplayName(val);
     }
   };
 
@@ -6360,11 +6385,10 @@ function toggleEffortPopover(): void {
    */
   const sliderIndexFor = (clientX: number): number => {
     const rect = range.getBoundingClientRect();
-    const thumb = 24; // .effort-range thumb width; half is the inset per side
-    const usable = Math.max(1, rect.width - thumb);
+    const usable = Math.max(1, rect.width - thumbSize);
     const fraction = Math.min(
       1,
-      Math.max(0, (clientX - rect.left - thumb / 2) / usable),
+      Math.max(0, (clientX - rect.left - thumbSize / 2) / usable),
     );
     const min = Number(range.min) || 0;
     const max = Number(range.max) || 0;
@@ -6386,13 +6410,13 @@ function toggleEffortPopover(): void {
   };
 
   /**
-   * Canceled native slider drags also cancel the focus transfer, so while the
-   * composer is focused the slider is driven from pointer events instead: the
-   * textarea (and the software keyboard) never blurs.
+   * Drive pointer drags explicitly so polling cannot move the selected stop.
+   * Keep composer focus (and its software keyboard); otherwise focus the range
+   * for subsequent keyboard adjustments.
    */
   range.addEventListener("pointerdown", (event) => {
-    if (!composerFocused()) return;
     event.preventDefault();
+    if (!composerFocused()) range.focus({ preventScroll: true });
     activePointer = event.pointerId;
     effortSliderDragging = true;
     try {
@@ -6423,7 +6447,7 @@ function toggleEffortPopover(): void {
   effortPopoverDocClickListener = (event: MouseEvent) => {
     const target = event.target as Node | null;
     const effortBtn = document.querySelector("#effort-open");
-    if (popover && !popover.contains(target) && !effortBtn?.contains(target)) {
+    if (!popover.querySelector(".effort-track")?.contains(target) && !effortBtn?.contains(target)) {
       closeEffortPopover();
     }
   };
