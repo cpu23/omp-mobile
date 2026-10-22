@@ -3468,6 +3468,7 @@ export default function registerMobileRemote(pi: ExtensionAPI): void {
   pi.on("agent_start", (_event, ctx) => observeAgentStart(ctx));
   pi.on("agent_end", (event, ctx) => {
     if ("isTerminal" in event && event.isTerminal === false) return;
+    if (event.willContinue || event.awaitingAsyncWork) return;
     observeAgentEnd(ctx);
   });
   pi.on("auto_retry_start", (event, ctx) => {
