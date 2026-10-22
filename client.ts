@@ -34,7 +34,8 @@ import type {
   MobilePart,
   MobileRuntime,
 } from "./parity-types";
-import { isRoutineNotice, normalizeTranscriptParts } from "./parity-types";
+import { normalizeTranscriptParts } from "./parity-types";
+import { integrateRuntimeEvents } from "./runtime-events";
 import { appendRichContent } from "./rich-content";
 import {
   askAnswerFromDraft,
@@ -3597,13 +3598,13 @@ function transcriptMessagesFor(
     seen.add(id);
     return true;
   });
-  return messages.map((message) => {
+  return integrateRuntimeEvents(messages.map((message) => {
     const entryId = asString(message.entryId) ?? asString(message.id) ?? "";
     const full = fullMessageCache.get(
       fullMessageKey(slotId, state.generation, entryId),
     );
     return full ? ({ ...message, ...full } as ClientMessage) : message;
-  });
+  }), state.runtime);
 }
 
 async function loadOlderHistory(
@@ -3785,6 +3786,9 @@ function renderMessages(
       }
     }
   }
+  const lastConversationIndex = messages.findLastIndex(
+    (message) => !asString(message.entryId)?.startsWith("runtime:"),
+  );
   const prepared: PreparedTranscriptMessage[] = [];
   // Compare rendered inputs; renderActive updates theme and status chrome separately.
   messages.forEach((message, messageIndex) => {
@@ -3815,7 +3819,7 @@ function renderMessages(
         `msg-${messageIndex}`,
       entryId: asString(message.entryId) ?? asString(message.id),
       role,
-      liveMessage: active && messageIndex === messages.length - 1,
+      liveMessage: role === "status" || (active && messageIndex === lastConversationIndex),
       needsFull,
       parts,
       actions,
@@ -3983,9 +3987,9 @@ function renderMessages(
         });
         const summary = document.createElement("summary");
         summary.className = "part-tool-summary";
-        let line = part.summary
-          ? `→ ${part.name}(${part.summary})`
-          : `→ ${part.name}()`;
+        let line = part.format === "rich"
+          ? `→ ${part.name}`
+          : part.summary ? `→ ${part.name}(${part.summary})` : `→ ${part.name}()`;
         if (taskAgents.length > 0) {
           const running = taskAgents.filter(
             (agent) => agent.status === "running" || agent.status === "pending",
@@ -3997,7 +4001,7 @@ function renderMessages(
           line = line.slice(0, 87) + "…";
         }
         const live =
-          (liveMessage && part.output === undefined) ||
+          (liveMessage && (role === "status" || part.output === undefined)) ||
           taskAgents.some(
             (agent) => agent.status === "running" || agent.status === "pending",
           );
@@ -4022,8 +4026,13 @@ function renderMessages(
           details.append(taskBody);
         }
 
-        appendStructuredDetails(details, "Arguments and details", part.details);
-        if (part.output != null && part.output !== "") {
+        appendStructuredDetails(details, part.format === "rich" ? "Event details" : "Arguments and details", part.details);
+        if (part.format === "rich" && part.output) {
+          const body = document.createElement("div");
+          body.className = "part-event-body";
+          appendFormatted(body, part.output);
+          details.append(body);
+        } else if (part.output != null && part.output !== "") {
           const rawOut = part.output;
           const diffOutput =
             /^(?:diff --git |@@ |--- |\+\+\+ )/m.test(rawOut);
@@ -4042,48 +4051,6 @@ function renderMessages(
           part.label || "Image",
           msgKey,
         );
-      } else if (part.kind === "notice") {
-        const notice = document.createElement("section");
-        notice.className = `part part-notice tone-${part.tone}`;
-        const title = document.createElement("strong");
-        title.textContent = part.title;
-        notice.append(title);
-        if (part.body) {
-          const body = document.createElement("div");
-          body.className = "part-notice-body";
-          appendFormatted(body, part.body);
-          notice.append(body);
-        }
-        article.append(notice);
-      } else if (part.kind === "summary") {
-        const summary = document.createElement("section");
-        summary.className = "part part-summary";
-        const heading = document.createElement("h3");
-        heading.textContent = part.title;
-        summary.append(heading);
-        if (part.tokensBefore !== undefined) {
-          const tokens = document.createElement("span");
-          tokens.className = "part-summary-tokens";
-          tokens.textContent = `${formatActivityNumber(part.tokensBefore)} tokens before compaction`;
-          summary.append(tokens);
-        }
-        const body = document.createElement("div");
-        body.className = "part-summary-text";
-        appendFormatted(body, part.text);
-        summary.append(body);
-        article.append(summary);
-      } else if (part.kind === "custom") {
-        const custom = document.createElement("section");
-        custom.className = "part part-custom";
-        const heading = document.createElement("h3");
-        heading.textContent = part.title;
-        custom.append(heading);
-        const body = document.createElement("div");
-        body.className = "part-custom-text";
-        appendFormatted(body, part.text);
-        custom.append(body);
-        appendStructuredDetails(custom, "Details", part.details);
-        article.append(custom);
       } else if (part.kind === "execution") {
         const execution = document.createElement("section");
         execution.className = "part part-execution";
@@ -4686,65 +4653,6 @@ function renderRuntime(state: ClientState | null): void {
   area.classList.toggle("hidden", !state);
   if (!state) return;
 
-  for (const notice of runtime?.notices ?? []) {
-    if (isRoutineNotice(notice.title)) continue;
-    const card = document.createElement("section");
-    card.className = `runtime-card runtime-notice tone-${notice.tone}`;
-    const title = document.createElement("strong");
-    title.textContent = notice.title;
-    card.append(title);
-    if (notice.body) {
-      const body = document.createElement("div");
-      body.className = "runtime-card-body";
-      appendFormatted(body, notice.body);
-      card.append(body);
-    }
-    const timestamp = document.createElement("time");
-    const date = new Date(notice.timestamp);
-    if (Number.isFinite(date.getTime())) {
-      timestamp.dateTime = date.toISOString();
-      timestamp.textContent = date.toLocaleTimeString([], {
-        hour: "numeric",
-        minute: "2-digit",
-      });
-    } else {
-      timestamp.textContent = String(notice.timestamp);
-    }
-    card.append(timestamp);
-    area.append(card);
-  }
-  if (runtime?.status?.active) {
-    const status = document.createElement("section");
-    status.className = `runtime-card runtime-status status-${runtime.status.kind}`;
-    const title = document.createElement("strong");
-    title.textContent = runtime.status.label;
-    status.append(title);
-    if (runtime.status.detail) {
-      const detail = document.createElement("div");
-      detail.className = "runtime-card-body";
-      appendFormatted(detail, runtime.status.detail);
-      status.append(detail);
-    }
-    area.append(status);
-  }
-  if (runtime?.goal) {
-    const goal = document.createElement("section");
-    goal.className = "runtime-card runtime-goal";
-    const heading = document.createElement("strong");
-    heading.textContent = "Goal";
-    goal.append(heading);
-    const text = document.createElement("div");
-    text.className = "runtime-card-body";
-    appendFormatted(text, runtime.goal.text);
-    goal.append(text);
-    if (runtime.goal.detail) {
-      const detail = document.createElement("div");
-      detail.className = "runtime-card-detail";
-      appendFormatted(detail, runtime.goal.detail);
-      goal.append(detail);
-    }
-    area.append(goal);
-  }
   if (!interaction) return;
 
   const card = document.createElement("section");

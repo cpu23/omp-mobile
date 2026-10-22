@@ -1498,11 +1498,7 @@ export function transcript(
     if (
       type === "compaction" ||
       type === "branch_summary" ||
-      type === "reset_boundary" ||
-      type === "mode_change" ||
-      type === "title_change" ||
-      type === "label" ||
-      type === "credential_pin"
+      type === "reset_boundary"
     )
       visible.push({ item, index, entryId, timestamp });
     if (type === "custom_message" && item.display === true)
@@ -2084,39 +2080,8 @@ export function transcript(
             : {}),
         });
       }
-    } else {
-      const notice = (
-        title: string,
-        body?: string,
-        tone: "info" | "warning" | "error" | "success" = "info",
-      ): void => {
-        parts.push({
-          kind: "notice",
-          tone,
-          title: projectLabel(title, 200, entryId),
-          ...(body ? { body: projectText(body, 1200, entryId) } : {}),
-        });
-      };
-      switch (type) {
-        case "reset_boundary":
-          notice("Conversation reset");
-          break;
-        case "mode_change":
-          notice("Mode changed", asString(item.mode));
-          break;
-        case "title_change":
-          notice("Session title changed", asString(item.title));
-          break;
-        case "label":
-          notice("Session bookmark", asString(item.label) ?? "Bookmark removed");
-          break;
-        case "credential_pin":
-          notice(
-            "Provider account pinned",
-            asString(item.provider),
-          );
-          break;
-      }
+    } else if (type === "reset_boundary") {
+      parts.push({ kind: "notice", tone: "info", title: "Conversation reset" });
     }
     if (parts.length === 0) return undefined;
     return projectMessage(role, entryId, timestamp, parts);

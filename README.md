@@ -72,6 +72,10 @@ local; share only the Mobile gateway over HTTPS.
 - Keep the activity drawer narrow at 90% when collapsed and full composer width when expanded, with a continuous
   rounded top and no bottleneck.
 - Render background `async-result` messages as collapsed tool-style result cards; expand to read the complete output and job details.
+- Integrate passive runtime notices, compaction summaries, retries/fallbacks, goals and custom events into the chat
+  stream as compact expandable rows, retaining rich output and error styling. Keep actionable dialogs prominent.
+- Hide title changes, provider pins, bookmarks, mode changes and duplicate compaction-start notices; show unread
+  session completion as a small sidebar dot rather than a numbered badge.
 
 See [UI coverage and host limits](docs/guide.md#transcript-and-interaction-coverage) before upgrading live sessions.
 
