@@ -1606,7 +1606,7 @@ pre,
   border: 1px solid var(--composer-border, var(--line));
   border-top: 0;
   background: var(--composer-bg);
-  border-radius: 12px;
+  border-radius: 22px;
   padding-top: 3px;
   box-shadow: var(--shadow);
   transition: border-color 0.16s ease;
@@ -1696,7 +1696,7 @@ pre,
   /* Tracks the composer border box so the arcs line up with its corners. */
   inset: 0 -1px -1px -1px;
   border: 3px solid transparent;
-  border-radius: 12px;
+  border-radius: inherit;
   pointer-events: none;
   transition: --ctx-fill-width 0.25s ease;
   /* Paint the top edge itself: the ring follows the box radius, so the fill
