@@ -72,3 +72,70 @@ export type MobileInteractionAction = {
   answers?: MobileAskSubmissionAnswer[];
   role?: string;
 };
+
+const ROUTINE_NOTICE_TITLES: Record<string, true> = {
+  "Model changed": true,
+  "Fallback model selected": true,
+  "Service tier changed": true,
+  "Thinking level changed": true,
+  "Time-traveling rules injected": true,
+  "Time-traveling rules triggered": true,
+};
+
+/** Exact structured notice titles that are routine transcript/runtime metadata. */
+export function isRoutineNotice(title: string): boolean {
+  return ROUTINE_NOTICE_TITLES[title] === true;
+}
+
+function usageMetricStart(text: string, start: number, end: number): boolean {
+  if (
+    (text.startsWith("in ", start) && /\p{N}/u.test(text[start + 3] ?? "")) ||
+    (text.startsWith("out ", start) && /\p{N}/u.test(text[start + 4] ?? "")) ||
+    (text.startsWith("cache read ", start) &&
+      /\p{N}/u.test(text[start + 11] ?? "")) ||
+    (text.startsWith("cache write ", start) &&
+      /\p{N}/u.test(text[start + 12] ?? ""))
+  )
+    return true;
+  return /^\$-?\d+\.\d{4}$/.test(text.slice(start, end));
+}
+
+function visibleUsageText(text: string): string | undefined {
+  let start = 0;
+  while (start < text.length) {
+    const separator = text.indexOf(" · ", start);
+    const end = separator < 0 ? text.length : separator;
+    if (usageMetricStart(text, start, end))
+      return start === 0 ? text : text.slice(start);
+    if (separator < 0) break;
+    start = separator + 3;
+  }
+  return undefined;
+}
+
+/** Removes old structured routing notices/usage labels without inspecting prose. */
+export function normalizeTranscriptParts(parts: MobilePart[]): MobilePart[] {
+  let normalized: MobilePart[] | undefined;
+  for (let index = 0; index < parts.length; index += 1) {
+    const part = parts[index];
+    if (!part) continue;
+    if (part.kind === "notice" && isRoutineNotice(part.title)) {
+      normalized ??= parts.slice(0, index);
+      continue;
+    }
+    if (part.kind === "usage") {
+      const text = visibleUsageText(part.text);
+      if (text === undefined) {
+        normalized ??= parts.slice(0, index);
+        continue;
+      }
+      if (text !== part.text) {
+        normalized ??= parts.slice(0, index);
+        normalized.push({ ...part, text });
+        continue;
+      }
+    }
+    normalized?.push(part);
+  }
+  return normalized ?? parts;
+}

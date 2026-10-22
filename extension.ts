@@ -9,16 +9,17 @@ import {
 import { join } from "node:path";
 import type { ExtensionAPI, ExtensionContext } from "@oh-my-pi/pi-coding-agent";
 import { getSessionAccentHex, type SessionAccentInputs } from "./session-accent";
-import type {
-  MobileHistory,
-  MobileImage,
-  MobileInteractionAction,
-  MobileMessage,
-  MobileNotice,
-  MobilePart,
-  MobileRuntime,
-  MobileAskDisplay,
-  MobileAskSubmissionAnswer,
+import {
+  isRoutineNotice,
+  type MobileHistory,
+  type MobileImage,
+  type MobileInteractionAction,
+  type MobileMessage,
+  type MobileNotice,
+  type MobilePart,
+  type MobileRuntime,
+  type MobileAskDisplay,
+  type MobileAskSubmissionAnswer,
 } from "./parity-types";
 import { createInteractionBridge } from "./interactions";
 import { registerMobileAskTool } from "./ask-tool";
@@ -1483,16 +1484,23 @@ export function transcript(
         visible.push({ item, index, entryId, timestamp });
       continue;
     }
+    if (type === "model_usage") {
+      const errorMessage = asString(item.errorMessage);
+      if (
+        usageText(item) !== undefined ||
+        item.stopReason === "error" ||
+        (item.stopReason === "aborted" &&
+          errorMessage !== "Interrupted by user" &&
+          errorMessage !== "__omp.silent_abort__")
+      )
+        visible.push({ item, index, entryId, timestamp });
+      continue;
+    }
     if (
       type === "compaction" ||
       type === "branch_summary" ||
       type === "reset_boundary" ||
-      type === "model_usage" ||
-      type === "model_change" ||
-      type === "service_tier_change" ||
-      type === "thinking_level_change" ||
       type === "mode_change" ||
-      type === "ttsr_injection" ||
       type === "title_change" ||
       type === "label" ||
       type === "credential_pin"
@@ -1745,17 +1753,6 @@ export function transcript(
         ? (value.usage as Record<string, unknown>)
         : value;
     const labels: string[] = [];
-    const provider =
-      asString(value.upstreamProvider) ?? asString(value.provider);
-    const model = asString(value.upstreamModel) ?? asString(value.model);
-    if (provider || model)
-      labels.push(`served by ${[provider, model].filter(Boolean).join("/")}`);
-    const serviceTier = asString(value.serviceTier);
-    if (serviceTier) labels.push(`tier ${serviceTier}`);
-    const role = asString(value.role);
-    if (role && role !== "default") labels.push(`role ${role}`);
-    const purpose = asString(value.purpose);
-    if (purpose) labels.push(purpose);
     for (const [key, label] of [
       ["input", "in"],
       ["output", "out"],
@@ -2095,12 +2092,11 @@ export function transcript(
       });
     } else if (type === "model_usage") {
       const usage = usageText(item);
-      parts.push({
-        kind: "usage",
-        text: usage
-          ? projectText(usage, MAX_TEXT_CHARS, entryId)
-          : "Usage marker with no token details",
-      });
+      if (usage)
+        parts.push({
+          kind: "usage",
+          text: projectText(usage, MAX_TEXT_CHARS, entryId),
+        });
       const errorMessage = asString(item.errorMessage);
       if (item.stopReason === "error") {
         parts.push({
@@ -2144,47 +2140,9 @@ export function transcript(
         case "reset_boundary":
           notice("Conversation reset");
           break;
-        case "model_change": {
-          const model = asString(item.model);
-          const roleName = asString(item.role);
-          const fallback = item.resolvedModelIsFallback === true;
-          notice(
-            fallback ? "Fallback model selected" : "Model changed",
-            [model, roleName && roleName !== "default" ? `role ${roleName}` : ""]
-              .filter(Boolean)
-              .join(" · "),
-          );
-          break;
-        }
-        case "service_tier_change":
-          notice(
-            "Service tier changed",
-            item.serviceTier === null
-              ? "Default service tier"
-              : asString(item.serviceTier),
-          );
-          break;
-        case "thinking_level_change":
-          notice(
-            "Thinking level changed",
-            asString(item.thinkingLevel) ?? "Default",
-          );
-          break;
         case "mode_change":
           notice("Mode changed", asString(item.mode));
           break;
-        case "ttsr_injection": {
-          const names = Array.isArray(item.injectedRules)
-            ? item.injectedRules.filter(
-                (name): name is string => typeof name === "string",
-              )
-            : [];
-          notice(
-            "Time-traveling rules injected",
-            names.length > 0 ? names.join(", ") : undefined,
-          );
-          break;
-        }
         case "title_change":
           notice("Session title changed", asString(item.title));
           break;
@@ -2399,6 +2357,7 @@ export default function registerMobileRemote(pi: ExtensionAPI): void {
     title: string,
     body?: string,
   ): void {
+    if (isRoutineNotice(title)) return;
     runtimeNotices.push({
       id: `${generation}:notice:${++runtimeNoticeSequence}`,
       tone,

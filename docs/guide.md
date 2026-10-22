@@ -89,9 +89,11 @@ Opening swipes also leave controls, code blocks and overflowing horizontal scrol
 ## Transcript and interaction coverage
 
 The structured transcript includes rule/system-violation notices, visible custom messages, provider errors and aborted
-responses, compaction and branch summaries, shell/Python executions, tool output, file mentions and usage/model
-metadata. Hidden custom messages and developer/internal guidance remain hidden. Runtime cards show exposed retry,
-model-fallback, compaction, goal and reminder state alongside pending interactions.
+responses, compaction and branch summaries, shell/Python executions, tool output, file mentions and token/cost usage.
+Routine served-by/model-routing/default-role metadata, thinking-level-change notices and time-traveling rule
+trigger/injection notices, plus role/time headers, are omitted; hidden custom messages and developer/internal guidance
+remain hidden. Runtime cards show exposed retry, model-fallback, compaction, goal and reminder state alongside pending
+interactions.
 
 Plan review uses OMP's public resolver: read the plan, select an execution tier when offered, then explicitly choose
 execute, compact, keep context, refine with feedback, or save and quit. Choices and tiers are validated against the
