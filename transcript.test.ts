@@ -186,6 +186,20 @@ test("legacy transcript normalization hides usage rows and routine notices witho
   expect(isRoutineNotice("The transcript says Model changed")).toBe(false);
 });
 
+test("background completions use tool disclosure without losing output or changing other custom messages", () => {
+  const text = "<system-notice>\nBackground job build completed.\nBuild failed: missing dependency.\n</system-notice>";
+  const details = { jobs: [{ jobId: "build-1", type: "bash", label: "bun run build" }] };
+  const custom: MobilePart = { kind: "custom", title: "extension-result", text: "Important custom content" };
+  const prose: MobilePart = { kind: "text", text: "The async-result message was received." };
+  const normalized = normalizeTranscriptParts([
+    { kind: "custom", title: "async-result", text, details },
+    custom,
+    prose,
+  ]);
+  expect(normalized[0]).toMatchObject({ kind: "tool", output: text, details });
+  expect(normalized.slice(1)).toEqual([custom, prose]);
+});
+
 test("history pages recover the oldest visible messages without skipping a boundary", () => {
   const branch = Array.from({ length: 83 }, (_, index) => ({
     type: "message", id: `message-${index}`, message: { role: "user", content: `Prompt ${index}` },

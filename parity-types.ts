@@ -87,7 +87,7 @@ export function isRoutineNotice(title: string): boolean {
   return ROUTINE_NOTICE_TITLES[title] === true;
 }
 
-/** Removes structured metadata and per-message usage rows without inspecting prose. */
+/** Normalizes transcript presentation, including legacy live-extension parts. */
 export function normalizeTranscriptParts(parts: MobilePart[]): MobilePart[] {
   let normalized: MobilePart[] | undefined;
   for (let index = 0; index < parts.length; index += 1) {
@@ -95,6 +95,18 @@ export function normalizeTranscriptParts(parts: MobilePart[]): MobilePart[] {
     if (!part) continue;
     if (part.kind === "usage" || (part.kind === "notice" && isRoutineNotice(part.title))) {
       normalized ??= parts.slice(0, index);
+      continue;
+    }
+    if (part.kind === "custom" && part.title === "async-result") {
+      normalized ??= parts.slice(0, index);
+      normalized.push({
+        kind: "tool",
+        id: `background-result-${index}`,
+        name: "Background result",
+        summary: "",
+        output: part.text,
+        ...(part.details !== undefined ? { details: part.details } : {}),
+      });
       continue;
     }
     normalized?.push(part);

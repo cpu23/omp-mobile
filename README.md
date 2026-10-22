@@ -71,6 +71,7 @@ local; share only the Mobile gateway over HTTPS.
 - Round the composer to 22px, with its context track inheriting the same corner radius.
 - Keep the activity drawer narrow at 90% when collapsed and full composer width when expanded, with a continuous
   rounded top and no bottleneck.
+- Render background `async-result` messages as collapsed tool-style result cards; expand to read the complete output and job details.
 
 See [UI coverage and host limits](docs/guide.md#transcript-and-interaction-coverage) before upgrading live sessions.
 
