@@ -4135,11 +4135,6 @@ function renderMessages(
           files.append(item);
         }
         article.append(files);
-      } else if (part.kind === "usage") {
-        const usage = document.createElement("section");
-        usage.className = "part part-usage";
-        usage.textContent = part.text;
-        article.append(usage);
       } else {
         const unsupported = document.createElement("section");
         unsupported.className = "part part-unsupported";

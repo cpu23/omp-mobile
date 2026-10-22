@@ -113,36 +113,28 @@ test("routine routing and thinking metadata is omitted without matching ordinary
 
   expect(projection.messages.map((message) => message.entryId)).toEqual([
     "assistant",
-    "usage",
     "failure",
   ]);
-  expect(projection.history.total).toBe(3);
+  expect(projection.history.total).toBe(2);
   const assistant = projection.messages[0];
   expect(assistant?.parts.find((part) => part.kind === "text")).toMatchObject({
     kind: "text",
     text: messageText,
   });
-  expect(assistant?.parts.find((part) => part.kind === "usage")).toMatchObject({
-    kind: "usage",
-    text: "in 12 · out 3 · cache read 4 · cache write 5 · $0.0123",
-  });
-  expect(projection.messages[1]?.parts).toContainEqual({
-    kind: "usage",
-    text: "in 8 · out 2",
-  });
-  expect(projection.messages[2]?.parts).toContainEqual(
+  expect(assistant?.parts.some((part) => part.kind === "usage")).toBe(false);
+  expect(projection.messages[1]?.parts).toContainEqual(
     expect.objectContaining({
       kind: "notice",
       title: "Provider error",
       body: "Provider rejected the request",
     }),
   );
-  expect(projection.messages[2]?.parts.some((part) => part.kind === "usage")).toBe(
+  expect(projection.messages[1]?.parts.some((part) => part.kind === "usage")).toBe(
     false,
   );
 });
 
-test("legacy transcript normalization removes routine notices and routing labels only", () => {
+test("legacy transcript normalization hides usage rows and routine notices without touching prose", () => {
   const routineTitles = [
     "Model changed",
     "Fallback model selected",
@@ -187,7 +179,6 @@ test("legacy transcript normalization removes routine notices and routing labels
   expect(normalizeTranscriptParts(parts)).toEqual([
     parts[0],
     parts[1],
-    { kind: "usage", text: "in 12 · cache read 3 · $0.1000" },
     parts.at(-1),
   ]);
   expect(isRoutineNotice("Model changed")).toBe(true);

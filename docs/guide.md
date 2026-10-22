@@ -89,9 +89,9 @@ Opening swipes also leave controls, code blocks and overflowing horizontal scrol
 ## Transcript and interaction coverage
 
 The structured transcript includes rule/system-violation notices, visible custom messages, provider errors and aborted
-responses, compaction and branch summaries, shell/Python executions, tool output, file mentions and token/cost usage.
-Routine served-by/model-routing/default-role metadata, thinking-level-change notices and time-traveling rule
-trigger/injection notices, plus role/time headers, are omitted; hidden custom messages and developer/internal guidance
+responses, compaction and branch summaries, shell/Python executions, tool output and file mentions.
+Routine served-by/model-routing/default-role metadata, per-message token/cache/cost rows, thinking-level-change notices
+and time-traveling rule trigger/injection notices, plus role/time headers, are omitted; hidden custom messages and developer/internal guidance
 remain hidden. Runtime cards show exposed retry, model-fallback, compaction, goal and reminder state alongside pending
 interactions.
 

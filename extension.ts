@@ -1487,7 +1487,6 @@ export function transcript(
     if (type === "model_usage") {
       const errorMessage = asString(item.errorMessage);
       if (
-        usageText(item) !== undefined ||
         item.stopReason === "error" ||
         (item.stopReason === "aborted" &&
           errorMessage !== "Interrupted by user" &&
@@ -1747,32 +1746,6 @@ export function transcript(
     return parts;
   }
 
-  function usageText(value: Record<string, unknown>): string | undefined {
-    const tokens =
-      value.usage && typeof value.usage === "object"
-        ? (value.usage as Record<string, unknown>)
-        : value;
-    const labels: string[] = [];
-    for (const [key, label] of [
-      ["input", "in"],
-      ["output", "out"],
-      ["cacheRead", "cache read"],
-      ["cacheWrite", "cache write"],
-    ] as const) {
-      const count = tokens[key];
-      if (typeof count === "number" && Number.isFinite(count))
-        labels.push(`${label} ${count.toLocaleString()}`);
-    }
-    const costValue = tokens.cost;
-    const cost =
-      costValue && typeof costValue === "object"
-        ? (costValue as Record<string, unknown>).total
-        : undefined;
-    if (typeof cost === "number" && Number.isFinite(cost))
-      labels.push(`$${cost.toFixed(4)}`);
-    return labels.length > 0 ? labels.join(" · ") : undefined;
-  }
-
   function project(entry: (typeof selected)[number]): MobileMessage | undefined {
     const { item, index, entryId, timestamp } = entry;
     const type = asString(item.type);
@@ -2025,12 +1998,6 @@ export function transcript(
               : {}),
           });
         }
-        const served = usageText(raw);
-        if (served)
-          parts.push({
-            kind: "usage",
-            text: projectText(served, MAX_TEXT_CHARS, entryId),
-          });
         if (Array.isArray(raw.reactions)) {
           for (const reaction of raw.reactions) {
             if (typeof reaction === "string" && reaction.trim())
@@ -2091,12 +2058,6 @@ export function transcript(
           : {}),
       });
     } else if (type === "model_usage") {
-      const usage = usageText(item);
-      if (usage)
-        parts.push({
-          kind: "usage",
-          text: projectText(usage, MAX_TEXT_CHARS, entryId),
-        });
       const errorMessage = asString(item.errorMessage);
       if (item.stopReason === "error") {
         parts.push({

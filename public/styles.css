@@ -2796,7 +2796,6 @@ pre,
 .part-custom,
 .part-execution,
 .part-files,
-.part-usage,
 .part-unsupported {
   min-width: 0;
   border: 1px solid var(--line);
@@ -3255,12 +3254,6 @@ pre,
   border-top: 1px solid var(--line);
 }
 
-.part-usage {
-  color: var(--muted);
-  font: 11px/1.5 var(--mono);
-  overflow-wrap: anywhere;
-}
-
 .history-controls {
   display: flex;
   flex-wrap: wrap;
@@ -3511,7 +3504,6 @@ pre,
   .part-custom,
   .part-execution,
   .part-files,
-  .part-usage,
   .part-unsupported {
     padding: 9px 10px;
   }
