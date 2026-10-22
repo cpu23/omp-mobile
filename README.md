@@ -63,7 +63,7 @@ local; share only the Mobile gateway over HTTPS.
   notices and per-message token/cache/cost rows while retaining important failures and tool output.
 - Keep the slash-command menu hidden when empty or a dialog is pending, removing the empty strip above the composer;
   shorten the composer's medium thinking-level label to `med` without changing the selected level.
-- Use a wide pill-shaped thinking slider with teal fill, visible stop markers, a large white thumb and readable
+- Use a wide pill-shaped thinking slider with session-accent fill and label, visible stop markers, a large white thumb and readable
   labels such as “Extra High effort”; pointer drags preserve composer focus and resist polling updates until release.
 
 See [UI coverage and host limits](docs/guide.md#transcript-and-interaction-coverage) before upgrading live sessions.

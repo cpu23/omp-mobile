@@ -2512,7 +2512,6 @@ pre,
 
 /* Effort Popover */
 .effort-popover {
-  --effort-slider-accent: #00bba6;
   --effort-thumb-size: 40px;
   --effort-cap-size: calc(var(--effort-thumb-size) + 8px);
   position: absolute;
@@ -2544,7 +2543,7 @@ pre,
 }
 
 .effort-current {
-  color: var(--effort-slider-accent);
+  color: var(--session-accent, var(--accent));
 }
 
 .effort-track {
@@ -2570,7 +2569,7 @@ pre,
   border-radius: 999px;
   height: 100%;
   width: var(--effort-fill, var(--effort-cap-size));
-  background: var(--effort-slider-accent);
+  background: var(--session-accent, var(--accent));
 }
 
 .effort-range {
@@ -2591,7 +2590,7 @@ pre,
 }
 
 .effort-range:focus-visible {
-  outline: 2px solid var(--effort-slider-accent);
+  outline: 2px solid var(--session-accent, var(--accent));
   outline-offset: 8px;
 }
 
