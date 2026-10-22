@@ -69,6 +69,8 @@ local; share only the Mobile gateway over HTTPS.
 - Keep the empty composer's placeholder out of editable text layout so the caret starts at the left text inset.
 - Tighten composer metadata gaps and padding; keep effort, context and cost readable, truncating only long model names when needed.
 - Round the composer to 22px, with its context track inheriting the same corner radius.
+- Keep the activity drawer narrow at 90% when collapsed and full composer width when expanded, with a continuous
+  rounded top and no bottleneck.
 
 See [UI coverage and host limits](docs/guide.md#transcript-and-interaction-coverage) before upgrading live sessions.
 

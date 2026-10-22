@@ -1267,10 +1267,11 @@ pre,
 .activity-dock {
   position: relative;
   pointer-events: auto;
+  width: 100%;
   max-width: 920px;
   margin: 20px auto -1px;
   border: 0;
-  border-radius: 12px 12px 0 0;
+  border-radius: 22px 22px 0 0;
   background: var(--composer-bg);
   font: 11px/1.4 var(--mono);
 }
@@ -1281,7 +1282,7 @@ pre,
   top: 100%;
   left: 0;
   right: 0;
-  height: 12px;
+  height: 22px;
   background: var(--composer-bg);
   pointer-events: none;
 }
@@ -1314,7 +1315,7 @@ pre,
   margin: -24px auto 0;
   padding: 3px 14px;
   border: 0;
-  border-radius: 10px 10px 0 0;
+  border-radius: 22px 22px 0 0;
   background: var(--composer-bg);
   color: var(--muted);
   font: 10px/1.2 var(--mono);
@@ -1331,15 +1332,14 @@ pre,
 .activity-todo-phase.is-numbered::before { content: counter(todo-phase, upper-roman) ". "; }
 
 .activity-dock.todos-closed {
-  width: 95%;
+  width: 90%;
+  max-width: 828px;
   margin-top: 0;
   border: 0;
-  border-radius: 10px 10px 0 0;
   background: transparent;
 }
 
 .activity-dock.todos-closed .todo-pull-tab {
-  width: 100%;
   min-height: 14px;
   height: 14px;
   padding: 0;
