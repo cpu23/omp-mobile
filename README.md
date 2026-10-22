@@ -66,6 +66,7 @@ local; share only the Mobile gateway over HTTPS.
 - Use a wide pill-shaped thinking slider with session-accent fill and label, visible stop markers, a large white thumb and readable
   labels such as “Extra High effort”; it overlays the composer and dismisses on taps outside the rail. Pointer drags
   preserve composer focus and resist polling updates until release.
+- Keep the empty composer's placeholder out of editable text layout so the caret starts at the left text inset.
 
 See [UI coverage and host limits](docs/guide.md#transcript-and-interaction-coverage) before upgrading live sessions.
 

@@ -1771,6 +1771,7 @@ pre,
 }
 
 #prompt {
+  position: relative;
   overflow-x: hidden;
   overflow-y: auto;
   overflow-wrap: anywhere;
@@ -1779,6 +1780,10 @@ pre,
 }
 
 #prompt.is-empty::before {
+  position: absolute;
+  top: 12px;
+  left: 14px;
+  right: 14px;
   content: attr(data-placeholder);
   color: var(--dim);
   pointer-events: none;
