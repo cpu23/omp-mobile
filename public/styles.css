@@ -1851,14 +1851,14 @@ pre,
 .composer-tools {
   display: flex;
   align-items: center;
-  gap: 8px;
-  padding: 4px 10px 8px;
+  gap: 6px;
+  padding: 4px 8px 8px;
 }
 
 .composer-meta,
 .composer-status {
   display: flex;
-  gap: 10px;
+  gap: 3px;
   align-items: baseline;
   min-width: 0;
   flex: 1;
@@ -1880,7 +1880,7 @@ pre,
 .context-status {
   border: 0;
   background: transparent;
-  padding: 2px 4px;
+  padding: 2px;
   min-height: 24px;
   border-radius: 4px;
   font: inherit;
@@ -1896,21 +1896,25 @@ pre,
 }
 
 #model-open {
+  flex: 0 1 auto;
   color: var(--model-color, var(--text));
 }
 
 #effort-open {
+  flex-shrink: 0;
   color: var(--thinking-color, var(--effort-accent));
 }
 
 #ctx-label,
 #context-status,
 .context-status {
+  flex-shrink: 0;
   color: var(--ctx-text-color, var(--muted));
   cursor: default;
 }
 
 #cost-label {
+  flex-shrink: 0;
   color: var(--cost-color, var(--gold));
   cursor: default;
 }
