@@ -2510,12 +2510,22 @@ pre,
   display: none !important;
 }
 
+.effort-backdrop {
+  position: fixed;
+  inset: 0;
+  z-index: 19;
+  border: 0;
+  padding: 0;
+  background: transparent;
+  pointer-events: auto;
+}
+
 /* Effort Popover */
 .effort-popover {
   --effort-thumb-size: 40px;
   --effort-cap-size: calc(var(--effort-thumb-size) + 8px);
   position: absolute;
-  bottom: calc(100% + 18px);
+  bottom: max(12px, env(safe-area-inset-bottom));
   left: 50%;
   transform: translateX(-50%);
   width: min(440px, 86vw);

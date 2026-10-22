@@ -6300,6 +6300,7 @@ function closeEffortPopover(): void {
     effortPopoverDocClickListener = null;
   }
   const popover = document.querySelector("#effort-popover");
+  document.querySelector("#effort-backdrop")?.remove();
   if (popover) popover.remove();
 }
 function toggleEffortPopover(): void {
@@ -6329,11 +6330,20 @@ function toggleEffortPopover(): void {
   popover.className = "effort-popover";
   popover.innerHTML = `<p class="effort-heading"><span class="effort-current" id="effort-current">${esc(effortDisplayName(initialValue))}</span> effort</p><div class="effort-track"><div class="effort-rail" aria-hidden="true"><div class="effort-stops">${values.map(() => "<span></span>").join("")}</div><div class="effort-fill"></div></div><input id="effort-range" type="range" class="effort-range" min="0" max="${values.length - 1}" step="1" value="${index}" aria-label="Reasoning effort" aria-valuetext="${esc(effortDisplayName(initialValue))}"></div>`;
 
+  const backdrop = document.createElement("button");
+  backdrop.type = "button";
+  backdrop.id = "effort-backdrop";
+  backdrop.className = "effort-backdrop";
+  backdrop.setAttribute("aria-label", "Close thinking slider");
+  backdrop.addEventListener("pointerdown", (event) => event.preventDefault());
+  backdrop.addEventListener("click", closeEffortPopover);
   const dock = document.querySelector(".composer-dock");
   if (dock) {
     dock.prepend(popover);
+    dock.prepend(backdrop);
   } else {
     document.body.append(popover);
+    document.body.append(backdrop);
   }
 
   const range = requiredElement<HTMLInputElement>("#effort-range", popover);
@@ -6437,7 +6447,7 @@ function toggleEffortPopover(): void {
   effortPopoverDocClickListener = (event: MouseEvent) => {
     const target = event.target as Node | null;
     const effortBtn = document.querySelector("#effort-open");
-    if (popover && !popover.contains(target) && !effortBtn?.contains(target)) {
+    if (!popover.querySelector(".effort-track")?.contains(target) && !effortBtn?.contains(target)) {
       closeEffortPopover();
     }
   };
