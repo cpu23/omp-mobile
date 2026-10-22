@@ -142,6 +142,11 @@ test("legacy transcript normalization hides usage rows and routine notices witho
     "Thinking level changed",
     "Time-traveling rules injected",
     "Time-traveling rules triggered",
+    "Context compaction started",
+    "Session title changed",
+    "Provider account pinned",
+    "Session bookmark",
+    "Mode changed",
   ];
   const parts: MobilePart[] = [
     {
@@ -179,14 +184,14 @@ test("legacy transcript normalization hides usage rows and routine notices witho
   expect(normalizeTranscriptParts(parts)).toEqual([
     parts[0],
     parts[1],
-    parts.at(-1),
+    expect.objectContaining({ kind: "tool", output: "The provider request failed.", isError: true }),
   ]);
   expect(isRoutineNotice("Model changed")).toBe(true);
   expect(isRoutineNotice("Time-traveling rules triggered")).toBe(true);
   expect(isRoutineNotice("The transcript says Model changed")).toBe(false);
 });
 
-test("background completions use tool disclosure without losing output or changing other custom messages", () => {
+test("custom completions use tool disclosure without losing output or changing ordinary prose", () => {
   const text = "<system-notice>\nBackground job build completed.\nBuild failed: missing dependency.\n</system-notice>";
   const details = { jobs: [{ jobId: "build-1", type: "bash", label: "bun run build" }] };
   const custom: MobilePart = { kind: "custom", title: "extension-result", text: "Important custom content" };
@@ -197,7 +202,30 @@ test("background completions use tool disclosure without losing output or changi
     prose,
   ]);
   expect(normalized[0]).toMatchObject({ kind: "tool", output: text, details });
-  expect(normalized.slice(1)).toEqual([custom, prose]);
+  expect(normalized[1]).toMatchObject({ kind: "tool", output: custom.text });
+  expect(normalized[2]).toEqual(prose);
+});
+
+test("compaction summaries and warning notices retain details in tool disclosures", () => {
+  const normalized = normalizeTranscriptParts([
+    { kind: "summary", title: "Context compacted", text: "Full summary", tokensBefore: 100000 },
+    { kind: "notice", tone: "warning", title: "Retrying", body: "Provider rate limited" },
+  ]);
+  expect(normalized[0]).toMatchObject({ kind: "tool", output: "Full summary", details: { tokensBefore: 100000 } });
+  expect(normalized[1]).toMatchObject({ kind: "tool", output: "Provider rate limited", isError: false, details: { tone: "warning" } });
+});
+
+test("housekeeping entries do not consume visible transcript history", () => {
+  const projection = transcript([
+    { type: "title_change", id: "title", title: "New title" },
+    { type: "credential_pin", id: "pin", provider: "provider" },
+    { type: "mode_change", id: "mode", mode: "plan" },
+    { type: "label", id: "label", label: "Bookmark" },
+    { type: "reset_boundary", id: "reset" },
+    { type: "message", id: "user", message: { role: "user", content: "Visible prompt" } },
+  ]);
+  expect(projection.messages.map((message) => message.entryId)).toEqual(["reset", "user"]);
+  expect(projection.history.total).toBe(2);
 });
 
 test("history pages recover the oldest visible messages without skipping a boundary", () => {

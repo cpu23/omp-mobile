@@ -90,10 +90,13 @@ Opening swipes also leave controls, code blocks and overflowing horizontal scrol
 
 The structured transcript includes rule/system-violation notices, visible custom messages, provider errors and aborted
 responses, compaction and branch summaries, shell/Python executions, tool output and file mentions.
-Routine served-by/model-routing/default-role metadata, per-message token/cache/cost rows, thinking-level-change notices
-and time-traveling rule trigger/injection notices, plus role/time headers, are omitted; hidden custom messages and developer/internal guidance
-remain hidden. Runtime cards show exposed retry, model-fallback, compaction, goal and reminder state alongside pending
-interactions.
+Routine served-by/model-routing/default-role metadata, per-message token/cache/cost rows, thinking-level changes,
+rule trigger/injection notices, title changes, provider pins, bookmarks and mode changes are omitted, as are role/time
+headers and hidden developer/internal guidance. Passive notices, compaction/branch summaries and custom events use
+compact tool-style disclosures within the chat stream, preserving rich output and marking errors. Runtime notices
+follow transcript timestamps; goals and active retry/fallback/compaction state appear at the end. A duplicate compaction-start
+notice is hidden while the active state remains visible. Only pending approvals, questions and dialogs use prominent
+runtime cards. Unread session completion appears as a small session-accent dot in the sidebar.
 
 Plan review uses OMP's public resolver: read the plan, select an execution tier when offered, then explicitly choose
 execute, compact, keep context, refine with feedback, or save and quit. Choices and tiers are validated against the

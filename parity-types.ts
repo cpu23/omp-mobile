@@ -54,7 +54,7 @@ export type MobileAskDisplay = {
 export type MobilePart =
   | { kind: "text"; text: string }
   | { kind: "thinking"; text: string }
-  | { kind: "tool"; id: string; name: string; summary: string; output?: string; isError?: boolean; ask?: MobileAskDisplay; task?: { agents: ActivitySubagent[]; asyncState?: string }; images?: MobileImage[]; details?: unknown; full?: boolean }
+  | { kind: "tool"; id: string; name: string; summary: string; output?: string; format?: "rich"; isError?: boolean; ask?: MobileAskDisplay; task?: { agents: ActivitySubagent[]; asyncState?: string }; images?: MobileImage[]; details?: unknown; full?: boolean }
   | { kind: "image"; image: MobileImage; label?: string }
   | { kind: "notice"; tone: MobileNotice["tone"]; title: string; body?: string }
   | { kind: "summary"; title: string; text: string; tokensBefore?: number }
@@ -80,6 +80,11 @@ const ROUTINE_NOTICE_TITLES: Record<string, true> = {
   "Thinking level changed": true,
   "Time-traveling rules injected": true,
   "Time-traveling rules triggered": true,
+  "Context compaction started": true,
+  "Session title changed": true,
+  "Provider account pinned": true,
+  "Session bookmark": true,
+  "Mode changed": true,
 };
 
 /** Exact structured notice titles that are routine transcript/runtime metadata. */
@@ -97,15 +102,21 @@ export function normalizeTranscriptParts(parts: MobilePart[]): MobilePart[] {
       normalized ??= parts.slice(0, index);
       continue;
     }
-    if (part.kind === "custom" && part.title === "async-result") {
+    if (part.kind === "custom" || part.kind === "notice" || part.kind === "summary") {
       normalized ??= parts.slice(0, index);
       normalized.push({
         kind: "tool",
-        id: `background-result-${index}`,
-        name: "Background result",
+        id: `event-${index}`,
+        name: part.kind === "custom" && part.title === "async-result" ? "Background result" : part.title,
         summary: "",
-        output: part.text,
-        ...(part.details !== undefined ? { details: part.details } : {}),
+        output: part.kind === "notice" ? part.body ?? "" : part.text,
+        format: "rich",
+        ...(part.kind === "notice" ? {
+          isError: part.tone === "error",
+          details: { tone: part.tone },
+        } : part.kind === "summary" ? {
+          ...(part.tokensBefore !== undefined ? { details: { tokensBefore: part.tokensBefore } } : {}),
+        } : part.details !== undefined ? { details: part.details } : {}),
       });
       continue;
     }

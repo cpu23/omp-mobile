@@ -514,15 +514,12 @@ textarea:focus-visible {
 }
 
 .slot-unread {
-  display: inline-grid;
-  place-items: center;
-  min-width: 18px;
-  height: 18px;
-  padding: 0 4px;
-  border-radius: 999px;
-  background: var(--effort-accent);
-  color: var(--dark);
-  font: 700 9px var(--mono);
+  display: block;
+  width: 7px;
+  height: 7px;
+  border-radius: 50%;
+  background: var(--slot-accent, var(--success));
+  font-size: 0;
   flex: 0 0 auto;
 }
 .slot-working {
@@ -2819,9 +2816,6 @@ pre,
 }
 
 .runtime-card,
-.part-notice,
-.part-summary,
-.part-custom,
 .part-execution,
 .part-files,
 .part-unsupported {
@@ -2833,8 +2827,7 @@ pre,
   color: var(--text);
 }
 
-.runtime-card > strong,
-.part-notice > strong {
+.runtime-card > strong {
   display: block;
   margin-bottom: 5px;
   font-size: 12px;
@@ -2842,9 +2835,7 @@ pre,
 
 .runtime-card-body,
 .runtime-card-detail,
-.part-notice-body,
-.part-summary-text,
-.part-custom-text {
+.part-event-body {
   min-width: 0;
   overflow-wrap: anywhere;
 }
@@ -2855,36 +2846,8 @@ pre,
   font-size: 12px;
 }
 
-.runtime-status {
-  display: flex;
-  align-items: flex-start;
-  gap: 8px;
-}
-
-.runtime-status > strong {
-  flex: 0 0 auto;
-  margin: 0;
-}
-
-.runtime-status-body {
-  min-width: 0;
-  overflow-wrap: anywhere;
-}
-
-.runtime-notice.tone-error,
-.part-notice.tone-error,
 .part-error {
   border-color: rgba(255, 71, 87, 0.38);
-}
-
-.runtime-notice.tone-warning,
-.part-notice.tone-warning {
-  border-color: rgba(255, 190, 77, 0.42);
-}
-
-.runtime-notice.tone-success,
-.part-notice.tone-success {
-  border-color: rgba(72, 190, 130, 0.4);
 }
 
 .runtime-queue ol {
@@ -3214,23 +3177,9 @@ pre,
   font-size: 11px;
 }
 
-.part-summary h3,
-.part-custom h3,
 .part-files h3 {
   margin: 0 0 6px;
   font-size: 12px;
-}
-
-.part-summary-tokens {
-  display: inline-block;
-  margin: 0 0 8px;
-  color: var(--muted);
-  font-size: 11px;
-}
-
-.part-custom,
-.part-summary {
-  margin: 8px 0;
 }
 
 .part-execution-heading {
@@ -3527,9 +3476,6 @@ pre,
   }
 
   .runtime-card,
-  .part-notice,
-  .part-summary,
-  .part-custom,
   .part-execution,
   .part-files,
   .part-unsupported {
