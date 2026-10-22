@@ -1267,12 +1267,12 @@ pre,
 .activity-dock {
   position: relative;
   pointer-events: auto;
-  width: 90%;
-  max-width: 828px;
+  width: 100%;
+  max-width: 920px;
   margin: 20px auto -1px;
   border: 0;
   border-radius: 22px 22px 0 0;
-  background: var(--composer-bg);
+  background: transparent;
   font: 11px/1.4 var(--mono);
 }
 
@@ -1299,6 +1299,8 @@ pre,
   overflow-y: auto;
   overscroll-behavior: contain;
   padding-top: 5px;
+  border-radius: 22px 22px 0 0;
+  background: var(--composer-bg);
 }
 
 .activity-todos { padding: 2px 10px 6px; }
@@ -1308,7 +1310,7 @@ pre,
   align-items: center;
   justify-content: center;
   gap: 8px;
-  width: 100%;
+  width: 90%;
   min-width: 64px;
   min-height: 24px;
   position: relative;
@@ -1332,6 +1334,8 @@ pre,
 .activity-todo-phase.is-numbered::before { content: counter(todo-phase, upper-roman) ". "; }
 
 .activity-dock.todos-closed {
+  width: 90%;
+  max-width: 828px;
   margin-top: 0;
   border: 0;
   background: transparent;
