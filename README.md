@@ -61,6 +61,8 @@ local; share only the Mobile gateway over HTTPS.
 - Load full message content and images automatically, and simplify transcript cards: hide role/time headers and routine
   served-by/model-routing/default-role metadata, thinking-level-change notices, and time-traveling rule trigger/injection
   notices and per-message token/cache/cost rows while retaining important failures and tool output.
+- Keep the slash-command menu hidden when empty or a dialog is pending, removing the empty strip above the composer;
+  shorten the composer's medium thinking-level label to `med` without changing the selected level.
 
 See [UI coverage and host limits](docs/guide.md#transcript-and-interaction-coverage) before upgrading live sessions.
 

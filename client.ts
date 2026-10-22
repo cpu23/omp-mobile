@@ -2010,6 +2010,10 @@ function renderCommandMenu(): void {
   const menu = document.querySelector<HTMLElement>("#command-menu");
   const prompt = document.querySelector<HTMLDivElement>("#prompt");
   if (!menu || !prompt) return;
+  if (activeState?.runtime?.interaction) {
+    hideCommandMenu(menu, prompt);
+    return;
+  }
   const moveValue = moveDraft(prompt.innerText);
   if (moveValue !== null) {
     renderMoveMenu(menu, prompt, moveValue);
@@ -5247,9 +5251,6 @@ function renderActive(): void {
     resizePrompt();
   }
   renderCommandMenu();
-  document
-    .querySelector<HTMLElement>("#command-menu")
-    ?.classList.toggle("hidden", pendingInteraction);
   const transcript = requiredElement<HTMLDivElement>("#transcript");
   if (state) {
     applyTheme(state.theme);
@@ -5399,7 +5400,7 @@ function renderActive(): void {
 
   const effortBtn = requiredElement<HTMLButtonElement>("#effort-open");
   effortBtn.textContent =
-    state?.effort != null ? String(state.effort) : "Effort";
+    state?.effort === "medium" ? "med" : state?.effort != null ? String(state.effort) : "Effort";
   effortBtn.disabled = pendingInteraction || !capability("effort");
 
   const ctxLabel = document.querySelector<HTMLElement>("#ctx-label");
