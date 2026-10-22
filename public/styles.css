@@ -1606,7 +1606,7 @@ pre,
   border: 1px solid var(--composer-border, var(--line));
   border-top: 0;
   background: var(--composer-bg);
-  border-radius: 12px;
+  border-radius: 22px;
   padding-top: 3px;
   box-shadow: var(--shadow);
   transition: border-color 0.16s ease;
@@ -1696,7 +1696,7 @@ pre,
   /* Tracks the composer border box so the arcs line up with its corners. */
   inset: 0 -1px -1px -1px;
   border: 3px solid transparent;
-  border-radius: 12px;
+  border-radius: inherit;
   pointer-events: none;
   transition: --ctx-fill-width 0.25s ease;
   /* Paint the top edge itself: the ring follows the box radius, so the fill
@@ -1771,6 +1771,7 @@ pre,
 }
 
 #prompt {
+  position: relative;
   overflow-x: hidden;
   overflow-y: auto;
   overflow-wrap: anywhere;
@@ -1779,6 +1780,10 @@ pre,
 }
 
 #prompt.is-empty::before {
+  position: absolute;
+  top: 12px;
+  left: 14px;
+  right: 14px;
   content: attr(data-placeholder);
   color: var(--dim);
   pointer-events: none;
@@ -1846,14 +1851,14 @@ pre,
 .composer-tools {
   display: flex;
   align-items: center;
-  gap: 8px;
-  padding: 4px 10px 8px;
+  gap: 6px;
+  padding: 4px 8px 8px;
 }
 
 .composer-meta,
 .composer-status {
   display: flex;
-  gap: 10px;
+  gap: 3px;
   align-items: baseline;
   min-width: 0;
   flex: 1;
@@ -1875,7 +1880,7 @@ pre,
 .context-status {
   border: 0;
   background: transparent;
-  padding: 2px 4px;
+  padding: 2px;
   min-height: 24px;
   border-radius: 4px;
   font: inherit;
@@ -1891,21 +1896,25 @@ pre,
 }
 
 #model-open {
+  flex: 0 1 auto;
   color: var(--model-color, var(--text));
 }
 
 #effort-open {
+  flex-shrink: 0;
   color: var(--thinking-color, var(--effort-accent));
 }
 
 #ctx-label,
 #context-status,
 .context-status {
+  flex-shrink: 0;
   color: var(--ctx-text-color, var(--muted));
   cursor: default;
 }
 
 #cost-label {
+  flex-shrink: 0;
   color: var(--cost-color, var(--gold));
   cursor: default;
 }

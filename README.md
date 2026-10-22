@@ -66,6 +66,9 @@ local; share only the Mobile gateway over HTTPS.
 - Use a wide pill-shaped thinking slider with session-accent fill and label, visible stop markers, a large white thumb and readable
   labels such as “Extra High effort”; it overlays the composer and dismisses on taps outside the rail. Pointer drags
   preserve composer focus and resist polling updates until release.
+- Keep the empty composer's placeholder out of editable text layout so the caret starts at the left text inset.
+- Tighten composer metadata gaps and padding; keep effort, context and cost readable, truncating only long model names when needed.
+- Round the composer to 22px, with its context track inheriting the same corner radius.
 
 See [UI coverage and host limits](docs/guide.md#transcript-and-interaction-coverage) before upgrading live sessions.
 
