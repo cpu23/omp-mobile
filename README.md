@@ -48,6 +48,23 @@ tailscale serve --bg 4173
 Open Tailscale's HTTPS URL, enter the token and use **Add to Home Screen** in your browser. Keep Desktop port 4180
 local; share only the Mobile gateway over HTTPS.
 
+## Checks
+
+GitHub Actions runs the type-check, complete unit-test suite and server build on Linux and macOS using Bun 1.3.14.
+The Linux job also runs the standalone Chromium composer-caret acceptance check. Run the same checks locally from the
+repository root:
+
+```sh
+bun install --frozen-lockfile
+bun run check
+bun run test
+bun run build
+bunx playwright install chromium
+bun run scripts/composer-selection.browser.ts
+```
+
+The browser check requires Chromium; it does not require the OMP Desktop daemon or provider credentials.
+
 ## Releases
 
 ### Unreleased
