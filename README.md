@@ -52,6 +52,8 @@ local; share only the Mobile gateway over HTTPS.
 
 ### Unreleased
 
+- Keep Desktop and Mobile session indicators working across automatic continuations and background-job waits;
+  publish completion only when the agent settles without pending continuation work.
 - Render rule/system-violation notices, provider failures, retry/fallback/compaction state, goals, custom messages,
   execution output, summaries and file mentions.
 - Surface pending `ask`, approvals and terminal-owned dialogs with live phone controls; render native plan reviews
