@@ -37,6 +37,7 @@ import type {
 import { normalizeTranscriptParts } from "./parity-types";
 import { integrateRuntimeEvents } from "./runtime-events";
 import { appendRichContent } from "./rich-content";
+import { ByteLruMap, TextDraftStore } from "./client-cache";
 import {
   askAnswerFromDraft,
   canSubmitAskAnswer,
@@ -109,14 +110,15 @@ type NotificationActionNeeded = {
 };
 type NotificationItem = {
   slot: SlotId;
-  unread: CompletionMarker[];
+  unreadCount: number;
+  unread?: CompletionMarker[];
   actionNeeded?: NotificationActionNeeded;
 };
 type NotificationsResponse = { slots: NotificationItem[] };
 type NotificationConfig = { enabled: boolean; publicKey?: string };
 type DirectoryResponse = DirectoryListing;
 type ApiResult = unknown;
-type ApiError = Error & { auth?: boolean; status?: number };
+type ApiError = Error & { auth?: boolean; status?: number; code?: string };
 type ApiAction =
   | Omit<Extract<SlotAction, { type: "prompt" }>, "generation">
   | Omit<Extract<SlotAction, { type: "abort" }>, "generation">
@@ -261,7 +263,24 @@ type PushSubscriptionJson = {
 
 const app = requiredElement<HTMLElement>("#app");
 const drafts = new Map<SlotId, string>();
-const cache = new Map<SlotId, ClientState>();
+const draftStore = new TextDraftStore(
+  localStorage,
+  "omp-mobile-drafts",
+  128 * 1024,
+  64,
+);
+function approximateJsonBytes(value: unknown): number {
+  try {
+    return JSON.stringify(value)?.length * 2 || 0;
+  } catch {
+    return 0;
+  }
+}
+const cache = new ByteLruMap<SlotId, ClientState>(
+  8 * 1024 * 1024,
+  approximateJsonBytes,
+  32,
+);
 /**
  * Requested transcript per runtime, held until the daemon reports the file omp
  * sniffed: until then a resumed session's history row must still dedupe against
@@ -279,10 +298,44 @@ type HistoryCache = {
   loading: boolean;
   error?: string;
 };
-const olderHistoryBySlot = new Map<SlotId, HistoryCache>();
-const fullMessageCache = new Map<string, MobileMessage>();
+const olderHistoryBySlot = new ByteLruMap<SlotId, HistoryCache>(
+  24 * 1024 * 1024,
+  (history) => approximateJsonBytes(history.messages),
+  8,
+);
+const fullMessageCache = new ByteLruMap<string, MobileMessage>(
+  72 * 1024 * 1024,
+  approximateJsonBytes,
+  512,
+);
 const fullMessageRequests = new Set<string>();
-const fullMessageFailures = new Set<string>();
+const fullMessageQueued = new Set<string>();
+const fullMessageQueue: Array<{
+  key: string;
+  slotId: SlotId;
+  generation: string;
+  entryId: string;
+  epoch: number;
+}> = [];
+const fullMessageIndividualQueue: Array<(typeof fullMessageQueue)[number]> = [];
+const fullMessageFailures = new ByteLruMap<string, true>(
+  256 * 1024,
+  () => 16,
+  2048,
+);
+const fullMessageCapacityDeferred = new ByteLruMap<string, number>(
+  256 * 1024,
+  () => 24,
+  2048,
+);
+const sessionSummaryCache = new ByteLruMap<
+  string,
+  SessionSummary[]
+>(4 * 1024 * 1024, approximateJsonBytes, 8);
+let hydrationBatchScheduled = false;
+let hydrationBatchesInFlight = 0;
+let hydrationRenderFrame = 0;
+let activeSlotEpoch = 0;
 let attachedImages: MobileImage[] = [];
 const attachmentsBySlot = new Map<SlotId, MobileImage[]>();
 let terminalControlVisible = false;
@@ -298,9 +351,16 @@ let slotsError: string | null = null;
 let stateError: string | null = null;
 let slotsRequest = 0;
 let stateRequest = 0;
+let slotsLoading = false;
+let slotsReloadPending = false;
+let stateLoading = false;
+let stateReloadPending = false;
+let sessionsReloadPending = false;
+let notificationsLoading = false;
+let notificationsReloadPending = false;
 let initialStateRequested = false;
-let creatingSession = false;
 let activeId: SlotId = "";
+let creatingSession = false;
 let activeState: ClientState | null = null;
 type PromptSubmission = {
   generation: string;
@@ -317,6 +377,9 @@ let modalDismiss: (() => void) | null = null;
 let toastTimer = 0;
 let pins: string[] = [];
 let transcriptNearBottom = true;
+let transcriptAnchor: { msgKey: string; offset: number } | null = null;
+let transcriptResizeObserver: ResizeObserver | null = null;
+const observedTranscriptArticles = new Set<HTMLElement>();
 let lastRenderedMessageCount = 0;
 let lastTranscriptSnapshot: TranscriptRenderSnapshot | null = null;
 let lastEmptyTranscriptContent: string | null = null;
@@ -331,8 +394,11 @@ let dismissedMoveDraft: string | null = null;
 /** One activity drawer, retained only for the session that opened it. */
 let todosExpanded = false;
 let activitySlot: SlotId | null = null;
+let lastActivityRenderKey = "";
 let lastComposerWorkingText = "";
+let lastThemeSignature: string | null = null;
 let unreadBySlot = new Map<SlotId, CompletionMarker[]>();
+const unreadCountsBySlot = new Map<SlotId, number>();
 const actionNeededBySlot = new Map<SlotId, NotificationActionNeeded>();
 const interactionActionsInFlight = new Set<string>();
 const interactionFeedbackDrafts = new Map<string, string>();
@@ -377,6 +443,9 @@ function hasAuth(error: unknown): error is ApiError & { auth: true } {
 function errorStatus(error: unknown): number | undefined {
   return isApiError(error) ? error.status : undefined;
 }
+function errorCode(error: unknown): string | undefined {
+  return isApiError(error) ? error.code : undefined;
+}
 
 function esc(value: unknown): string {
   return String(value ?? "").replace(
@@ -408,8 +477,10 @@ async function api<T extends ApiResult = ApiResult>(
   path: string,
   options: RequestOptions = {},
 ): Promise<T> {
+  const method = options.method?.toUpperCase() ?? "GET";
   const response = await fetch(path, {
     ...options,
+    cache: options.cache ?? (method === "GET" ? "no-cache" : undefined),
     headers: { ...headers(Boolean(options.body)), ...(options.headers || {}) },
     credentials: "same-origin",
   });
@@ -422,16 +493,20 @@ async function api<T extends ApiResult = ApiResult>(
   if (!response.ok) {
     let detail =
       response.status === 403 ? "Access forbidden" : "Request failed";
+    let code: string | undefined;
     try {
       const body = (await response.json()) as {
+        code?: unknown;
         error?: unknown;
         message?: unknown;
       };
+      if (typeof body.code === "string") code = body.code;
       if (typeof body.error === "string") detail = body.error;
       else if (typeof body.message === "string") detail = body.message;
     } catch {}
     throw Object.assign(new Error(detail), {
       status: response.status,
+      ...(code ? { code } : {}),
     }) as ApiError;
   }
   return (response.status === 204 ? null : await response.json()) as T;
@@ -620,14 +695,10 @@ function updateNotificationButton(): void {
 }
 
 function updateAppBadge(): void {
-  const completionCount = [...unreadBySlot.values()].reduce(
-    (total, unread) => total + unread.length,
+  const count = [...unreadCountsBySlot.values()].reduce(
+    (total, unreadCount) => total + unreadCount,
     0,
   );
-  const actionCount = [...actionNeededBySlot.values()].filter(
-    (action) => action.unread,
-  ).length;
-  const count = completionCount + actionCount;
   const badgeNavigator = navigator as Navigator & {
     setAppBadge?: (value?: number) => Promise<void>;
     clearAppBadge?: () => Promise<void>;
@@ -654,12 +725,35 @@ function normalizedUnread(
   return next;
 }
 async function loadNotifications(): Promise<void> {
+  if (document.visibilityState !== "visible") return;
+  if (notificationsLoading) {
+    notificationsReloadPending = true;
+    return;
+  }
+  notificationsLoading = true;
+  const requestSlot = activeId;
   try {
-    const result = await api<NotificationsResponse>("/api/notifications");
-    unreadBySlot = normalizedUnread(result);
+    const result = await api<NotificationsResponse>(
+      `/api/notifications${requestSlot ? `?slot=${encodeURIComponent(requestSlot)}` : ""}`,
+    );
+    const requestedUnread = normalizedUnread(result);
+    unreadCountsBySlot.clear();
+    for (const item of result.slots ?? []) {
+      if (!isSlotId(item.slot) || !slots.some((slot) => slot.id === item.slot))
+        continue;
+      unreadCountsBySlot.set(
+        item.slot,
+        Number.isSafeInteger(item.unreadCount)
+          ? Math.max(0, item.unreadCount)
+          : requestedUnread.get(item.slot)?.length ?? 0,
+      );
+    }
+    if (requestSlot === activeId) unreadBySlot = requestedUnread;
     actionNeededBySlot.clear();
     for (const item of result.slots ?? []) {
       if (
+        item.slot === requestSlot &&
+        requestSlot === activeId &&
         isSlotId(item.slot) &&
         slots.some((slot) => slot.id === item.slot) &&
         item.actionNeeded &&
@@ -667,11 +761,18 @@ async function loadNotifications(): Promise<void> {
       )
         actionNeededBySlot.set(item.slot, item.actionNeeded);
     }
+    updateSlots();
     updateAppBadge();
     if (activeState && document.visibilityState === "visible")
       window.setTimeout(() => acknowledgeSlot(activeId), 0);
   } catch (error: unknown) {
     if (hasAuth(error)) updateNotificationButton();
+  } finally {
+    notificationsLoading = false;
+    if (notificationsReloadPending && document.visibilityState === "visible") {
+      notificationsReloadPending = false;
+      void loadNotifications();
+    }
   }
 }
 async function acknowledgeSlot(slot: SlotId): Promise<void> {
@@ -684,28 +785,40 @@ async function acknowledgeSlot(slot: SlotId): Promise<void> {
   const unread = unreadBySlot.get(slot) || [];
   const actionNeeded = actionNeededBySlot.get(slot);
   if (!unread.length && !actionNeeded?.unread) return;
+  const identities = [
+    ...new Set([
+      ...unread.map((entry) => entry.identity),
+      ...(actionNeeded?.unread ? [actionNeeded.identity] : []),
+    ]),
+  ];
+  if (!identities.length) return;
   acknowledging.add(slot);
   try {
-    for (const entry of unread)
+    for (let start = 0; start < identities.length; start += 256) {
       await api<void>("/api/notifications/ack", {
         method: "POST",
-        body: JSON.stringify({ slot, identity: entry.identity }),
+        body: JSON.stringify({
+          slot,
+          identities: identities.slice(start, start + 256),
+        }),
       });
-    if (actionNeeded?.unread)
-      await api<void>("/api/notifications/ack", {
-        method: "POST",
-        body: JSON.stringify({ slot, identity: actionNeeded.identity }),
-      });
-    const acknowledgedIds = new Set(unread.map((entry) => entry.identity));
+    }
+    const acknowledgedIds = new Set(identities);
     const remaining = (unreadBySlot.get(slot) || []).filter(
       (entry) => !acknowledgedIds.has(entry.identity),
     );
     if (remaining.length) unreadBySlot.set(slot, remaining);
     else unreadBySlot.delete(slot);
-    if (actionNeeded?.unread)
-      actionNeededBySlot.set(slot, { ...actionNeeded, unread: false });
+    const currentAction = actionNeededBySlot.get(slot);
+    if (actionNeeded?.unread && currentAction?.identity === actionNeeded.identity)
+      actionNeededBySlot.set(slot, { ...currentAction, unread: false });
+    unreadCountsBySlot.set(
+      slot,
+      remaining.length + (actionNeededBySlot.get(slot)?.unread ? 1 : 0),
+    );
     updateSlots();
     updateAppBadge();
+    void loadNotifications();
   } catch (error: unknown) {
     if (!hasAuth(error))
       showToast(`Could not mark ${slotTitle(slotById(slot))} as read`, true);
@@ -924,21 +1037,64 @@ function isAgentActive(
 function syncTopBar(): void {
   const topTitle = document.querySelector<HTMLElement>("#top-title");
   if (!topTitle) return;
-  if (!activeId) {
-    topTitle.textContent = slotsError
+  const title = !activeId
+    ? slotsError
       ? "Live sessions unavailable"
       : slots.length
         ? "Select a session"
-        : "No live session";
-    return;
-  }
-  topTitle.textContent = slotTitle(slotById(activeId), activeState);
+        : "No live session"
+    : slotTitle(slotById(activeId), activeState);
+  if (topTitle.textContent !== title) topTitle.textContent = title;
 }
 function capability(name: string): boolean {
   return activeState?.capabilities?.[name] === true;
 }
+function setTextIfChanged(element: Node, text: string): void {
+  if (element.textContent !== text) element.textContent = text;
+}
+function setAttributeIfChanged(
+  element: Element,
+  name: string,
+  value: string,
+): void {
+  if (element.getAttribute(name) !== value) element.setAttribute(name, value);
+}
+function setStyleIfChanged(
+  style: CSSStyleDeclaration,
+  name: string,
+  value: string,
+): void {
+  if (style.getPropertyValue(name) !== value) style.setProperty(name, value);
+}
+function draftStorageKey(id: SlotId): string {
+  const sessionFile = slots.find((slot) => slot.id === id)?.sessionFile;
+  return sessionFile ? `session:${sessionFile}` : `runtime:${id}`;
+}
+function storeDraft(id: SlotId, value: string): void {
+  drafts.set(id, value);
+  const sessionFile = slots.find((slot) => slot.id === id)?.sessionFile;
+  if (sessionFile) {
+    draftStore.set(`session:${sessionFile}`, value);
+    draftStore.delete(`runtime:${id}`);
+  } else {
+    draftStore.set(`runtime:${id}`, value);
+  }
+}
+function migrateDraftForSlot(slot: SlotSummary): void {
+  if (!slot.sessionFile) return;
+  const stableKey = `session:${slot.sessionFile}`;
+  const current = drafts.get(slot.id);
+  if (current !== undefined) draftStore.set(stableKey, current);
+  else draftStore.move(`runtime:${slot.id}`, stableKey);
+  draftStore.delete(`runtime:${slot.id}`);
+}
 function draftFor(id: SlotId = activeId): string {
-  return drafts.get(id) || "";
+  const current = drafts.get(id);
+  if (current !== undefined) return current;
+  const stored = draftStore.get(draftStorageKey(id));
+  if (stored !== undefined) return stored;
+  const sessionFile = slots.find((slot) => slot.id === id)?.sessionFile;
+  return sessionFile ? draftStore.get(`runtime:${id}`) ?? "" : "";
 }
 function getThemeToken(
   theme: ClientTheme | null,
@@ -1093,16 +1249,27 @@ const THEME_TOKENS: Record<string, string> = {
 };
 function applyTheme(theme: ClientTheme | null): void {
   const root = document.documentElement;
-  Object.values(THEME_TOKENS).forEach((token) =>
-    root.style.removeProperty(token),
-  );
   const source = theme
     ? { ...theme, ...(theme.tokens ? theme.tokens : {}) }
     : {};
-  Object.entries(THEME_TOKENS).forEach(([key, token]) => {
+  const values = Object.entries(THEME_TOKENS).map(([key, token]) => {
     const value = source[key];
-    if (typeof value === "string" && /^#[0-9a-f]{6}$/i.test(value))
+    return [
+      token,
+      typeof value === "string" && /^#[0-9a-f]{6}$/i.test(value)
+        ? value
+        : null,
+    ] as const;
+  });
+  const signature = JSON.stringify(values);
+  if (signature === lastThemeSignature) return;
+  lastThemeSignature = signature;
+  values.forEach(([token, value]) => {
+    if (value === null) {
+      if (root.style.getPropertyValue(token)) root.style.removeProperty(token);
+    } else if (root.style.getPropertyValue(token) !== value) {
       root.style.setProperty(token, value);
+    }
   });
 }
 function renderShell(): void {
@@ -1328,7 +1495,7 @@ function renderShell(): void {
       document.execCommand("insertText", false, text);
   });
   prompt.addEventListener("input", () => {
-    drafts.set(activeId, prompt.innerText);
+    storeDraft(activeId, prompt.innerText);
     dismissedCommandDraft = null;
     dismissedMoveDraft = null;
     commandSelection = 0;
@@ -1407,6 +1574,8 @@ function renderShell(): void {
           transcript.scrollTop -
           transcript.clientHeight <
         90;
+      if (transcriptNearBottom) transcriptAnchor = null;
+      else updateTranscriptAnchor(transcript);
       requiredElement<HTMLButtonElement>("#scroll-bottom").classList.toggle(
         "hidden",
         transcriptNearBottom,
@@ -1440,10 +1609,25 @@ function renderShell(): void {
     }
   });
 }
+function updateTranscriptAnchor(transcript: HTMLDivElement): void {
+  const top = transcript.getBoundingClientRect().top;
+  for (const article of transcript.querySelectorAll<HTMLElement>(
+    "article.message",
+  )) {
+    const rect = article.getBoundingClientRect();
+    if (rect.bottom <= top) continue;
+    const msgKey = article.dataset.msgKey;
+    if (!msgKey) return;
+    transcriptAnchor = { msgKey, offset: rect.top - top };
+    return;
+  }
+  transcriptAnchor = null;
+}
 function scrollToBottom(): void {
   const box = requiredElement<HTMLDivElement>("#transcript");
   box.scrollTop = box.scrollHeight;
   transcriptNearBottom = true;
+  transcriptAnchor = null;
   document.querySelector("#scroll-bottom")?.classList.add("hidden");
 }
 function sidebarSlotAccent(slot: SlotSummary): string {
@@ -1489,12 +1673,121 @@ function slotCardMarkup(slot: SlotSummary): string {
   const slotState = slot.id === activeId ? activeState : cache.get(slot.id);
   const isBusy =
     connected && isAgentActive(slot.id === activeId ? activeState : null, slot);
-  const unread = unreadBySlot.get(slot.id)?.length || 0;
+  const unread = unreadCountsBySlot.get(slot.id) ?? 0;
   const notificationAction = actionNeededBySlot.get(slot.id);
   const interaction = slotState?.runtime?.interaction;
   const needsAction = Boolean(interaction || notificationAction);
   const title = slotTitle(slot, slotState);
   return `<div class="slot-card${slot.id === activeId ? " active" : ""}${!connected ? " offline" : ""}${isBusy ? " busy" : ""}" data-slot="${esc(slot.id)}" role="button" tabindex="0" aria-label="Open ${esc(title)}${isBusy ? " — Working" : ""}${needsAction ? " — Action needed" : ""}"><div class="slot-title">${isBusy ? `<span class="slot-working"><span class="working-spinner" aria-hidden="true">${SPINNER_FRAMES[0]}</span><span class="slot-title-text shimmer shimmer-accent">${shimmerMarkup(title)}</span></span>` : `<span>${esc(title)}</span>`}<span class="slot-badges">${!connected ? `<span class="slot-offline">offline</span>` : ""}${needsAction ? `<span class="slot-action-needed" title="${esc(interaction?.title ?? notificationAction?.actionTitle ?? "Pending action")}">Action needed</span>` : ""}${unread > 0 ? `<span class="slot-unread" aria-label="${unread} unread completion${unread === 1 ? "" : "s"}">${unread > 99 ? "99+" : unread}</span>` : ""}</span></div>${slot.summary && slot.summary.trim() ? `<div class="slot-summary">${esc(slot.summary)}</div>` : ""}<div class="slot-meta"><span class="slot-cwd" title="${esc(slot.cwd)}">${esc(compactPath(slot.cwd) || "Working directory unavailable")}</span><button type="button" class="slot-stop" data-stop="${esc(slot.id)}" aria-label="Stop ${esc(title)}" title="Stop this session">${ICONS.cross}</button></div></div>`;
+}
+
+/**
+ * The sidebar shows the daemon's sessions exactly once, in the desktop's order:
+ * live runtimes first, then transcripts no runtime owns, most recently used
+ * first (the daemon sorts them). A running transcript is only ever its live
+ * card — its history row is dropped by transcript path.
+ */
+function sidebarKey(node: HTMLElement, index: number): string {
+  if (node.dataset.slot) return `slot:${node.dataset.slot}`;
+  if (node.dataset.session) return `session:${node.dataset.session}`;
+  return node.dataset.renderKey ?? `static:${index}`;
+}
+
+function patchSidebarNode(current: Node, desired: Node): Node {
+  if (current.nodeType !== desired.nodeType || current.nodeName !== desired.nodeName)
+    return desired;
+  if (current.nodeType === Node.TEXT_NODE) {
+    if (current.nodeValue !== desired.nodeValue)
+      current.nodeValue = desired.nodeValue;
+    return current;
+  }
+  if (current.nodeType !== Node.ELEMENT_NODE) return current;
+  const currentElement = current as HTMLElement;
+  const desiredElement = desired as HTMLElement;
+  for (const attribute of Array.from(currentElement.attributes)) {
+    if (
+      attribute.name !== "style" &&
+      !desiredElement.hasAttribute(attribute.name)
+    )
+      currentElement.removeAttribute(attribute.name);
+  }
+  for (const attribute of Array.from(desiredElement.attributes)) {
+    if (
+      attribute.name !== "style" &&
+      currentElement.getAttribute(attribute.name) !== attribute.value
+    )
+      currentElement.setAttribute(attribute.name, attribute.value);
+  }
+  const desiredChildren = Array.from(desiredElement.childNodes);
+  for (let index = 0; index < desiredChildren.length; index += 1) {
+    const desiredChild = desiredChildren[index]!;
+    const currentChild = currentElement.childNodes[index];
+    const nextChild = currentChild
+      ? patchSidebarNode(currentChild, desiredChild)
+      : desiredChild;
+    if (nextChild !== currentChild && currentChild)
+      currentElement.replaceChild(nextChild, currentChild);
+    else if (!currentChild)
+      currentElement.append(nextChild);
+  }
+  while (currentElement.childNodes.length > desiredChildren.length)
+    currentElement.lastChild?.remove();
+  return current;
+}
+
+let sidebarEventsBound: HTMLDivElement | null = null;
+function bindSidebarRowEvents(list: HTMLDivElement): void {
+  if (sidebarEventsBound === list) return;
+  sidebarEventsBound = list;
+  list.addEventListener("click", (event) => {
+    const target =
+      event.target instanceof Element
+        ? event.target.closest<HTMLElement>(
+            "[data-slot], [data-session], [data-stop], #slots-retry, #sessions-retry",
+          )
+        : null;
+    if (!target) return;
+    const stop = target.closest<HTMLButtonElement>("[data-stop]");
+    if (stop) {
+      event.stopPropagation();
+      const id = stop.dataset.stop;
+      if (isSlotId(id)) void stopSlot(id);
+      return;
+    }
+    if (target.id === "slots-retry") {
+      void loadSlots();
+      return;
+    }
+    if (target.id === "sessions-retry") {
+      void loadSessions();
+      return;
+    }
+    const slotRow = target.closest<HTMLElement>("[data-slot]");
+    if (slotRow && isSlotId(slotRow.dataset.slot)) {
+      selectSlot(slotRow.dataset.slot);
+      return;
+    }
+    const sessionRow = target.closest<HTMLElement>("[data-session]");
+    if (sessionRow?.dataset.session)
+      void openHistorySession(sessionRow.dataset.session);
+  });
+  list.addEventListener("keydown", (event: KeyboardEvent) => {
+    if (event.key !== "Enter" && event.key !== " ") return;
+    const target =
+      event.target instanceof Element
+        ? event.target.closest<HTMLElement>("[data-slot], [data-session]")
+        : null;
+    if (!target) return;
+    event.preventDefault();
+    const slotRow = target.closest<HTMLElement>("[data-slot]");
+    if (slotRow && isSlotId(slotRow.dataset.slot)) {
+      selectSlot(slotRow.dataset.slot);
+      return;
+    }
+    const sessionRow = target.closest<HTMLElement>("[data-session]");
+    if (sessionRow?.dataset.session)
+      void openHistorySession(sessionRow.dataset.session);
+  });
 }
 
 /**
@@ -1546,58 +1839,47 @@ function updateSlots(): void {
   else if (sessionsLoading && !sessions.length)
     notices.push(`<div class="slot-empty" role="status">Loading sessions…</div>`);
   const liveRows = liveSlots.map(slotCardMarkup).join("");
-  // Separates the live runtimes from the historical rows below them, so the
-  // two row kinds stay distinguishable without a second list.
   const divider =
     liveRows && historyRows.length
       ? `<div class="slot-sep">Recent</div>`
       : "";
   const rows = liveRows + divider + historyRows.join("");
-  list.innerHTML =
+  const markup =
     notices.join("") +
     (rows ||
       (notices.length
         ? ""
         : `<div class="slot-empty" role="status">${query ? "No sessions match this search." : "No sessions yet. Start a new one."}</div>`));
-  list.querySelectorAll<HTMLElement>("[data-slot]").forEach((node) => {
-    const id = node.dataset.slot;
-    if (!isSlotId(id)) return;
-    node.style.setProperty("--slot-accent", sidebarSlotAccent(slotById(id)));
-    node.addEventListener("click", () => selectSlot(id));
-    node.addEventListener("keydown", (event: KeyboardEvent) => {
-      if (event.key !== "Enter" && event.key !== " ") return;
-      event.preventDefault();
-      selectSlot(id);
-    });
+  const template = document.createElement("template");
+  template.innerHTML = markup;
+  const desired = Array.from(template.content.children) as HTMLElement[];
+  desired.forEach((node, index) => {
+    if (!node.dataset.slot && !node.dataset.session)
+      node.dataset.renderKey = `static:${index}`;
   });
-  list.querySelectorAll<HTMLElement>("[data-session]").forEach((node) => {
-    const path = node.dataset.session;
-    if (!path) return;
-    const open = (): void => void openHistorySession(path);
-    node.addEventListener("click", open);
-    node.addEventListener("keydown", (event: KeyboardEvent) => {
-      if (event.key !== "Enter" && event.key !== " ") return;
-      event.preventDefault();
-      open();
-    });
+  const existing = new Map<string, HTMLElement>();
+  Array.from(list.children).forEach((child, index) => {
+    const node = child as HTMLElement;
+    existing.set(sidebarKey(node, index), node);
   });
-  list.querySelectorAll<HTMLButtonElement>("[data-stop]").forEach((button) => {
-    button.addEventListener("click", (event) => {
-      event.stopPropagation();
-      const id = button.dataset.stop;
-      if (isSlotId(id)) void stopSlot(id);
-    });
+  desired.forEach((node, index) => {
+    const key = sidebarKey(node, index);
+    const retained = existing.get(key);
+    const row = retained
+      ? (patchSidebarNode(retained, node) as HTMLElement)
+      : node;
+    existing.delete(key);
+    if (row !== list.children[index])
+      list.insertBefore(row, list.children[index] ?? null);
+    if (row.dataset.slot) {
+      const slot = slotById(row.dataset.slot);
+      const accent = sidebarSlotAccent(slot);
+      if (row.style.getPropertyValue("--slot-accent") !== accent)
+        row.style.setProperty("--slot-accent", accent);
+    }
   });
-  list
-    .querySelectorAll<HTMLButtonElement>("#slots-retry")
-    .forEach((button) =>
-      button.addEventListener("click", () => void loadSlots()),
-    );
-  list
-    .querySelectorAll<HTMLButtonElement>("#sessions-retry")
-    .forEach((button) =>
-      button.addEventListener("click", () => void loadSessions()),
-    );
+  for (const stale of existing.values()) stale.remove();
+  bindSidebarRowEvents(list);
   syncTopBar();
   syncAnimation();
 }
@@ -1861,7 +2143,7 @@ function focusPromptEnd(prompt: HTMLDivElement): void {
 function applyMoveSelection(path: string): void {
   const prompt = requiredElement<HTMLDivElement>("#prompt");
   prompt.innerText = `/move ${path}`;
-  drafts.set(activeId, prompt.innerText);
+  storeDraft(activeId, prompt.innerText);
   dismissedCommandDraft = null;
   dismissedMoveDraft = null;
   commandSelection = 0;
@@ -1874,10 +2156,12 @@ function hideCommandMenu(
   menu: HTMLElement,
   prompt: HTMLDivElement,
 ): void {
-  menu.replaceChildren();
-  menu.classList.add("hidden");
-  prompt.setAttribute("aria-expanded", "false");
-  prompt.removeAttribute("aria-activedescendant");
+  if (menu.childNodes.length > 0) menu.replaceChildren();
+  if (!menu.classList.contains("hidden")) menu.classList.add("hidden");
+  setAttributeIfChanged(prompt, "aria-expanded", "false");
+  if (prompt.hasAttribute("aria-activedescendant"))
+    prompt.removeAttribute("aria-activedescendant");
+  if (menu.dataset.renderKey) delete menu.dataset.renderKey;
 }
 
 function renderMoveMenu(
@@ -1911,7 +2195,6 @@ function renderMoveMenu(
   if (options.length === 0) commandSelection = 0;
   else commandSelection = Math.min(commandSelection, options.length - 1);
 
-  menu.setAttribute("aria-label", "Move destination directories");
   const status = completion.loading
     ? "Searching directories…"
     : completion.error
@@ -1927,22 +2210,42 @@ function renderMoveMenu(
         `<button type="button" id="command-option-${index}" class="command-option directory-option${index === commandSelection ? " selected" : ""}" role="option" aria-selected="${index === commandSelection}" data-move-path="${esc(suggestion.path)}" aria-label="Fill ${esc(suggestion.path)}"><strong>${esc(suggestion.name)}/</strong><span>${esc(suggestion.path)}</span></button>`,
     )
     .join("");
-  menu.innerHTML =
+  const menuMarkup =
     (options.length
       ? rows
       : `<div class="command-status${completion.error ? " error" : ""}" role="presentation">${esc(status)}</div>`) +
     `<div class="command-hint" role="presentation">Tap a folder to fill the path · Enter moves</div>`;
+  const renderKey = JSON.stringify([
+    "move",
+    context,
+    draft,
+    completion.loading,
+    completion.error,
+    completion.resolvedPath,
+    options.map((option) => [option.name, option.path]),
+    commandSelection,
+  ]);
+  if (
+    !menu.classList.contains("hidden") &&
+    menu.dataset.renderKey === renderKey
+  )
+    return;
+  menu.dataset.renderKey = renderKey;
+  if (menu.innerHTML !== menuMarkup) menu.innerHTML = menuMarkup;
   menu.classList.remove("hidden");
-  prompt.setAttribute("aria-expanded", "true");
+  setAttributeIfChanged(prompt, "aria-expanded", "true");
+  if (menu.getAttribute("aria-label") !== "Move destination directories")
+    menu.setAttribute("aria-label", "Move destination directories");
   if (options.length) {
-    prompt.setAttribute(
+    setAttributeIfChanged(
+      prompt,
       "aria-activedescendant",
       `command-option-${commandSelection}`,
     );
     menu
       .querySelector<HTMLElement>(`#command-option-${commandSelection}`)
       ?.scrollIntoView({ block: "nearest" });
-  } else {
+  } else if (prompt.hasAttribute("aria-activedescendant")) {
     prompt.removeAttribute("aria-activedescendant");
   }
   menu
@@ -1999,7 +2302,7 @@ function selectCommand(command: SlashCommand | undefined): void {
   if (!command) return;
   const prompt = requiredElement<HTMLDivElement>("#prompt");
   prompt.innerText = `/${command.name}`;
-  drafts.set(activeId, prompt.innerText);
+  storeDraft(activeId, prompt.innerText);
   dismissedCommandDraft = prompt.innerText;
   commandSelection = 0;
   resizePrompt();
@@ -2020,22 +2323,40 @@ function renderCommandMenu(): void {
     renderMoveMenu(menu, prompt, moveValue);
     return;
   }
-  menu.setAttribute("aria-label", "Slash commands");
   const matches = matchingCommands(prompt.innerText);
   if (matches.length === 0) {
     hideCommandMenu(menu, prompt);
     return;
   }
   commandSelection = Math.min(commandSelection, matches.length - 1);
-  menu.innerHTML = matches
+  const menuMarkup = matches
     .map(
       (command, index) =>
         `<button type="button" id="command-option-${index}" class="command-option${index === commandSelection ? " selected" : ""}" role="option" aria-selected="${index === commandSelection}" data-command-index="${index}"><strong>/${esc(command.name)}</strong><span>${esc(command.description || "Slash command")}</span></button>`,
     )
     .join("");
+  const renderKey = JSON.stringify([
+    "commands",
+    matches.map((command) => [
+      command.name,
+      command.description,
+      command.aliases,
+    ]),
+    commandSelection,
+  ]);
+  if (
+    !menu.classList.contains("hidden") &&
+    menu.dataset.renderKey === renderKey
+  )
+    return;
+  menu.dataset.renderKey = renderKey;
+  if (menu.getAttribute("aria-label") !== "Slash commands")
+    menu.setAttribute("aria-label", "Slash commands");
+  if (menu.innerHTML !== menuMarkup) menu.innerHTML = menuMarkup;
   menu.classList.remove("hidden");
-  prompt.setAttribute("aria-expanded", "true");
-  prompt.setAttribute(
+  setAttributeIfChanged(prompt, "aria-expanded", "true");
+  setAttributeIfChanged(
+    prompt,
     "aria-activedescendant",
     `command-option-${commandSelection}`,
   );
@@ -2155,9 +2476,11 @@ function selectSlot(id: SlotId): void {
     }, 0);
     return;
   }
+  const previousId = activeId;
+  if (previousId !== id) activeSlotEpoch += 1;
   const oldPrompt = document.querySelector<HTMLDivElement>("#prompt");
   if (activeId) attachmentsBySlot.set(activeId, attachedImages);
-  if (oldPrompt) drafts.set(activeId, oldPrompt.innerText);
+  if (oldPrompt) storeDraft(activeId, oldPrompt.innerText);
   activeId = id;
   attachedImages = attachmentsBySlot.get(id) ?? [];
   attachmentRevision += 1;
@@ -2168,6 +2491,7 @@ function selectSlot(id: SlotId): void {
     resizePrompt();
   }
   transcriptNearBottom = true;
+  transcriptAnchor = null;
   lastRenderedMessageCount = 0;
   updateSlots();
   renderActive();
@@ -2177,6 +2501,7 @@ function selectSlot(id: SlotId): void {
       void acknowledgeSlot(id);
     }, 0);
   void loadState();
+  void loadNotifications();
 }
 function normalizeModel(model: ClientModel | string | null): string {
   if (!model) return "No model";
@@ -2333,10 +2658,6 @@ function extractContentText(content: unknown): string | undefined {
   }
   return String(content);
 }
-const toolCallCache = new Map<
-  string,
-  { name: string; arguments?: Record<string, unknown> }
->();
 function mobileImageFrom(value: unknown): MobileImage | undefined {
   if (!value || typeof value !== "object") return undefined;
   const image = value as Record<string, unknown>;
@@ -2378,7 +2699,7 @@ function projectParts(
   toolCalls: Map<
     string,
     { name: string; arguments?: Record<string, unknown> }
-  > = toolCallCache,
+  >,
 ): ChatPart[] {
   const parts: ChatPart[] = [];
   const rawRole = asString(message.role);
@@ -3068,7 +3389,9 @@ type PreparedTranscriptMessage = {
   role: string;
   liveMessage: boolean;
   needsFull: boolean;
+  fullContent: boolean;
   parts: ChatPart[];
+  partSignatures: string[];
   actions: Array<{ label: string; url: string | undefined }>;
 };
 type TranscriptRenderSnapshot = {
@@ -3412,7 +3735,9 @@ function appendMobileImage(
     open.addEventListener("click", () => openImageViewer(image, label));
     figure.append(open);
   } else {
+    figure.classList.add("is-loading");
     const loading = document.createElement("span");
+    loading.className = "part-image-loading-indicator";
     loading.textContent = "Loading image…";
     figure.append(loading);
     void loadFullMessage(image.sourceId || entryId);
@@ -3445,119 +3770,386 @@ function clearFullMessagesForSlot(slotId: SlotId): void {
   const prefix = `${JSON.stringify([slotId]).slice(0, -1)},`;
   for (const key of fullMessageCache.keys())
     if (key.startsWith(prefix)) fullMessageCache.delete(key);
-  for (const key of fullMessageRequests)
-    if (key.startsWith(prefix)) fullMessageRequests.delete(key);
-  for (const key of fullMessageFailures)
+  for (const key of fullMessageQueued)
+    if (key.startsWith(prefix)) fullMessageQueued.delete(key);
+  for (const key of fullMessageFailures.keys())
     if (key.startsWith(prefix)) fullMessageFailures.delete(key);
+  for (const key of fullMessageCapacityDeferred.keys())
+    if (key.startsWith(prefix)) fullMessageCapacityDeferred.delete(key);
+  for (let index = fullMessageQueue.length - 1; index >= 0; index -= 1) {
+    if (fullMessageQueue[index]?.slotId === slotId)
+      fullMessageQueue.splice(index, 1);
+  }
+  for (
+    let index = fullMessageIndividualQueue.length - 1;
+    index >= 0;
+    index -= 1
+  ) {
+    if (fullMessageIndividualQueue[index]?.slotId === slotId)
+      fullMessageIndividualQueue.splice(index, 1);
+  }
+}
+function cacheFullMessage(
+  task: (typeof fullMessageQueue)[number],
+  message: MobileMessage,
+  bytes: number,
+): void {
+  if (!hydrationIsCurrent(task)) return;
+  if (bytes > fullMessageCache.maxBytes)
+    throw new Error("Full message exceeds the mobile cache budget.");
+  if (fullMessageCache.retainedBytes + bytes > fullMessageCache.maxBytes)
+    renderActive();
+  fullMessageCache.set(task.key, message, bytes);
 }
 
-async function loadFullMessage(entryId: string): Promise<void> {
+function hydrationIsCurrent(task: (typeof fullMessageQueue)[number]): boolean {
+  return (
+    task.slotId === activeId &&
+    task.generation === activeState?.generation &&
+    task.epoch === activeSlotEpoch
+  );
+}
+
+function scheduleHydrationRender(): void {
+  if (hydrationRenderFrame) return;
+  hydrationRenderFrame = window.requestAnimationFrame(() => {
+    hydrationRenderFrame = 0;
+    if (activeId && activeState) renderActive();
+  });
+}
+
+function queueHydrationBatch(): void {
+  if (hydrationBatchScheduled) return;
+  hydrationBatchScheduled = true;
+  queueMicrotask(() => {
+    hydrationBatchScheduled = false;
+    if (fullMessageIndividualQueue.length > 0) {
+      if (hydrationBatchesInFlight > 0) return;
+      let task: (typeof fullMessageQueue)[number] | undefined;
+      while (fullMessageIndividualQueue.length > 0) {
+        const candidate = fullMessageIndividualQueue.shift()!;
+        fullMessageQueued.delete(candidate.key);
+        if (!hydrationIsCurrent(candidate) || fullMessageCache.has(candidate.key))
+          continue;
+        task = candidate;
+        break;
+      }
+      if (task) {
+        fullMessageRequests.add(task.key);
+        hydrationBatchesInFlight += 1;
+        void runSingleFullMessage(task).finally(() => {
+          hydrationBatchesInFlight -= 1;
+          fullMessageRequests.delete(task.key);
+          queueHydrationBatch();
+        });
+        return;
+      }
+    }
+    while (hydrationBatchesInFlight < 2 && fullMessageQueue.length > 0) {
+      const batch: Array<(typeof fullMessageQueue)[number]> = [];
+      while (batch.length < 8 && fullMessageQueue.length > 0) {
+        const task = fullMessageQueue.shift()!;
+        fullMessageQueued.delete(task.key);
+        if (!hydrationIsCurrent(task) || fullMessageCache.has(task.key)) continue;
+        fullMessageRequests.add(task.key);
+        batch.push(task);
+      }
+      if (!batch.length) continue;
+      hydrationBatchesInFlight += 1;
+      void runHydrationBatch(batch).finally(() => {
+        hydrationBatchesInFlight -= 1;
+        for (const task of batch) fullMessageRequests.delete(task.key);
+        for (const task of batch) {
+          if (
+            task.slotId === activeId &&
+            task.generation === activeState?.generation &&
+            task.epoch !== activeSlotEpoch &&
+            !fullMessageCache.has(task.key) &&
+            !fullMessageFailures.has(task.key)
+          )
+            loadFullMessage(task.entryId);
+        }
+        queueHydrationBatch();
+      });
+    }
+  });
+}
+
+type FullMessageTransfer = {
+  entryId: string;
+  transferId: string;
+  chunk: string;
+  nextOffset: number | null;
+  total: number;
+};
+
+async function completeFullMessageTransfer(
+  task: (typeof fullMessageQueue)[number],
+  transfer: FullMessageTransfer,
+  generation: string,
+  renderAfter = true,
+): Promise<void> {
+  if (
+    transfer.entryId !== task.entryId ||
+    !transfer.transferId ||
+    !Number.isSafeInteger(transfer.total) ||
+    transfer.total < 0 ||
+    transfer.total > 32 * 1024 * 1024 ||
+    typeof transfer.chunk !== "string" ||
+    transfer.chunk.length > 256 * 1024
+  )
+    throw new Error("Invalid full-message transfer metadata.");
+  const chunks = [transfer.chunk];
+  let chunkLength = transfer.chunk.length;
+  let offset = 0;
+  let nextOffset = transfer.nextOffset;
+  if (nextOffset !== null && (!Number.isInteger(nextOffset) || nextOffset !== chunkLength))
+    throw new Error("Invalid full-message transfer offset.");
+  while (nextOffset !== null) {
+    if (!hydrationIsCurrent(task)) return;
+    const path =
+      `/api/slots/${encodeURIComponent(task.slotId)}/message?id=${encodeURIComponent(task.entryId)}` +
+      `&offset=${nextOffset}&transferId=${encodeURIComponent(transfer.transferId)}`;
+    const response = await api<{
+      generation: string;
+      transferId: string;
+      chunk: string;
+      nextOffset: number | null;
+      total: number;
+    }>(path);
+    if (response.generation !== generation)
+      throw new Error("The session changed while loading this message.");
+    if (response.transferId !== transfer.transferId)
+      throw new Error("Full-message transfer identity changed between chunks.");
+    if (
+      !Number.isSafeInteger(response.total) ||
+      response.total !== transfer.total ||
+      typeof response.chunk !== "string" ||
+      response.chunk.length > 256 * 1024 ||
+      (!Number.isInteger(response.nextOffset) && response.nextOffset !== null)
+    )
+      throw new Error("Invalid full-message chunk response.");
+    chunks.push(response.chunk);
+    chunkLength += response.chunk.length;
+    if (
+      chunkLength > response.total ||
+      (response.nextOffset !== null &&
+        (response.nextOffset !== chunkLength ||
+          response.nextOffset <= offset))
+    )
+      throw new Error("Full-message chunk response made no progress.");
+    offset = nextOffset;
+    nextOffset = response.nextOffset;
+  }
+  if (chunkLength !== transfer.total)
+    throw new Error("Full-message chunks were incomplete.");
+  const serialized = chunks.join("");
+  chunks.length = 0;
+  const parsed: unknown = JSON.parse(serialized);
+  if (
+    !parsed ||
+    typeof parsed !== "object" ||
+    !("entryId" in parsed) ||
+    parsed.entryId !== task.entryId
+  )
+    throw new Error("Full message response did not match the requested entry.");
+  cacheFullMessage(task, parsed as MobileMessage, serialized.length * 2 + 256);
+  if (renderAfter) scheduleHydrationRender();
+}
+
+async function runSingleFullMessage(
+  task: (typeof fullMessageQueue)[number],
+): Promise<void> {
+  const retryDelays = [250, 750, 1500];
+  for (let attempt = 0; attempt <= retryDelays.length; attempt += 1) {
+    if (!hydrationIsCurrent(task)) return;
+    try {
+      await loadSingleFullMessage(task);
+      fullMessageCapacityDeferred.delete(task.key);
+      return;
+    } catch (error: unknown) {
+      if (!hydrationIsCurrent(task)) return;
+      if (
+        errorStatus(error) === 503 &&
+        errorCode(error) === "transfer_capacity"
+      ) {
+        if (attempt < retryDelays.length) {
+          await new Promise<void>((resolve) =>
+            window.setTimeout(resolve, retryDelays[attempt]!),
+          );
+          continue;
+        }
+        fullMessageCapacityDeferred.set(task.key, Date.now() + 30_000, task.key.length * 2 + 24);
+        return;
+      }
+      fullMessageFailures.set(task.key, true, task.key.length * 2 + 16);
+      showToast(
+        hasAuth(error)
+          ? "Access token rejected"
+          : `Could not load full message: ${errorMessage(error)}`,
+        true,
+      );
+      if (hasAuth(error)) openTokenModal();
+      return;
+    }
+  }
+}
+
+async function loadSingleFullMessage(
+  task: (typeof fullMessageQueue)[number],
+): Promise<void> {
+  const response = await api<{
+    generation: string;
+    message?: MobileMessage;
+    transferId?: string;
+    chunk?: string;
+    nextOffset?: number | null;
+    total?: number;
+  }>(
+    `/api/slots/${encodeURIComponent(task.slotId)}/message?id=${encodeURIComponent(task.entryId)}`,
+  );
+  if (response.generation !== task.generation)
+    throw new Error("The session changed while loading this message.");
+  if (response.message) {
+    if (response.message.entryId !== task.entryId)
+      throw new Error("Full message response did not match the requested entry.");
+    const bytes = approximateJsonBytes(response.message);
+    if (bytes > 512 * 1024)
+      throw new Error("Individual message response exceeded the batch size limit.");
+    cacheFullMessage(task, response.message, bytes);
+    scheduleHydrationRender();
+    return;
+  }
+  if (
+    typeof response.transferId !== "string" ||
+    typeof response.chunk !== "string" ||
+    response.nextOffset === undefined ||
+    typeof response.total !== "number"
+  )
+    throw new Error("Invalid individual full-message response.");
+  await completeFullMessageTransfer(
+    task,
+    {
+      entryId: task.entryId,
+      transferId: response.transferId,
+      chunk: response.chunk,
+      nextOffset: response.nextOffset,
+      total: response.total,
+    },
+    task.generation,
+  );
+}
+
+async function runHydrationBatch(
+  batch: Array<(typeof fullMessageQueue)[number]>,
+): Promise<void> {
+  const current = batch.filter(hydrationIsCurrent);
+  if (!current.length) return;
+  const slotId = current[0]!.slotId;
+  const generation = current[0]!.generation;
+  const params = new URLSearchParams({
+    ids: JSON.stringify(current.map((task) => task.entryId)),
+    generation,
+  });
+  try {
+    const response = await api<{
+      generation: string;
+      messages: MobileMessage[];
+      transfers: FullMessageTransfer[];
+    }>(`/api/slots/${encodeURIComponent(slotId)}/messages?${params.toString()}`);
+    if (response.generation !== generation)
+      throw new Error("The session changed while loading these messages.");
+    if (current.some((task) => !hydrationIsCurrent(task))) return;
+    const requested = new Map(current.map((task) => [task.entryId, task]));
+    for (const message of response.messages ?? []) {
+      const task = requested.get(message.entryId);
+      if (!task) throw new Error("Batch returned an unrequested message.");
+      const bytes = approximateJsonBytes(message);
+      if (bytes > 512 * 1024)
+        throw new Error("Batch returned an oversized full message.");
+      if (hydrationIsCurrent(task)) {
+        cacheFullMessage(task, message, bytes);
+      }
+      requested.delete(message.entryId);
+    }
+    for (const transfer of response.transfers ?? []) {
+      const task = requested.get(transfer.entryId);
+      if (!task) throw new Error("Batch returned an unrequested transfer.");
+      requested.delete(transfer.entryId);
+      try {
+        await completeFullMessageTransfer(task, transfer, generation, false);
+      } catch (error: unknown) {
+        if (hydrationIsCurrent(task)) {
+          fullMessageFailures.set(task.key, true, task.key.length * 2 + 16);
+          showToast(
+            hasAuth(error)
+              ? "Access token rejected"
+              : `Could not load full message: ${errorMessage(error)}`,
+            true,
+          );
+          if (hasAuth(error)) openTokenModal();
+        }
+      }
+    }
+    if (requested.size)
+      throw new Error("Batch response omitted requested messages.");
+    scheduleHydrationRender();
+  } catch (error: unknown) {
+    if (
+      errorStatus(error) === 413 &&
+      errorCode(error) === "transfer_capacity"
+    ) {
+      for (const task of current) {
+        if (!hydrationIsCurrent(task) || fullMessageCache.has(task.key))
+          continue;
+        fullMessageQueued.add(task.key);
+        fullMessageIndividualQueue.push(task);
+      }
+      return;
+    }
+    for (const task of current) {
+      if (!hydrationIsCurrent(task)) continue;
+      fullMessageFailures.set(task.key, true, task.key.length * 2 + 16);
+    }
+    if (current.some(hydrationIsCurrent)) {
+      showToast(
+        hasAuth(error)
+          ? "Access token rejected"
+          : `Could not load full message: ${errorMessage(error)}`,
+        true,
+      );
+      if (hasAuth(error)) openTokenModal();
+    }
+  }
+}
+
+function loadFullMessage(entryId: string): void {
   const slotId = activeId;
   const generation = activeState?.generation;
   if (!slotId || !generation) return;
   const key = fullMessageKey(slotId, generation, entryId);
-  if (fullMessageCache.has(key) || fullMessageRequests.has(key) || fullMessageFailures.has(key)) return;
-  fullMessageRequests.add(key);
-  try {
-    const path =
-      `/api/slots/${encodeURIComponent(slotId)}/message?id=${encodeURIComponent(entryId)}`;
-    let offset = 0;
-    let transferId: string | undefined;
-    let message: MobileMessage | undefined;
-    let chunks: string[] = [];
-    let chunkLength = 0;
-    let chunkTotal: number | undefined;
-    let responseGeneration = generation;
-    for (;;) {
-      const requestPath =
-        transferId === undefined
-          ? `${path}&offset=0`
-          : `${path}&offset=${offset}&transferId=${encodeURIComponent(transferId)}`;
-      const response = await api<
-        | { generation: string; message: MobileMessage }
-        | {
-            generation: string;
-            transferId: string;
-            chunk: string;
-            nextOffset: number | null;
-            total: number;
-          }
-      >(requestPath);
-      responseGeneration = response.generation;
-      if (!("message" in response)) {
-        if (!response.transferId || (transferId && response.transferId !== transferId))
-          throw new Error("Full-message transfer identity changed between chunks.");
-        transferId = response.transferId;
-      }
-      if (responseGeneration !== generation)
-        throw new Error("The session changed while loading this message.");
-      if ("message" in response) {
-        message = response.message;
-        break;
-      }
-      if (
-        !Number.isSafeInteger(response.total) ||
-        response.total > 32 * 1024 * 1024 ||
-        response.total < 0 ||
-        typeof response.chunk !== "string" ||
-        response.chunk.length > 256 * 1024
-      )
-        throw new Error("Invalid full-message chunk response.");
-      if (chunkTotal !== undefined && response.total !== chunkTotal)
-        throw new Error("Full-message size changed between chunks.");
-      chunkTotal = response.total;
-      if (
-        !Number.isInteger(response.nextOffset) &&
-        response.nextOffset !== null
-      )
-        throw new Error("Invalid full-message chunk response.");
-      chunks.push(response.chunk);
-      chunkLength += response.chunk.length;
-      if (response.nextOffset === null) {
-        if (chunkLength !== response.total)
-          throw new Error("Full-message chunks were incomplete.");
-        break;
-      }
-      if (
-        response.nextOffset !== chunkLength ||
-        response.nextOffset <= offset ||
-        chunkLength > response.total
-      )
-        throw new Error("Full-message chunk response made no progress.");
-      offset = response.nextOffset;
-    }
-    if (!message && chunkLength > 0) {
-      const serialized = chunks.join("");
-      const parsed: unknown = JSON.parse(serialized);
-      if (
-        parsed &&
-        typeof parsed === "object" &&
-        "entryId" in parsed &&
-        parsed.entryId === entryId
-      )
-        message = parsed as MobileMessage;
-    }
-    if (!message) throw new Error("Full message response was incomplete.");
-    if (message.entryId !== entryId)
-      throw new Error("Full message response did not match the requested entry.");
-    if (
-      slotId !== activeId ||
-      generation !== activeState?.generation ||
-      responseGeneration !== generation
-    )
-      return;
-    fullMessageCache.set(key, message);
-    renderActive();
-  } catch (error: unknown) {
-    fullMessageFailures.add(key);
-    showToast(
-      hasAuth(error) ? "Access token rejected" : `Could not load full message: ${errorMessage(error)}`,
-      true,
-    );
-    if (hasAuth(error)) openTokenModal();
-  } finally {
-    fullMessageRequests.delete(key);
+  const retryAfter = fullMessageCapacityDeferred.get(key);
+  if (retryAfter !== undefined) {
+    if (retryAfter > Date.now()) return;
+    fullMessageCapacityDeferred.delete(key);
   }
+  if (
+    fullMessageCache.has(key) ||
+    fullMessageRequests.has(key) ||
+    fullMessageQueued.has(key) ||
+    fullMessageFailures.has(key)
+  )
+    return;
+  if (fullMessageQueue.length >= 1024) return;
+  fullMessageQueued.add(key);
+  fullMessageQueue.push({
+    key,
+    slotId,
+    generation,
+    entryId,
+    epoch: activeSlotEpoch,
+  });
+  queueHydrationBatch();
 }
 
 function historyCacheFor(
@@ -3581,6 +4173,7 @@ function historyCacheFor(
   } else if (state.history) {
     history.total = Math.max(history.total, state.history.total);
     history.shown = Math.max(history.shown, state.history.shown);
+    olderHistoryBySlot.set(slotId, history);
   }
   return history;
 }
@@ -3646,6 +4239,7 @@ async function loadOlderHistory(
     history.total = response.history.total;
     history.shown = Math.min(history.total, history.shown + response.messages.length);
     history.hasMore = response.history.hasMore;
+    olderHistoryBySlot.set(slotId, history);
   } catch (error: unknown) {
     if (request !== historyLoadRequest) return;
     history.error = hasAuth(error)
@@ -3686,9 +4280,6 @@ function appendStructuredDetails(
   parent.append(details);
 }
 
-function sameTranscriptPart(a: ChatPart, b: ChatPart): boolean {
-  return a === b || JSON.stringify(a) === JSON.stringify(b);
-}
 
 function sameTranscriptSnapshot(
   a: TranscriptRenderSnapshot,
@@ -3710,17 +4301,13 @@ function sameTranscriptSnapshot(
       left.entryId !== right.entryId ||
       left.liveMessage !== right.liveMessage ||
       left.needsFull !== right.needsFull ||
-      left.parts.length !== right.parts.length ||
+      left.fullContent !== right.fullContent ||
+      left.partSignatures.length !== right.partSignatures.length ||
       left.actions.length !== right.actions.length
     )
       return false;
-    for (let partIndex = 0; partIndex < left.parts.length; partIndex += 1)
-      if (
-        !sameTranscriptPart(
-          left.parts[partIndex]!,
-          right.parts[partIndex]!,
-        )
-      )
+    for (let partIndex = 0; partIndex < left.partSignatures.length; partIndex += 1)
+      if (left.partSignatures[partIndex] !== right.partSignatures[partIndex])
         return false;
     for (let actionIndex = 0; actionIndex < left.actions.length; actionIndex += 1) {
       const leftAction = left.actions[actionIndex]!;
@@ -3735,6 +4322,90 @@ function sameTranscriptSnapshot(
   return true;
 }
 
+function syncHistoryControls(
+  transcript: HTMLDivElement,
+  history: HistoryCache | undefined,
+): HTMLElement | null {
+  const shouldShow = Boolean(
+    history &&
+      (history.hasMore || history.error || history.total > history.shown),
+  );
+  let controls =
+    transcript.querySelector<HTMLElement>(".history-controls");
+  if (!shouldShow || !history) {
+    controls?.remove();
+    return null;
+  }
+  if (!controls) {
+    controls = document.createElement("div");
+    controls.className = "history-controls";
+  }
+  let status =
+    controls.querySelector<HTMLElement>(".history-status");
+  if (!status) {
+    status = document.createElement("span");
+    status.className = "history-status";
+    controls.prepend(status);
+  }
+  const statusText = history.error
+    ? `Older history unavailable: ${history.error}`
+    : !history.hasMore && history.total > history.shown
+      ? `Some older messages are not available (${history.shown} of ${history.total} loaded).`
+      : `Showing ${history.shown} of ${history.total} messages`;
+  if (status.textContent !== statusText) status.textContent = statusText;
+  let button =
+    controls.querySelector<HTMLButtonElement>(".history-load");
+  if (history.hasMore) {
+    if (!button) {
+      button = document.createElement("button");
+      button.type = "button";
+      button.className = "ghost-btn history-load";
+      button.addEventListener("click", () => {
+        if (activeState)
+          void loadOlderHistory(
+            activeId,
+            activeState,
+            historyCacheFor(activeId, activeState),
+          );
+      });
+      controls.append(button);
+    }
+    button.disabled = history.loading;
+    const label = history.loading
+      ? "Loading older messages…"
+      : history.error
+        ? "Retry loading older"
+        : "Load older messages";
+    if (button.textContent !== label) button.textContent = label;
+  } else {
+    button?.remove();
+  }
+  if (controls !== transcript.firstElementChild)
+    transcript.insertBefore(controls, transcript.firstChild);
+  return controls;
+}
+
+function transcriptArticles(transcript: HTMLDivElement): Map<string, HTMLElement> {
+  const owner = JSON.stringify([activeId, activeState?.generation]);
+  const articles = new Map<string, HTMLElement>();
+  transcript.querySelectorAll<HTMLElement>("article.message").forEach((article) => {
+    if (article.dataset.transcriptOwner === owner && article.dataset.msgKey)
+      articles.set(article.dataset.msgKey, article);
+  });
+  return articles;
+}
+
+function messagePartNodes(article: HTMLElement): Map<string, HTMLElement[]> {
+  const parts = new Map<string, HTMLElement[]>();
+  article.querySelectorAll<HTMLElement>(":scope > [data-part-key]").forEach((node) => {
+    const key = node.dataset.partKey?.split(":", 1)[0];
+    if (!key) return;
+    const existing = parts.get(key);
+    if (existing) existing.push(node);
+    else parts.set(key, [node]);
+  });
+  return parts;
+}
 function renderMessages(
   messages: ClientMessage[],
   active = false,
@@ -3812,16 +4483,20 @@ function renderMessages(
       kind === "error" || kind === "tool" || kind === "thinking" || kind === "user"
         ? kind
         : asString(message.role) ?? kind;
+    const liveMessage =
+      role === "status" || (active && messageIndex === lastConversationIndex);
+    const entryId = asString(message.entryId) ?? asString(message.id);
     prepared.push({
-      msgKey:
-        asString(message.entryId) ??
-        asString(message.id) ??
-        `msg-${messageIndex}`,
-      entryId: asString(message.entryId) ?? asString(message.id),
+      msgKey: entryId ?? `msg-${messageIndex}`,
+      entryId,
       role,
-      liveMessage: role === "status" || (active && messageIndex === lastConversationIndex),
+      liveMessage,
       needsFull,
+      fullContent: message.full === true,
       parts,
+      partSignatures: parts.map((part) =>
+        JSON.stringify([liveMessage, part]),
+      ),
       actions,
     });
   });
@@ -3840,6 +4515,18 @@ function renderMessages(
       : "",
     messages: prepared,
   };
+  // Unchanged snapshots must still resume hydration after temporary capacity pressure.
+  if (fullMessageCapacityDeferred.size > 0 && snapshot.generation) {
+    const now = Date.now();
+    for (const message of prepared) {
+      if (!message.needsFull || !message.entryId) continue;
+      const retryAfter = fullMessageCapacityDeferred.get(
+        fullMessageKey(snapshot.slotId, snapshot.generation, message.entryId),
+      );
+      if (retryAfter !== undefined && retryAfter <= now)
+        loadFullMessage(message.entryId);
+    }
+  }
   if (
     lastTranscriptSnapshot &&
     sameTranscriptSnapshot(lastTranscriptSnapshot, snapshot)
@@ -3850,75 +4537,115 @@ function renderMessages(
 
   const wasNear = transcriptNearBottom;
   const oldTop = transcript.scrollTop;
+  const existingArticles = transcriptArticles(transcript);
+  const oldTranscriptTop = transcript.getBoundingClientRect().top;
   let anchorKey: string | null = null;
-  let anchorOffset = 0;
+  let anchorViewportTop = 0;
   if (!wasNear && lastRenderedMessageCount > 0) {
-    const articles =
-      transcript.querySelectorAll<HTMLElement>("article.message");
-    for (const art of articles) {
-      if (art.offsetTop + art.offsetHeight > oldTop) {
-        anchorKey = art.dataset.msgKey || null;
-        anchorOffset = oldTop - art.offsetTop;
+    for (const article of transcript.querySelectorAll<HTMLElement>(
+      "article.message",
+    )) {
+      const rect = article.getBoundingClientRect();
+      if (rect.bottom > oldTranscriptTop) {
+        anchorKey = article.dataset.msgKey || null;
+        anchorViewportTop = rect.top;
         break;
       }
     }
   }
-
-  transcript.innerHTML = "";
-  if (history && (history.hasMore || history.error || history.total > history.shown)) {
-    const controls = document.createElement("div");
-    controls.className = "history-controls";
-    const status = document.createElement("span");
-    status.className = "history-status";
-    status.textContent = history.error
-      ? `Older history unavailable: ${history.error}`
-      : `Showing ${history.shown} of ${history.total} messages`;
-    controls.append(status);
-    if (history.hasMore) {
-      const button = document.createElement("button");
-      button.type = "button";
-      button.className = "ghost-btn history-load";
-      button.disabled = history.loading;
-      button.textContent = history.loading
-        ? "Loading older messages…"
-        : history.error
-          ? "Retry loading older"
-          : "Load older messages";
-      button.addEventListener("click", () => {
-        if (activeState)
-          void loadOlderHistory(activeId, activeState, history);
-      });
-      controls.append(button);
-    } else if (history.total > history.shown && !history.error) {
-      status.textContent =
-        `Some older messages are not available (${history.shown} of ${history.total} loaded).`;
-    }
-    transcript.append(controls);
-  }
+  const controls = syncHistoryControls(transcript, history);
+  const oldEmpty = transcript.querySelector<HTMLElement>(".transcript-empty");
   if (messages.length === 0) {
+    for (const article of transcript.querySelectorAll<HTMLElement>(
+      "article.message",
+    )) {
+      transcriptResizeObserver?.unobserve(article);
+      observedTranscriptArticles.delete(article);
+      article.remove();
+    }
     if (!history?.hasMore) {
-      const empty = document.createElement("div");
+      const empty =
+        oldEmpty ?? document.createElement("div");
       empty.className = "transcript-empty";
-      empty.textContent = "No messages in this session yet.";
-      transcript.append(empty);
+      if (empty.textContent !== "No messages in this session yet.")
+        empty.textContent = "No messages in this session yet.";
+      if (!empty.isConnected) transcript.append(empty);
+    } else {
+      oldEmpty?.remove();
     }
     lastRenderedMessageCount = 0;
     lastTranscriptSnapshot = snapshot;
     return;
   }
+  oldEmpty?.remove();
 
+  if (!transcriptResizeObserver) {
+    transcriptResizeObserver = new ResizeObserver(() => {
+      const box = document.querySelector<HTMLDivElement>("#transcript");
+      if (!box) return;
+      if (transcriptNearBottom) {
+        box.scrollTop = box.scrollHeight;
+      } else if (transcriptAnchor) {
+        const anchor = Array.from(
+          box.querySelectorAll<HTMLElement>("article.message"),
+        ).find((item) => item.dataset.msgKey === transcriptAnchor?.msgKey);
+        if (anchor) {
+          const boxTop = box.getBoundingClientRect().top;
+          const anchorTop = anchor.getBoundingClientRect().top - boxTop;
+          box.scrollTop += anchorTop - transcriptAnchor.offset;
+        }
+      }
+    });
+  }
+  const transcriptOwner = JSON.stringify([activeId, activeState?.generation]);
+  let articleCursor = controls?.nextSibling ?? transcript.firstChild;
   prepared.forEach(
-    ({ msgKey, entryId, role, liveMessage, needsFull, parts, actions }) => {
-      const article = document.createElement("article");
-      article.className = `message ${role}`;
+    ({
+      msgKey,
+      entryId,
+      role,
+      liveMessage,
+      needsFull,
+      fullContent,
+      parts,
+      partSignatures,
+      actions,
+    }) => {
+      const article =
+        existingArticles.get(msgKey) ?? document.createElement("article");
+      existingArticles.delete(msgKey);
+      const articleClass = `message ${role}`;
+      if (article.className !== articleClass) article.className = articleClass;
       article.dataset.msgKey = msgKey;
-      parts.forEach((part, partIndex) => {
-      if (!part || typeof part !== "object") return;
+      article.dataset.transcriptOwner = transcriptOwner;
+      const priorPartNodes = messagePartNodes(article);
+      const preserveRecoveredContent =
+        !fullContent &&
+        needsFull &&
+        Boolean(entryId) &&
+        article.dataset.fullContent === "true";
+      const desiredPartNodes: HTMLElement[] = [];
+      if (preserveRecoveredContent) {
+        for (const nodes of priorPartNodes.values())
+          desiredPartNodes.push(...nodes);
+      }
+      if (!preserveRecoveredContent) parts.forEach((part, partIndex) => {
+        if (!part || typeof part !== "object") return;
+        const signature = partSignatures[partIndex] ?? "";
+        const retained = priorPartNodes.get(String(partIndex));
+        if (
+          retained?.length &&
+          retained.every((node) => node.dataset.partSignature === signature)
+        ) {
+          desiredPartNodes.push(...retained);
+          return;
+        }
+        const partTarget = document.createElement("div");
       if (part.kind === "text") {
         const partDiv = document.createElement("div");
         partDiv.className = "part part-text";
         appendFormatted(partDiv, part.text ?? "");
-        article.append(partDiv);
+        partTarget.append(partDiv);
       } else if (part.kind === "thinking") {
         const details = document.createElement("details");
         details.className = "part part-thinking";
@@ -3964,89 +4691,84 @@ function renderMessages(
         body.className = "part-thinking-body";
         appendFormatted(body, part.text ?? "");
         details.append(body);
-        article.append(details);
+        partTarget.append(details);
       } else if (part.kind === "tool") {
         if (part.ask) {
-          appendAskCard(article, part);
-          return;
-        }
-        const details = document.createElement("details");
-        details.className = `part part-tool${part.isError ? " part-error" : ""}`;
-        const taskAgents = part.task?.agents ?? [];
-        if (taskAgents.length > 0) details.classList.add("part-task");
-        const toolMsgKey = msgKey;
-        const toolId = part.id || `${part.name}-${partIndex}`;
-        const toolKey = `${activeId}:${activeState?.generation}:${toolMsgKey}:tool:${toolId}`;
-        details.open = expandedToolKeys.has(toolKey);
-        details.addEventListener("toggle", () => {
-          if (details.open) {
-            expandedToolKeys.add(toolKey);
-          } else {
-            expandedToolKeys.delete(toolKey);
-          }
-        });
-        const summary = document.createElement("summary");
-        summary.className = "part-tool-summary";
-        let line = part.format === "rich"
-          ? `→ ${part.name}`
-          : part.summary ? `→ ${part.name}(${part.summary})` : `→ ${part.name}()`;
-        if (taskAgents.length > 0) {
-          const running = taskAgents.filter(
-            (agent) => agent.status === "running" || agent.status === "pending",
-          ).length;
-          line += ` · ${taskAgents.length} subagent${taskAgents.length === 1 ? "" : "s"}`;
-          if (running > 0) line += ` (${running} running)`;
-        }
-        if (line.length > 90) {
-          line = line.slice(0, 87) + "…";
-        }
-        const live =
-          (liveMessage && (role === "status" || part.output === undefined)) ||
-          taskAgents.some(
-            (agent) => agent.status === "running" || agent.status === "pending",
-          );
-        if (live) {
-          summary.classList.add("live");
-          const glyph = document.createElement("span");
-          glyph.className = "working-spinner";
-          glyph.textContent = SPINNER_FRAMES[0];
-          const sweep = document.createElement("span");
-          sweep.className = "shimmer";
-          sweep.innerHTML = shimmerMarkup(line);
-          summary.append(glyph, sweep);
+          appendAskCard(partTarget, part);
         } else {
-          summary.textContent = line;
-        }
-        details.append(summary);
-
-        if (taskAgents.length > 0) {
-          const taskBody = document.createElement("div");
-          taskBody.className = "part-task-body";
-          appendAgentRows(taskBody, taskAgents);
-          details.append(taskBody);
-        }
-
-        appendStructuredDetails(details, part.format === "rich" ? "Event details" : "Arguments and details", part.details);
-        if (part.format === "rich" && part.output) {
-          const body = document.createElement("div");
-          body.className = "part-event-body";
-          appendFormatted(body, part.output);
-          details.append(body);
-        } else if (part.output != null && part.output !== "") {
-          const rawOut = part.output;
-          const diffOutput =
-            /^(?:diff --git |@@ |--- |\+\+\+ )/m.test(rawOut);
-          appendPreformatted(
+          const details = document.createElement("details");
+          details.className = `part part-tool${part.isError ? " part-error" : ""}`;
+          const taskAgents = part.task?.agents ?? [];
+          if (taskAgents.length > 0) details.classList.add("part-task");
+          const toolMsgKey = msgKey;
+          const toolId = part.id || `${part.name}-${partIndex}`;
+          const toolKey = `${activeId}:${activeState?.generation}:${toolMsgKey}:tool:${toolId}`;
+          details.open = expandedToolKeys.has(toolKey);
+          details.addEventListener("toggle", () => {
+            if (details.open) expandedToolKeys.add(toolKey);
+            else expandedToolKeys.delete(toolKey);
+          });
+          const summary = document.createElement("summary");
+          summary.className = "part-tool-summary";
+          let line = part.format === "rich"
+            ? `→ ${part.name}`
+            : part.summary ? `→ ${part.name}(${part.summary})` : `→ ${part.name}()`;
+          if (taskAgents.length > 0) {
+            const running = taskAgents.filter(
+              (agent) => agent.status === "running" || agent.status === "pending",
+            ).length;
+            line += ` · ${taskAgents.length} subagent${taskAgents.length === 1 ? "" : "s"}`;
+            if (running > 0) line += ` (${running} running)`;
+          }
+          if (line.length > 90) line = line.slice(0, 87) + "…";
+          const live =
+            (liveMessage && (role === "status" || part.output === undefined)) ||
+            taskAgents.some(
+              (agent) => agent.status === "running" || agent.status === "pending",
+            );
+          if (live) {
+            summary.classList.add("live");
+            const glyph = document.createElement("span");
+            glyph.className = "working-spinner";
+            glyph.textContent = SPINNER_FRAMES[0];
+            const sweep = document.createElement("span");
+            sweep.className = "shimmer";
+            sweep.innerHTML = shimmerMarkup(line);
+            summary.append(glyph, sweep);
+          } else {
+            summary.textContent = line;
+          }
+          details.append(summary);
+          if (taskAgents.length > 0) {
+            const taskBody = document.createElement("div");
+            taskBody.className = "part-task-body";
+            appendAgentRows(taskBody, taskAgents);
+            details.append(taskBody);
+          }
+          appendStructuredDetails(
             details,
-            `part-output${diffOutput ? " diff-output" : ""}`,
-            rawOut,
+            part.format === "rich" ? "Event details" : "Arguments and details",
+            part.details,
           );
+          if (part.format === "rich" && part.output) {
+            const body = document.createElement("div");
+            body.className = "part-event-body";
+            appendFormatted(body, part.output);
+            details.append(body);
+          } else if (part.output != null && part.output !== "") {
+            const diffOutput = /^(?:diff --git |@@ |--- |\+\+\+ )/m.test(part.output);
+            appendPreformatted(
+              details,
+              `part-output${diffOutput ? " diff-output" : ""}`,
+              part.output,
+            );
+          }
+          appendPartImages(details, part.images ?? [], msgKey, "Tool image");
+          partTarget.append(details);
         }
-        appendPartImages(details, part.images ?? [], msgKey, "Tool image");
-        article.append(details);
       } else if (part.kind === "image") {
         appendMobileImage(
-          article,
+          partTarget,
           part.image,
           part.label || "Image",
           msgKey,
@@ -4088,7 +4810,7 @@ function renderMessages(
           );
         appendStructuredDetails(execution, "Execution details", part.details);
         appendPartImages(execution, part.images ?? [], msgKey, "Execution image");
-        article.append(execution);
+        partTarget.append(execution);
       } else if (part.kind === "files") {
         const files = document.createElement("section");
         files.className = "part part-files";
@@ -4105,7 +4827,7 @@ function renderMessages(
             appendPreformatted(item, "part-file-content", file.text);
           files.append(item);
         }
-        article.append(files);
+        partTarget.append(files);
       } else {
         const unsupported = document.createElement("section");
         unsupported.className = "part part-unsupported";
@@ -4117,51 +4839,111 @@ function renderMessages(
           "part-unsupported-content",
           serializableUnknown(part),
         );
-        article.append(unsupported);
+        partTarget.append(unsupported);
       }
-    });
-      if (needsFull) {
-        if (!entryId) {
-          const note = document.createElement("p");
-          note.className = "full-message-unavailable";
-          note.textContent =
-            "Full content cannot be fetched because this message has no history identifier.";
-          article.append(note);
-        } else if (activeState?.generation) {
-          void loadFullMessage(entryId);
-        }
-      }
-
-    if (actions.length > 0) {
-      const actionList = document.createElement("div");
-      actionList.className = "message-actions";
-      actions.forEach((action) => {
-        const button = document.createElement("button");
-        button.className = "ghost-btn";
-        button.textContent = action.label;
-        button.addEventListener("click", () => {
-          if (
-            typeof action.url === "string" &&
-            /^https?:\/\//i.test(action.url)
-          )
-            window.open(action.url, "_blank", "noopener");
-          else showToast("This action is not available on mobile", true);
-        });
-        actionList.append(button);
+      Array.from(partTarget.children).forEach((node, nodeIndex) => {
+        const element = node as HTMLElement;
+        element.dataset.partKey = `${partIndex}:${nodeIndex}`;
+        element.dataset.partSignature = signature;
+        desiredPartNodes.push(element);
       });
-      article.append(actionList);
-    }
-
-    transcript.append(article);
-  });
+    });
+      let fullNote =
+        article.querySelector<HTMLElement>(":scope > [data-full-message-note]");
+      if (needsFull && !entryId) {
+        if (!fullNote) {
+          fullNote = document.createElement("p");
+          fullNote.className = "full-message-unavailable";
+          fullNote.dataset.fullMessageNote = "true";
+          fullNote.textContent =
+            "Full content cannot be fetched because this message has no history identifier.";
+        }
+      } else {
+        fullNote?.remove();
+        fullNote = null;
+      }
+      const actionSignature = JSON.stringify(actions);
+      let actionNode =
+        article.querySelector<HTMLElement>(":scope > [data-action-signature]");
+      if (actions.length > 0) {
+        if (!actionNode || actionNode.dataset.actionSignature !== actionSignature) {
+          actionNode = document.createElement("div");
+          actionNode.className = "message-actions";
+          actions.forEach((action) => {
+            const button = document.createElement("button");
+            button.className = "ghost-btn";
+            button.textContent = action.label;
+            button.addEventListener("click", () => {
+              if (
+                typeof action.url === "string" &&
+                /^https?:\/\//i.test(action.url)
+              )
+                window.open(action.url, "_blank", "noopener");
+              else showToast("This action is not available on mobile", true);
+            });
+            actionNode?.append(button);
+          });
+          actionNode.dataset.actionSignature = actionSignature;
+        }
+      } else {
+        actionNode?.remove();
+        actionNode = null;
+      }
+      article.dataset.fullContent =
+        fullContent || preserveRecoveredContent ? "true" : "false";
+      const desiredChildren = [
+        ...desiredPartNodes,
+        ...(fullNote ? [fullNote] : []),
+        ...(actionNode ? [actionNode] : []),
+      ];
+      desiredChildren.forEach((child, index) => {
+        const current = article.childNodes[index];
+        if (current !== child)
+          article.insertBefore(child, current ?? null);
+      });
+      while (article.childNodes.length > desiredChildren.length)
+        article.lastChild?.remove();
+      if (articleCursor !== article)
+        transcript.insertBefore(article, articleCursor);
+      articleCursor = article.nextSibling;
+      if (!observedTranscriptArticles.has(article)) {
+        transcriptResizeObserver?.observe(article);
+        observedTranscriptArticles.add(article);
+      }
+      if (
+        needsFull &&
+        entryId &&
+        activeState?.generation &&
+        !preserveRecoveredContent
+      )
+        loadFullMessage(entryId);
+    },
+  );
+  for (const stale of existingArticles.values()) {
+    transcriptResizeObserver?.unobserve(stale);
+    observedTranscriptArticles.delete(stale);
+    stale.remove();
+  }
+  for (const stale of transcript.querySelectorAll<HTMLElement>("article.message")) {
+    if (stale.dataset.transcriptOwner === transcriptOwner) continue;
+    transcriptResizeObserver?.unobserve(stale);
+    observedTranscriptArticles.delete(stale);
+    stale.remove();
+  }
   if (wasNear || lastRenderedMessageCount === 0) {
     transcript.scrollTop = transcript.scrollHeight;
+    transcriptNearBottom = true;
+    transcriptAnchor = null;
   } else if (anchorKey) {
-    const anchorEl = transcript.querySelector<HTMLElement>(
-      `article.message[data-msg-key="${CSS.escape(anchorKey)}"]`,
-    );
+    const anchorEl = Array.from(
+      transcript.querySelectorAll<HTMLElement>("article.message"),
+    ).find((article) => article.dataset.msgKey === anchorKey);
     if (anchorEl) {
-      transcript.scrollTop = anchorEl.offsetTop + anchorOffset;
+      const anchorTop =
+        anchorEl.getBoundingClientRect().top -
+        transcript.getBoundingClientRect().top;
+      transcript.scrollTop += anchorTop - (anchorViewportTop - oldTranscriptTop);
+      transcriptAnchor = { msgKey: anchorKey, offset: anchorViewportTop - oldTranscriptTop };
     } else {
       transcript.scrollTop = oldTop;
     }
@@ -4173,17 +4955,21 @@ function renderMessages(
       transcript.scrollTop -
       transcript.clientHeight <
     90;
-  document
-    .querySelector("#scroll-bottom")
-    ?.classList.toggle("hidden", transcriptNearBottom);
+  if (transcriptNearBottom) transcriptAnchor = null;
+  const scrollButton = document.querySelector<HTMLButtonElement>("#scroll-bottom");
+  if (scrollButton)
+    scrollButton.classList.toggle("hidden", transcriptNearBottom);
   lastTranscriptSnapshot = snapshot;
   lastRenderedMessageCount = messages.length;
 }
 let rawMode = localStorage.getItem("omp-mobile-raw") === "1";
 let rawRequest = 0;
+let rawLoading: Promise<void> | null = null;
+let rawReloadPending = false;
 
 /** Mirrors the host pane through the gateway's read-only terminal snapshot. */
 function applyRawMode(): void {
+  rawRequest += 1;
   const button = document.querySelector<HTMLButtonElement>("#raw-toggle");
   if (button) {
     button.classList.toggle("active", rawMode);
@@ -4199,7 +4985,23 @@ function applyRawMode(): void {
   document.body.classList.toggle("raw-mode", rawMode);
 }
 
-async function loadRawTerminal(): Promise<void> {
+function loadRawTerminal(): Promise<void> {
+  if (!rawMode) return Promise.resolve();
+  if (rawLoading) {
+    rawReloadPending = true;
+    return rawLoading;
+  }
+  rawLoading = loadRawTerminalOnce().finally(() => {
+    rawLoading = null;
+    if (rawReloadPending) {
+      rawReloadPending = false;
+      if (rawMode && document.visibilityState === "visible")
+        void loadRawTerminal();
+    }
+  });
+  return rawLoading;
+}
+async function loadRawTerminalOnce(): Promise<void> {
   if (!rawMode) return;
   const view = document.querySelector<HTMLElement>("#raw-view");
   if (!view) return;
@@ -4271,6 +5073,21 @@ function renderActivity(state: ClientState | null): void {
   const runningJobs = jobs.filter((job) => job.status === "running").length;
   const hasTodos = todoPhases.length > 0;
   const hasDetails = agents.length > 0 || jobs.length > 0;
+  const durationTick = jobs.some(
+    (job) => job.status === "running" && job.durationMs === undefined,
+  )
+    ? Math.floor(Date.now() / 1000)
+    : 0;
+  const renderKey = JSON.stringify([
+    activeId,
+    todosExpanded,
+    todoPhases,
+    agents,
+    jobs,
+    durationTick,
+  ]);
+  if (renderKey === lastActivityRenderKey) return;
+  lastActivityRenderKey = renderKey;
   const visible = hasTodos || hasDetails;
   dock.classList.toggle("hidden", !visible);
   content.classList.toggle("hidden", !visible || !todosExpanded);
@@ -4357,10 +5174,12 @@ function renderComposerWorking(active: boolean, state: ClientState | null): void
   const box = document.querySelector<HTMLElement>("#composer-working");
   const holder = document.querySelector<HTMLElement>("#composer-working-text");
   if (!box || !holder) return;
-  box.classList.toggle("hidden", !active);
+  const hidden = !active;
+  if (box.classList.contains("hidden") !== hidden)
+    box.classList.toggle("hidden", hidden);
   if (!active) return;
   const text = state?.activity?.working?.trim() || "Working…";
-  box.title = text;
+  if (box.title !== text) box.title = text;
   if (text !== lastComposerWorkingText) {
     holder.innerHTML = shimmerMarkup(text);
     lastComposerWorkingText = text;
@@ -4646,9 +5465,24 @@ function renderRuntime(state: ClientState | null): void {
         }
       })
     : false;
-  const renderKey = JSON.stringify([activeId, state?.generation, runtime, inFlight]);
+  const renderKey = JSON.stringify([
+    activeId,
+    state?.generation,
+    interaction,
+    inFlight,
+  ]);
   if (renderKey === lastRuntimeRenderKey) return;
   lastRuntimeRenderKey = renderKey;
+  const sameInteraction =
+    area.querySelector<HTMLElement>(".runtime-interaction")?.dataset
+      .interactionId === interaction?.id;
+  const preservedScrollTop = sameInteraction ? area.scrollTop : 0;
+  area.classList.toggle(
+    "has-scrollable-ask",
+    interaction?.kind === "ask" &&
+      interaction.transport === "native" &&
+      Boolean(interaction.questions?.length),
+  );
   area.innerHTML = "";
   area.classList.toggle("hidden", !state);
   if (!state) return;
@@ -4657,6 +5491,7 @@ function renderRuntime(state: ClientState | null): void {
 
   const card = document.createElement("section");
   card.className = `runtime-card runtime-interaction interaction-${interaction.kind}`;
+  card.dataset.interactionId = interaction.id;
   card.setAttribute("aria-label", `Pending ${interaction.kind}: ${interaction.title}`);
   const title = document.createElement("strong");
   title.className = "runtime-interaction-title";
@@ -4766,6 +5601,7 @@ function renderRuntime(state: ClientState | null): void {
     card.append(controls);
   }
   area.append(card);
+  area.scrollTop = preservedScrollTop;
 }
 
 function renderAttachments(): void {
@@ -5147,16 +5983,22 @@ function renderActive(): void {
   renderAttachments();
   syncTopBar();
   const prompt = requiredElement<HTMLDivElement>("#prompt");
-  prompt.dataset.placeholder = pendingInteraction
+  const promptPlaceholder = pendingInteraction
     ? "Resolve the pending dialog above…"
     : activeId
       ? "Message this session…"
       : "Start or select a session…";
-  prompt.contentEditable = String(!pendingInteraction);
-  prompt.setAttribute("aria-disabled", String(pendingInteraction));
+  if (prompt.dataset.placeholder !== promptPlaceholder)
+    prompt.dataset.placeholder = promptPlaceholder;
+  const editable = String(!pendingInteraction);
+  if (prompt.contentEditable !== editable) prompt.contentEditable = editable;
+  setAttributeIfChanged(prompt, "aria-disabled", String(pendingInteraction));
   if (document.activeElement !== prompt) {
-    prompt.innerText = draftFor();
-    resizePrompt();
+    const draft = draftFor();
+    if (prompt.innerText !== draft) {
+      prompt.innerText = draft;
+      resizePrompt();
+    }
   }
   renderCommandMenu();
   const transcript = requiredElement<HTMLDivElement>("#transcript");
@@ -5199,7 +6041,8 @@ function renderActive(): void {
     : state?.pendingMessages ?? [];
   const hasPendingMessages = state?.hasPendingMessages === true;
   if (hasPendingMessages || pendingMessages.length > 0) {
-    const queueState = hasPendingMessages || state?.runtime?.queue?.length ? "Queued" : "Submitting";
+    const queueState =
+      hasPendingMessages || state?.runtime?.queue?.length ? "Queued" : "Submitting";
     const messageItems = pendingMessages.length
       ? `<ol>${pendingMessages
           .map(
@@ -5208,18 +6051,26 @@ function renderActive(): void {
           )
           .join("")}</ol>`
       : "";
-    pendingContainer.innerHTML = `<div class="pending-card"><div class="pending-heading">${queueState}</div>${messageItems}</div>`;
+    const pendingHtml = `<div class="pending-card"><div class="pending-heading">${queueState}</div>${messageItems}</div>`;
+    if (pendingContainer.innerHTML !== pendingHtml)
+      pendingContainer.innerHTML = pendingHtml;
     pendingContainer.classList.remove("hidden");
   } else {
-    pendingContainer.innerHTML = "";
+    if (pendingContainer.innerHTML) pendingContainer.innerHTML = "";
     pendingContainer.classList.add("hidden");
   }
   const sendButton = requiredElement<HTMLButtonElement>("#send");
   const forceReady =
     hasPendingMessages && active && !prompt.innerText.trim();
-  sendButton.innerHTML = `<svg width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="${forceReady ? "m13 2-8 12h6l-1 8 9-13h-6l1-7" : "M12 19V5m-6 6 6-6 6 6"}"/></svg>`;
-  sendButton.title = forceReady ? "Force queued messages now" : "Send message";
-  sendButton.setAttribute(
+  const sendMarkup = `<svg width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="${forceReady ? "m13 2-8 12h6l-1 8 9-13h-6l1-7" : "M12 19V5m-6 6 6-6 6 6"}"/></svg>`;
+  if (sendButton.innerHTML !== sendMarkup) sendButton.innerHTML = sendMarkup;
+  setAttributeIfChanged(
+    sendButton,
+    "title",
+    forceReady ? "Force queued messages now" : "Send message",
+  );
+  setAttributeIfChanged(
+    sendButton,
     "aria-label",
     forceReady ? "Force queued messages now" : "Send message",
   );
@@ -5243,13 +6094,13 @@ function renderActive(): void {
     notice = "Effort selection is unavailable";
   }
 
-  if (notice) {
-    caps.innerHTML = `<span class="capability off">${esc(notice)}</span>`;
-    caps.classList.remove("hidden");
-  } else {
-    caps.innerHTML = "";
-    caps.classList.add("hidden");
-  }
+  const capabilityMarkup = notice
+    ? `<span class="capability off">${esc(notice)}</span>`
+    : "";
+  if (caps.innerHTML !== capabilityMarkup) caps.innerHTML = capabilityMarkup;
+  const capsHidden = !notice;
+  if (caps.classList.contains("hidden") !== capsHidden)
+    caps.classList.toggle("hidden", capsHidden);
 
   // An unnamed session has no assigned accent, even when its theme has one.
   const sessionAccent =
@@ -5287,12 +6138,13 @@ function renderActive(): void {
   const composerBorderColor = sessionAccent;
 
   const root = document.documentElement;
-  root.style.setProperty("--session-accent", sessionAccent);
-  root.style.setProperty("--model-color", modelColor);
-  root.style.setProperty("--thinking-color", thinkingColor);
-  root.style.setProperty("--ctx-text-color", ctxTextColor);
-  root.style.setProperty("--cost-color", costColor);
-  root.style.setProperty(
+  setStyleIfChanged(root.style, "--session-accent", sessionAccent);
+  setStyleIfChanged(root.style, "--model-color", modelColor);
+  setStyleIfChanged(root.style, "--thinking-color", thinkingColor);
+  setStyleIfChanged(root.style, "--ctx-text-color", ctxTextColor);
+  setStyleIfChanged(root.style, "--cost-color", costColor);
+  setStyleIfChanged(
+    root.style,
     "--ctx-fill-width",
     `${
       contextPercent !== undefined
@@ -5300,66 +6152,86 @@ function renderActive(): void {
         : 0
     }%`,
   );
-  root.style.setProperty("--composer-border", composerBorderColor);
+  setStyleIfChanged(root.style, "--composer-border", composerBorderColor);
 
   const modelBtn = requiredElement<HTMLButtonElement>("#model-open");
-  modelBtn.textContent = state?.model ? normalizeModel(state.model) : "Model";
-  modelBtn.disabled = pendingInteraction || !capability("model");
+  setTextIfChanged(
+    modelBtn,
+    state?.model ? normalizeModel(state.model) : "Model",
+  );
+  const modelDisabled = pendingInteraction || !capability("model");
+  if (modelBtn.disabled !== modelDisabled) modelBtn.disabled = modelDisabled;
 
   const effortBtn = requiredElement<HTMLButtonElement>("#effort-open");
-  effortBtn.textContent =
-    state?.effort === "medium" ? "med" : state?.effort != null ? String(state.effort) : "Effort";
-  effortBtn.disabled = pendingInteraction || !capability("effort");
+  setTextIfChanged(
+    effortBtn,
+    state?.effort === "medium"
+      ? "med"
+      : state?.effort != null
+        ? String(state.effort)
+        : "Effort",
+  );
+  const effortDisabled = pendingInteraction || !capability("effort");
+  if (effortBtn.disabled !== effortDisabled)
+    effortBtn.disabled = effortDisabled;
 
   const ctxLabel = document.querySelector<HTMLElement>("#ctx-label");
   if (ctxLabel) {
-    if (contextPercent !== undefined) {
-      if (contextWindow !== undefined) {
-        ctxLabel.textContent = `${contextPercent.toFixed(1)}%/${formatNumber(contextWindow)}`;
-      } else {
-        ctxLabel.textContent = `${contextPercent.toFixed(1)}%`;
-      }
-      ctxLabel.style.display = "";
-    } else {
-      ctxLabel.textContent = "";
-      ctxLabel.style.display = "none";
-    }
+    const contextText =
+      contextPercent === undefined
+        ? ""
+        : contextWindow !== undefined
+          ? `${contextPercent.toFixed(1)}%/${formatNumber(contextWindow)}`
+          : `${contextPercent.toFixed(1)}%`;
+    setTextIfChanged(ctxLabel, contextText);
+    setStyleIfChanged(
+      ctxLabel.style,
+      "display",
+      contextPercent === undefined ? "none" : "",
+    );
   }
 
   const costLabel = document.querySelector<HTMLElement>("#cost-label");
   if (costLabel) {
     const total = state?.cost?.total;
-    if (typeof total === "number" && Number.isFinite(total) && total > 0) {
-      costLabel.textContent = `$${total.toFixed(2)}`;
-      costLabel.style.display = "";
-    } else {
-      costLabel.textContent = "";
-      costLabel.style.display = "none";
-    }
+    const hasCost =
+      typeof total === "number" && Number.isFinite(total) && total > 0;
+    setTextIfChanged(
+      costLabel,
+      hasCost ? `$${total.toFixed(2)}` : "",
+    );
+    setStyleIfChanged(costLabel.style, "display", hasCost ? "" : "none");
   }
 
   const abortBtn = requiredElement<HTMLButtonElement>("#abort");
-  abortBtn.classList.toggle("hidden", !active || !capability("abort"));
+  const abortHidden = !active || !capability("abort");
+  if (abortBtn.classList.contains("hidden") !== abortHidden)
+    abortBtn.classList.toggle("hidden", abortHidden);
 
   const sendBtn = requiredElement<HTMLButtonElement>("#send");
-  sendBtn.disabled =
+  const sendDisabled =
     pendingInteraction || !capability("prompt") || !slot.connected;
+  if (sendBtn.disabled !== sendDisabled) sendBtn.disabled = sendDisabled;
   const attachButton =
     requiredElement<HTMLButtonElement>("#attach-images");
   const imageInput = requiredElement<HTMLInputElement>("#image-input");
-  attachButton.disabled = pendingInteraction;
-  imageInput.disabled = pendingInteraction;
+  if (attachButton.disabled !== pendingInteraction)
+    attachButton.disabled = pendingInteraction;
+  if (imageInput.disabled !== pendingInteraction)
+    imageInput.disabled = pendingInteraction;
   document
     .querySelectorAll<HTMLButtonElement>(".attachment-remove")
     .forEach((button) => {
-      button.disabled = pendingInteraction;
+      if (button.disabled !== pendingInteraction)
+        button.disabled = pendingInteraction;
     });
 
   const effort =
     typeof state?.effort === "string" ? state.effort.trim().toLowerCase() : "";
   if (effort) {
-    document.documentElement.dataset.effort = effort;
-  } else {
+    if (document.documentElement.dataset.effort !== effort)
+      document.documentElement.dataset.effort = effort;
+  } else if (document.documentElement.hasAttribute("data-effort")) {
     delete document.documentElement.dataset.effort;
   }
 
@@ -5373,14 +6245,17 @@ function renderActive(): void {
       const idx = currentIdx >= 0 ? currentIdx : 0;
       const fraction = values.length > 1 ? idx / (values.length - 1) : 0;
       const val = values[idx] ?? "";
-      range.max = String(values.length - 1);
-      range.value = String(idx);
-      popover.style.setProperty(
+      const max = String(values.length - 1);
+      if (range.max !== max) range.max = max;
+      const rangeValue = String(idx);
+      if (range.value !== rangeValue) range.value = rangeValue;
+      setStyleIfChanged(
+        popover.style,
         "--effort-fill",
         `calc(${fraction * 100}% + ${1 - fraction} * var(--effort-cap-size))`,
       );
-      range.setAttribute("aria-valuetext", effortDisplayName(val));
-      currentLabel.textContent = effortDisplayName(val);
+      setAttributeIfChanged(range, "aria-valuetext", effortDisplayName(val));
+      setTextIfChanged(currentLabel, effortDisplayName(val));
     }
   }
 
@@ -5421,6 +6296,9 @@ function reconcileActiveSlot(): void {
   for (const id of [...unreadBySlot.keys()]) {
     if (!liveIds.has(id)) unreadBySlot.delete(id);
   }
+  for (const id of [...unreadCountsBySlot.keys()]) {
+    if (!liveIds.has(id)) unreadCountsBySlot.delete(id);
+  }
   if (activeId && liveIds.has(activeId)) {
     if (!initialStateRequested) {
       initialStateRequested = true;
@@ -5429,14 +6307,16 @@ function reconcileActiveSlot(): void {
     return;
   }
   const prompt = document.querySelector<HTMLDivElement>("#prompt");
-  if (activeId && liveIds.has(activeId)) drafts.set(activeId, prompt?.innerText ?? "");
+  if (activeId && liveIds.has(activeId)) storeDraft(activeId, prompt?.innerText ?? "");
   if (activeId && liveIds.has(activeId))
     attachmentsBySlot.set(activeId, attachedImages);
   // Falling back to another runtime (or none) changes the session identity:
   // any `/move` listing belongs to the runtime that just disappeared.
   dismissedMoveDraft = null;
   resetMoveCompletion();
+  const previousId = activeId;
   activeId = slots[0]?.id ?? "";
+  if (previousId !== activeId) activeSlotEpoch += 1;
   attachedImages = activeId ? (attachmentsBySlot.get(activeId) ?? []) : [];
   attachmentRevision += 1;
   activeState = activeId ? cache.get(activeId) ?? null : null;
@@ -5446,6 +6326,7 @@ function reconcileActiveSlot(): void {
     resizePrompt();
   }
   transcriptNearBottom = true;
+  transcriptAnchor = null;
   lastRenderedMessageCount = 0;
   if (activeId) localStorage.setItem("omp-mobile-active-slot", activeId);
   else localStorage.removeItem("omp-mobile-active-slot");
@@ -5456,9 +6337,15 @@ function reconcileActiveSlot(): void {
     void loadState();
   }
   void loadRawTerminal();
+  void loadNotifications();
 }
 
 async function loadSlots(): Promise<void> {
+  if (slotsLoading) {
+    slotsReloadPending = true;
+    return;
+  }
+  slotsLoading = true;
   const request = ++slotsRequest;
   try {
     const result = await api<SlotsResponse>("/api/slots");
@@ -5475,6 +6362,7 @@ async function loadSlots(): Promise<void> {
         }
         return { ...slot, sessionFile: adopted };
       });
+    for (const slot of slots) migrateDraftForSlot(slot);
     for (const id of [...resumeAdoptedFiles.keys()])
       if (!slots.some((slot) => slot.id === id)) resumeAdoptedFiles.delete(id);
     reconcileActiveSlot();
@@ -5489,15 +6377,26 @@ async function loadSlots(): Promise<void> {
     if (!slots.length) reconcileActiveSlot();
     updateSlots();
     if (hasAuth(error)) openTokenModal();
+  } finally {
+    slotsLoading = false;
+    if (slotsReloadPending) {
+      slotsReloadPending = false;
+      void loadSlots();
+    }
   }
 }
 async function loadState(): Promise<void> {
+  if (stateLoading) {
+    stateReloadPending = true;
+    return;
+  }
   if (!activeId) {
     activeState = null;
     stateError = null;
     renderActive();
     return;
   }
+  stateLoading = true;
   const targetId = activeId;
   const request = ++stateRequest;
   try {
@@ -5528,6 +6427,16 @@ async function loadState(): Promise<void> {
     renderActive();
     if (hasAuth(error)) openTokenModal();
     else if (errorStatus(error) === 404) void loadSlots();
+  } finally {
+    stateLoading = false;
+    if (
+      stateReloadPending &&
+      activeId &&
+      document.visibilityState === "visible"
+    ) {
+      stateReloadPending = false;
+      void loadState();
+    }
   }
 }
 
@@ -5539,8 +6448,19 @@ async function loadState(): Promise<void> {
  * never fight over the list.
  */
 async function loadSessions(): Promise<void> {
+  if (sessionsLoading) {
+    sessionsReloadPending = true;
+    return;
+  }
   const request = ++sessionsRequest;
   const query = sessionsQuery.trim();
+  const queryKey = query.toLowerCase();
+  const cached = sessionSummaryCache.get(queryKey);
+  if (cached) {
+    sessions = cached;
+    sessionsQueryLoaded = queryKey;
+    updateSlots();
+  }
   sessionsLoading = true;
   updateSlots();
   try {
@@ -5560,8 +6480,9 @@ async function loadSessions(): Promise<void> {
         typeof session.updatedAt === "string" &&
         typeof session.costUsd === "number",
     );
+    sessionSummaryCache.set(queryKey, sessions);
     sessionsError = null;
-    sessionsQueryLoaded = query.toLowerCase();
+    sessionsQueryLoaded = queryKey;
   } catch (error: unknown) {
     if (request !== sessionsRequest) return;
     sessions = [];
@@ -5573,6 +6494,10 @@ async function loadSessions(): Promise<void> {
     if (request === sessionsRequest) {
       sessionsLoading = false;
       updateSlots();
+    }
+    if (sessionsReloadPending && document.visibilityState === "visible") {
+      sessionsReloadPending = false;
+      void loadSessions();
     }
   }
 }
@@ -5727,6 +6652,7 @@ function forgetSlot(id: SlotId): void {
   slots = slots.filter((slot) => slot.id !== id);
   cache.delete(id);
   drafts.delete(id);
+  unreadCountsBySlot.delete(id);
   unreadBySlot.delete(id);
   actionNeededBySlot.delete(id);
   olderHistoryBySlot.delete(id);
@@ -5734,6 +6660,8 @@ function forgetSlot(id: SlotId): void {
   clearFullMessagesForSlot(id);
   resumeAdoptedFiles.delete(id);
   if (activeId === id) {
+    activeSlotEpoch += 1;
+    transcriptAnchor = null;
     activeId = "";
     activeState = null;
     stateError = null;
@@ -5826,13 +6754,16 @@ async function sendAction(
   }
 }
 function handleSendSuccess(targetId: SlotId, draftAtSend: string): void {
-  if (!drafts.has(targetId) || drafts.get(targetId) === draftAtSend) {
-    drafts.set(targetId, "");
-  }
+  const draftUnchanged = draftFor(targetId) === draftAtSend;
+  if (draftUnchanged) storeDraft(targetId, "");
   const livePrompt = document.querySelector<HTMLDivElement>("#prompt");
-  if (activeId === targetId && livePrompt && livePrompt.innerText === draftAtSend) {
+  if (
+    draftUnchanged &&
+    activeId === targetId &&
+    livePrompt &&
+    livePrompt.innerText === draftAtSend
+  ) {
     livePrompt.innerText = "";
-    drafts.set(targetId, "");
     resizePrompt();
     dismissedCommandDraft = null;
     dismissedMoveDraft = null;
@@ -6390,7 +7321,7 @@ function selectDirectory(dirPath: string): void {
   const prompt = requiredElement<HTMLDivElement>("#prompt");
   const command = `/move ${dirPath}`;
   prompt.innerText = command;
-  drafts.set(activeId, command);
+  storeDraft(activeId, command);
   dismissedCommandDraft = null;
   dismissedMoveDraft = null;
   commandSelection = 0;
@@ -6754,7 +7685,7 @@ async function start(): Promise<void> {
   void loadNotificationConfig();
   void loadNotifications();
   window.setInterval(() => {
-    void loadSlots();
+    if (document.visibilityState === "visible") void loadSlots();
   }, 8000);
   window.setInterval(() => {
     void loadNotifications();
@@ -6771,8 +7702,10 @@ async function start(): Promise<void> {
   document.addEventListener("visibilitychange", () => {
     if (document.visibilityState === "visible") {
       void syncPermissionState().then(() => updateNotificationButton());
+      void loadSlots();
       void loadNotifications();
       void loadSessions();
+      void loadRawTerminal();
       if (activeId) void loadState();
       window.setTimeout(() => {
         if (activeId) void acknowledgeSlot(activeId);

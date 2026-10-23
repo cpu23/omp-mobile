@@ -63,6 +63,18 @@ export type MobilePart =
   | { kind: "files"; files: Array<{ path: string; text?: string }> }
   | { kind: "usage"; text: string };
 export type MobileMessage = { role: string; entryId: string; timestamp: string | null; parts: MobilePart[]; full?: boolean };
+export type MobileMessageTransfer = {
+  entryId: string;
+  transferId: string;
+  chunk: string;
+  nextOffset: number;
+  total: number;
+};
+export type MobileMessagesResponse = {
+  generation: string;
+  messages: MobileMessage[];
+  transfers: MobileMessageTransfer[];
+};
 export type MobileInteractionAction = {
   generation: string;
   type: "interaction";

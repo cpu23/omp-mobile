@@ -22,11 +22,23 @@ extension changes reach existing sessions after their OMP process restarts. With
 terminal-only views and reports transcript, model and capability data as unavailable. Viewing the terminal does not
 resize the desktop PTY. Its live controls send only the key or text you explicitly choose.
 
+Deploy matching Mobile and Desktop versions together. Terminal viewing now requires the daemon's
+`/api/runtimes/:id/screen` and `/input` endpoints; the gateway no longer owns a second terminal emulator.
+Finish running work before restarting the daemon to load the updated extension, then reload both clients.
+
+Assets are minified and gzip-compressed, with ETags and immutable fingerprinted URLs. HTML and canonical asset
+URLs revalidate; Mermaid, math and chart engines load only when needed. Periodic reads pause in hidden documents,
+and unchanged authenticated JSON responses can return `304` without another response body.
+Unsent text drafts are retained in bounded browser storage under the transcript's stable identity. Failed sends
+retain the draft; a successful send clears only the captured text, not edits made while the send was pending.
+
 OMP `ask` prompts appear inline with question text, options, descriptions, selection mode and recommended options.
 Pending prompts create an **Action needed** session badge and an answer card. Tap a radio option for single-choice
 questions or checkboxes for multi-select, then select **Submit answers**. Every question also offers **Other** with
 a custom text field; multi-select answers can combine options and custom text. Unsubmitted choices survive state
 refreshes, and controls are disabled while submitting. **Cancel** stops the pending ask.
+Long question cards have their own touch-scroll area, including landscape and reduced-height viewports.
+Scrolling and unchanged state refreshes preserve selected options, custom text and the position within the card.
 The extension delegates to OMP's native AskTool while also accepting explicit mobile answers: whichever surface
 finishes first closes the other, without answering twice. Desktop dialogs, timeouts and desktop image answers retain
 their native behavior. Oversized or incomplete question metadata remains terminal-owned rather than permitting
@@ -116,9 +128,19 @@ The browser resizes images when needed; the API permits at most 3 MiB of combine
 Failed sends retain attachments so they can be retried.
 
 The initial snapshot contains the latest 80 visible entries. **Load older messages** pages back through the branch.
-Clipped messages and omitted inline images expose **Load full message and images**. Full messages use immutable,
-generation-scoped transfers and have a 32 MiB serialized-message ceiling; oversized or expired transfers report an
-error rather than silently returning incomplete content.
+Clipped messages and omitted inline images recover automatically in batches of at most eight IDs, with at most two
+batches in flight. Unchanged cards retain their DOM nodes; prepended history and late content preserve the reading
+anchor, while the latest view remains pinned through size changes.
+
+Full messages use immutable, generation-scoped transfers with a 32 MiB serialized-message ceiling. The host's shared
+transfer cache admits at most 32 MiB and 64 live transfer IDs; new admissions do not evict IDs already returned to a
+reader. A batch that cannot fit returns `413 transfer_capacity`; a temporarily full individual transfer returns
+`503 transfer_capacity`; an oversized message returns `413 message_too_large`. Reads renew the two-minute inactivity
+expiry, and the final chunk releases its transfer. The client falls back to serialized individual reads and backs off
+under capacity pressure, reconsidering deferred loads on subsequent visible polls.
+
+Approximate client cache budgets are 8 MiB for state, 24 MiB for older history and 72 MiB for recovered full messages,
+with separate entry limits. These are cache-retention budgets, not a limit on browser RAM, DOM or decoded images.
 
 Host limits remain explicit: OMP 18.12.1 does not publicly expose every generic UI notice, desktop-origin queue text,
 IRC/chat event or private recap reader. Queue availability can therefore appear without its text. These surfaces
@@ -204,6 +226,12 @@ questions, approvals and plan reviews do not wait for a completion notification.
 runtime directly. Clearing a pending interaction removes its action-needed state; a transient discovery failure does
 not falsely clear it. Browser/platform push delivery still depends on notification permission and push-service access.
 
+Status responses carry unread counts for every slot and full unread identities only for the requested active slot.
+Acknowledgements contain the exact observed identities, in batches of at most 256, so a newer completion is not
+accidentally cleared. Push subscriptions are stored separately in `notifications.json.subscriptions` with owner-only
+permissions; bounded ledger maintenance does not discard those credentials. Migration preserves oversized or corrupt
+legacy data, and failed writes retain pending work for retry without resending completions already delivered.
+
 ## API
 
 | Route | Purpose |
@@ -214,11 +242,14 @@ not falsely clear it. Browser/platform push delivery still depends on notificati
 | `GET /api/slots/:id/state` | Structured state, current-generation runtime notices/interactions, history metadata, model, effort, transcript and activity. |
 | `GET /api/slots/:id/history?before=<entryId>&limit=80` | Older visible entries before the cursor. |
 | `GET /api/slots/:id/message?id=<entryId>` | Full message; add `offset=0` to begin chunked transfer, then use its `transferId` and `nextOffset`. |
+| `GET /api/slots/:id/messages?ids=<JSON array>&generation=<generation>` | Batch full-message recovery, up to eight unique IDs, with inline messages or chunk-transfer descriptors. |
 | `POST /api/slots/:id/action` | Prompt/images, abort, model, effort, command, move or native interaction; generation-guarded. |
-| `GET /api/slots/:id/terminal` | Terminal snapshot without resizing the PTY. |
+| `GET /api/slots/:id/terminal` | Plain-text viewport projected by Desktop, without another emulator or a PTY resize. |
 | `POST /api/slots/:id/terminal` | Explicitly confirmed key/text input, guarded by generation and current interaction when applicable. |
 | `GET /api/sessions` | Saved OMP sessions (id, path, cwd, title, update time and cost). |
-| `/api/notifications*` | Push configuration, status, subscriptions and per-runtime acknowledgement. |
+| `GET /api/notifications?slot=<id>` | Compact counts plus full unread identities for the selected slot. |
+| `POST /api/notifications/ack` | `{slot, identities}`; acknowledge only those identities, at most 256 per request. |
+| `/api/notifications*` | Push configuration and subscriptions. |
 | `/api/directories`, `/api/pins` | Folder explorer, `/move` destination completion, and pinned working directories. |
 
 All API routes require the bearer token; mutations additionally require `Origin`.

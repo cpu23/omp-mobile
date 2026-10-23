@@ -157,6 +157,8 @@ const MAX_PROMPT_IMAGE_BASE64_CHARS = 3 * 1024 * 1024;
 const MAX_MESSAGE_TRANSFER_CACHE_BYTES = 32 * 1024 * 1024;
 const MAX_MESSAGE_TRANSFER_CACHE_ENTRIES = 64;
 const MESSAGE_TRANSFER_TTL_MS = 2 * 60 * 1000;
+const FULL_MESSAGE_CHUNK_CHARS = 256 * 1024;
+const SNAPSHOT_CACHE_WINDOW_MS = 40;
 
 type AskOption = { label: string; description?: string };
 type AskQuestion = {
@@ -1227,6 +1229,7 @@ type TranscriptOptions = {
   beforeId?: string;
   entryId?: string;
   limit?: number;
+  entryIds?: readonly string[];
   full?: boolean;
   imageBudget?: number;
 };
@@ -1507,30 +1510,42 @@ export function transcript(
 
   const total = visible.length;
   let end = total;
+  let start = 0;
   let found = true;
-  if (options.entryId) {
-    const index = visible.findIndex((entry) => entry.entryId === options.entryId);
-    if (index < 0) {
-      found = false;
-      end = 0;
-    } else {
-      end = index + 1;
+  let selected: typeof visible = [];
+  if (options.entryIds !== undefined) {
+    const visibleById = new Map<string, (typeof visible)[number]>();
+    for (const entry of visible)
+      if (!visibleById.has(entry.entryId))
+        visibleById.set(entry.entryId, entry);
+    found = options.entryIds.every((entryId) => visibleById.has(entryId));
+    if (found)
+      selected = options.entryIds.map((entryId) => visibleById.get(entryId)!);
+  } else {
+    if (options.entryId) {
+      const index = visible.findIndex((entry) => entry.entryId === options.entryId);
+      if (index < 0) {
+        found = false;
+        end = 0;
+      } else {
+        end = index + 1;
+      }
+    } else if (options.beforeId) {
+      const index = visible.findIndex((entry) => entry.entryId === options.beforeId);
+      if (index < 0) {
+        found = false;
+        end = 0;
+      } else {
+        end = index;
+      }
     }
-  } else if (options.beforeId) {
-    const index = visible.findIndex((entry) => entry.entryId === options.beforeId);
-    if (index < 0) {
-      found = false;
-      end = 0;
-    } else {
-      end = index;
-    }
+    const limit =
+      options.entryId !== undefined
+        ? 1
+        : Math.max(1, Math.min(80, Math.floor(options.limit ?? MAX_MESSAGES)));
+    start = Math.max(0, end - limit);
+    selected = found ? visible.slice(start, end) : [];
   }
-  const limit =
-    options.entryId !== undefined
-      ? 1
-      : Math.max(1, Math.min(80, Math.floor(options.limit ?? MAX_MESSAGES)));
-  const start = Math.max(0, end - limit);
-  const selected = found ? visible.slice(start, end) : [];
   const full = options.full === true;
   const imageBudget = { used: 0, max: options.imageBudget ?? 512 * 1024 };
   const contentBudget = { used: 0 };
@@ -2100,7 +2115,9 @@ export function transcript(
       shown: messages.length,
       hasMore: start > 0,
     },
-    ...(options.entryId !== undefined || options.beforeId !== undefined
+    ...(options.entryId !== undefined ||
+    options.entryIds !== undefined ||
+    options.beforeId !== undefined
       ? { found }
       : {}),
   };
@@ -2184,6 +2201,14 @@ export default function registerMobileRemote(pi: ExtensionAPI): void {
   let generationSequence = 0;
   let generation = `${instanceId}:uninitialized`;
   let sessionSignature: string | undefined;
+  let snapshotRevision = 0;
+  let snapshotCache:
+    | { revision: number; expiresAt: number; state: MobileState }
+    | undefined;
+  function invalidateSnapshot(): void {
+    snapshotRevision += 1;
+    snapshotCache = undefined;
+  }
   let pendingApprovals = new Set<string>();
   let actionTail: Promise<unknown> = Promise.resolve();
   let agentActive = false;
@@ -2227,33 +2252,63 @@ export default function registerMobileRemote(pi: ExtensionAPI): void {
     }
   }
 
+  function storeMessageTransfers(
+    entries: readonly {
+      entryId: string;
+      encoded: string;
+      byteLength: number;
+    }[],
+  ): string[] | undefined {
+    if (entries.length === 0) return [];
+    if (
+      entries.length > MAX_MESSAGE_TRANSFER_CACHE_ENTRIES ||
+      entries.some((entry) =>
+        entry.byteLength > MAX_MESSAGE_TRANSFER_CACHE_BYTES
+      )
+    )
+      return undefined;
+    const now = Date.now();
+    pruneMessageTransfers(now);
+    const requestedBytes = entries.reduce(
+      (total, entry) => total + entry.byteLength,
+      0,
+    );
+    if (
+      messageTransfers.size + entries.length >
+        MAX_MESSAGE_TRANSFER_CACHE_ENTRIES ||
+      messageTransferCacheBytes + requestedBytes >
+        MAX_MESSAGE_TRANSFER_CACHE_BYTES
+    )
+      return undefined;
+    const transfers = entries.map((entry) => ({
+      id: crypto.randomUUID(),
+      ...entry,
+    }));
+    for (const transfer of transfers) {
+      messageTransfers.set(transfer.id, {
+        generation,
+        entryId: transfer.entryId,
+        encoded: transfer.encoded,
+        byteLength: transfer.byteLength,
+        expiresAt: now + MESSAGE_TRANSFER_TTL_MS,
+      });
+    }
+    messageTransferCacheBytes += requestedBytes;
+    return transfers.map((transfer) => transfer.id);
+  }
+
   function storeMessageTransfer(
     entryId: string,
     encoded: string,
     byteLength: number,
   ): string | undefined {
-    if (byteLength > MAX_MESSAGE_TRANSFER_CACHE_BYTES) return undefined;
-    const now = Date.now();
-    pruneMessageTransfers(now);
-    while (
-      messageTransfers.size >= MAX_MESSAGE_TRANSFER_CACHE_ENTRIES ||
-      messageTransferCacheBytes + byteLength > MAX_MESSAGE_TRANSFER_CACHE_BYTES
-    ) {
-      const oldest = messageTransfers.entries().next().value;
-      if (!oldest) break;
-      messageTransfers.delete(oldest[0]);
-      messageTransferCacheBytes -= oldest[1].byteLength;
-    }
-    const transferId = crypto.randomUUID();
-    messageTransfers.set(transferId, {
-      generation,
-      entryId,
-      encoded,
-      byteLength,
-      expiresAt: now + MESSAGE_TRANSFER_TTL_MS,
-    });
-    messageTransferCacheBytes += byteLength;
-    return transferId;
+    return storeMessageTransfers([{ entryId, encoded, byteLength }])?.[0];
+  }
+  function deleteMessageTransfer(transferId: string): void {
+    const transfer = messageTransfers.get(transferId);
+    if (!transfer) return;
+    messageTransfers.delete(transferId);
+    messageTransferCacheBytes -= transfer.byteLength;
   }
 
   function getMessageTransfer(
@@ -2269,8 +2324,7 @@ export default function registerMobileRemote(pi: ExtensionAPI): void {
       transfer.entryId !== entryId
     )
       return undefined;
-    messageTransfers.delete(transferId);
-    messageTransfers.set(transferId, transfer);
+    transfer.expiresAt = now + MESSAGE_TRANSFER_TTL_MS;
     return transfer;
   }
   let runtimeNoticeSequence = 0;
@@ -2420,6 +2474,7 @@ export default function registerMobileRemote(pi: ExtensionAPI): void {
   function observeSession(ctx: ExtensionContext): void {
     const signature = `${ctx.sessionManager.getSessionId()}\n${ctx.sessionManager.getSessionFile() ?? ""}`;
     if (sessionSignature === signature) return;
+    invalidateSnapshot();
     sessionSignature = signature;
     generationSequence += 1;
     generation = `${instanceId}:${ctx.sessionManager.getSessionId()}:${generationSequence}`;
@@ -2492,11 +2547,14 @@ export default function registerMobileRemote(pi: ExtensionAPI): void {
   }
 
 
-  function capabilities(ctx: ExtensionContext): MobileCapabilities {
-    const editor = editorGuard(ctx);
+  function capabilities(
+    ctx: ExtensionContext,
+    editor: { available: boolean; empty: boolean | null; reason?: string },
+    hasTheme: boolean,
+    hasSummary: boolean,
+  ): MobileCapabilities {
     const canStageCommand =
       editor.available && typeof ctx.ui.setEditorText === "function";
-    const hasTheme = themeSnapshot(ctx) !== null;
     return {
       prompt: true,
       abort: true,
@@ -2507,7 +2565,7 @@ export default function registerMobileRemote(pi: ExtensionAPI): void {
       theme: hasTheme,
       terminal: true,
       approval: false,
-      summary: latestSummary(ctx.sessionManager.getBranch()) !== undefined,
+      summary: hasSummary,
       events: true,
       moveReason: canStageCommand ? undefined : editor.reason,
       approvalReason:
@@ -2738,12 +2796,19 @@ export default function registerMobileRemote(pi: ExtensionAPI): void {
 
   function snapshot(ctx: ExtensionContext): MobileState {
     observeSession(ctx);
+    const now = Date.now();
+    const cached = snapshotCache;
+    if (
+      cached &&
+      cached.revision === snapshotRevision &&
+      cached.expiresAt > now
+    )
+      return cached.state;
     const model = ctx.models.current?.() ?? ctx.model;
     const currentModel = modelForSnapshot(model);
     const branch = ctx.sessionManager.getBranch();
     const summary = latestSummary(branch);
     const hasPendingMessages = ctx.hasPendingMessages();
-    const now = Date.now();
     const activitySnapshot = buildActivity(ctx, branch, now);
     interactionBridge.observe(ctx);
     const interaction = interactionBridge.snapshot(ctx);
@@ -2772,6 +2837,8 @@ export default function registerMobileRemote(pi: ExtensionAPI): void {
       }));
     const runtime = runtimeSnapshot(now);
     if (interaction) runtime.interaction = interaction;
+    const theme = themeSnapshot(ctx);
+    const editor = editorGuard(ctx);
     const state: MobileState = {
       apiVersion: 1,
       generation,
@@ -2791,17 +2858,22 @@ export default function registerMobileRemote(pi: ExtensionAPI): void {
           : null;
       })(),
       cost: branchCost(branch),
-      theme: themeSnapshot(ctx),
+      theme,
       commands: commandsForSnapshot(),
       messages: transcriptSnapshot.messages,
       history: transcriptSnapshot.history,
       runtime,
-      capabilities: capabilities(ctx),
+      capabilities: capabilities(
+        ctx,
+        editor,
+        theme !== null,
+        summary !== undefined,
+      ),
       cwd: ctx.sessionManager.getCwd(),
       pendingApproval: pendingApprovals.size,
       hasPendingMessages,
       pendingMessages,
-      editor: editorGuard(ctx),
+      editor,
       ...(completion ? { completion } : {}),
       agentActive,
       activity: activitySnapshot.activity,
@@ -2809,6 +2881,11 @@ export default function registerMobileRemote(pi: ExtensionAPI): void {
     const title = ctx.sessionManager.getSessionName();
     if (title) state.title = safeString(title);
     if (summary) state.summary = summary;
+    snapshotCache = {
+      revision: snapshotRevision,
+      expiresAt: now + SNAPSHOT_CACHE_WINDOW_MS,
+      state,
+    };
     return state;
   }
 
@@ -2818,8 +2895,11 @@ export default function registerMobileRemote(pi: ExtensionAPI): void {
    * byte caps on long sessions.
    */
   function statusSnapshot(ctx: ExtensionContext): {
+    generation: string;
     accent: string | null;
     agentActive: boolean;
+    cwd: string;
+    summary?: string;
     title?: string;
     completion?: CompletionMarker;
     pendingAction?: {
@@ -2832,9 +2912,13 @@ export default function registerMobileRemote(pi: ExtensionAPI): void {
     interactionBridge.observe(ctx);
     const interaction = interactionBridge.snapshot(ctx);
     const title = ctx.sessionManager.getSessionName();
+    const summary = latestSummary(ctx.sessionManager.getBranch());
     return {
+      generation,
       accent: sessionAccent(ctx),
       agentActive,
+      cwd: ctx.sessionManager.getCwd(),
+      ...(summary ? { summary } : {}),
       ...(title ? { title: title.slice(0, 200) } : {}),
       ...(completion ? { completion } : {}),
       ...(interaction
@@ -3188,15 +3272,31 @@ export default function registerMobileRemote(pi: ExtensionAPI): void {
             observeSession(ctx);
             const url = new URL(request.url);
             if (request.method === "GET" && url.pathname === "/history") {
-              const rawLimit = url.searchParams.get("limit");
-              const beforeId = url.searchParams.get("before") ?? undefined;
+              const params = url.searchParams;
+              const rawLimit = params.get("limit");
+              const beforeId = params.get("before") ?? undefined;
+              const requestedGeneration = params.get("generation");
               if (
+                [...params.keys()].some(
+                  (key) => !["generation", "limit", "before"].includes(key),
+                ) ||
+                params.getAll("generation").length !== 1 ||
+                params.getAll("limit").length > 1 ||
+                params.getAll("before").length > 1 ||
+                typeof requestedGeneration !== "string" ||
+                requestedGeneration.length === 0 ||
+                requestedGeneration.length > 200 ||
                 (rawLimit !== null && !/^[1-9]\d*$/.test(rawLimit)) ||
                 (beforeId !== undefined &&
                   (beforeId.length === 0 ||
                     Buffer.byteLength(beforeId, "utf8") > MAX_STRING_BYTES))
               )
                 return json({ error: "invalid history query" }, 400);
+              if (requestedGeneration !== generation)
+                return json(
+                  { error: "session changed; refresh history", generation },
+                  409,
+                );
               const limit =
                 rawLimit === null ? MAX_MESSAGES : Number(rawLimit);
               if (!Number.isSafeInteger(limit) || limit > MAX_MESSAGES)
@@ -3218,14 +3318,156 @@ export default function registerMobileRemote(pi: ExtensionAPI): void {
                 history: page.history,
               });
             }
+            if (request.method === "GET" && url.pathname === "/messages") {
+              const params = url.searchParams;
+              const rawIds = params.get("ids");
+              const requestedGeneration = params.get("generation");
+              if (
+                [...params.keys()].some((key) => key !== "ids" && key !== "generation") ||
+                params.getAll("ids").length !== 1 ||
+                params.getAll("generation").length !== 1 ||
+                typeof rawIds !== "string" ||
+                typeof requestedGeneration !== "string" ||
+                requestedGeneration.length === 0 ||
+                requestedGeneration.length > 200
+              )
+                return json({ error: "batch message query is invalid" }, 400);
+              let requestedIds: unknown;
+              try {
+                requestedIds = JSON.parse(rawIds);
+              } catch {
+                return json({ error: "batch message ids must be JSON" }, 400);
+              }
+              if (
+                !Array.isArray(requestedIds) ||
+                requestedIds.length < 1 ||
+                requestedIds.length > 8
+              )
+                return json({ error: "batch message ids must contain 1 to 8 entries" }, 400);
+              const entryIds: string[] = [];
+              const seenIds = new Set<string>();
+              for (const value of requestedIds) {
+                if (
+                  typeof value !== "string" ||
+                  value.length === 0 ||
+                  Buffer.byteLength(value, "utf8") > MAX_STRING_BYTES ||
+                  seenIds.has(value)
+                )
+                  return json({ error: "batch message ids must be unique nonempty entry ids" }, 400);
+                seenIds.add(value);
+                entryIds.push(value);
+              }
+              if (requestedGeneration !== generation)
+                return json(
+                  { error: "session changed; refresh messages", generation },
+                  409,
+                );
+
+              const branch = ctx.sessionManager.getBranch();
+              const messageEntries =
+                streamingMessage === undefined
+                  ? branch
+                  : [
+                      ...branch,
+                      {
+                        type: "message",
+                        id: `stream-${generation}-${streamingSequence}`,
+                        message: streamingMessage,
+                      },
+                    ];
+              const tasks = buildActivity(ctx, branch, Date.now()).tasks;
+              const messages: MobileMessage[] = [];
+              const transferCandidates: Array<{
+                entryId: string;
+                encoded: string;
+                byteLength: number;
+                chunk: string;
+                nextOffset: number;
+                total: number;
+              }> = [];
+              const batch = transcript(messageEntries, tasks, {
+                entryIds,
+                full: true,
+                imageBudget: 0,
+              });
+              if (!batch.found || batch.messages.length !== entryIds.length)
+                return json({ error: "one or more messages were not found" }, 404);
+              for (const message of batch.messages) {
+                const entryId = message.entryId;
+                const encoded = JSON.stringify(message);
+                const byteLength = Buffer.byteLength(encoded, "utf8");
+                if (byteLength > MAX_MESSAGE_TRANSFER_CACHE_BYTES)
+                  return json(
+                    {
+                      error:
+                        `full message ${entryId} exceeds the 32 MiB transfer limit`,
+                      code: "message_too_large",
+                    },
+                    413,
+                  );
+                if (encoded.length <= FULL_MESSAGE_CHUNK_CHARS) {
+                  messages.push(message);
+                  continue;
+                }
+                let end = Math.min(encoded.length, FULL_MESSAGE_CHUNK_CHARS);
+                if (
+                  end < encoded.length &&
+                  encoded.charCodeAt(end - 1) >= 0xd800 &&
+                  encoded.charCodeAt(end - 1) <= 0xdbff
+                )
+                  end -= 1;
+                transferCandidates.push({
+                  entryId,
+                  encoded,
+                  byteLength,
+                  chunk: encoded.slice(0, end),
+                  nextOffset: end,
+                  total: encoded.length,
+                });
+              }
+              const transferIds = storeMessageTransfers(transferCandidates);
+              if (!transferIds)
+                return json(
+                  {
+                    error:
+                      "batch full-message transfers exceed available cache capacity; split the batch or finish existing transfers",
+                    code: "transfer_capacity",
+                  },
+                  413,
+                );
+              const transfers = transferCandidates.map((transfer, index) => ({
+                entryId: transfer.entryId,
+                transferId: transferIds[index]!,
+                chunk: transfer.chunk,
+                nextOffset: transfer.nextOffset,
+                total: transfer.total,
+              }));
+              return json({ generation, messages, transfers });
+            }
             if (request.method === "GET" && url.pathname === "/message") {
-              const entryId = url.searchParams.get("id");
-              const rawOffset = url.searchParams.get("offset");
-              const transferId = url.searchParams.get("transferId");
+              const params = url.searchParams;
+              const entryId = params.get("id");
+              const rawOffset = params.get("offset");
+              const transferId = params.get("transferId");
+              const requestedGeneration = params.get("generation");
               const offset = rawOffset === null ? undefined : Number(rawOffset);
               if (
+                [...params.keys()].some(
+                  (key) =>
+                    key !== "id" &&
+                    key !== "offset" &&
+                    key !== "transferId" &&
+                    key !== "generation",
+                ) ||
+                params.getAll("id").length !== 1 ||
+                params.getAll("generation").length !== 1 ||
+                params.getAll("offset").length > 1 ||
+                params.getAll("transferId").length > 1 ||
                 !entryId ||
                 Buffer.byteLength(entryId, "utf8") > MAX_STRING_BYTES ||
+                typeof requestedGeneration !== "string" ||
+                requestedGeneration.length === 0 ||
+                requestedGeneration.length > 200 ||
                 (rawOffset !== null && !/^(0|[1-9]\d*)$/.test(rawOffset)) ||
                 (offset !== undefined && !Number.isSafeInteger(offset)) ||
                 (transferId !== null &&
@@ -3235,9 +3477,16 @@ export default function registerMobileRemote(pi: ExtensionAPI): void {
                 (transferId !== null && (offset === undefined || offset === 0)) ||
                 (offset !== undefined && offset > 0 && transferId === null)
               )
-                return json({ error: "message id, offset, or transfer id is invalid" }, 400);
+                return json(
+                  { error: "message id, offset, transfer id, or generation is invalid" },
+                  400,
+                );
+              if (requestedGeneration !== generation)
+                return json(
+                  { error: "session changed; refresh message", generation },
+                  409,
+                );
 
-              const chunkSize = 256 * 1024;
               const chunkResponse = (
                 id: string,
                 encoded: string,
@@ -3254,7 +3503,7 @@ export default function registerMobileRemote(pi: ExtensionAPI): void {
                   encoded.charCodeAt(chunkOffset) <= 0xdfff
                 )
                   return json({ error: "message chunk offset splits a character" }, 400);
-                let end = Math.min(encoded.length, chunkOffset + chunkSize);
+                let end = Math.min(encoded.length, chunkOffset + FULL_MESSAGE_CHUNK_CHARS);
                 if (
                   end < encoded.length &&
                   encoded.charCodeAt(end - 1) >= 0xd800 &&
@@ -3282,7 +3531,17 @@ export default function registerMobileRemote(pi: ExtensionAPI): void {
                     },
                     409,
                   );
-                return chunkResponse(transferId, transfer.encoded, offset);
+                const response = chunkResponse(
+                  transferId,
+                  transfer.encoded,
+                  offset,
+                );
+                if (
+                  offset <= transfer.encoded.length &&
+                  offset + FULL_MESSAGE_CHUNK_CHARS >= transfer.encoded.length
+                )
+                  deleteMessageTransfer(transferId);
+                return response;
               }
 
               const branch = ctx.sessionManager.getBranch();
@@ -3304,7 +3563,7 @@ export default function registerMobileRemote(pi: ExtensionAPI): void {
                 imageBudget: 0,
               });
               const message = result.messages[0];
-              if (!result.found || !message)
+              if (!result.found || !message || message.entryId !== entryId)
                 return json({ error: "message not found" }, 404);
               const encoded = JSON.stringify(message);
               const byteLength = Buffer.byteLength(encoded, "utf8");
@@ -3313,10 +3572,14 @@ export default function registerMobileRemote(pi: ExtensionAPI): void {
                   {
                     error:
                       "full message exceeds the 32 MiB transfer limit; retrieve a smaller session entry",
+                    code: "message_too_large",
                   },
                   413,
                 );
-              if (offset === undefined && encoded.length <= chunkSize)
+              if (
+                offset === undefined &&
+                encoded.length <= FULL_MESSAGE_CHUNK_CHARS
+              )
                 return json({ generation, message });
               const newTransferId = storeMessageTransfer(
                 entryId,
@@ -3324,8 +3587,18 @@ export default function registerMobileRemote(pi: ExtensionAPI): void {
                 byteLength,
               );
               if (!newTransferId)
-                return json({ error: "message transfer cache is unavailable" }, 503);
-              return chunkResponse(newTransferId, encoded, 0);
+                return json(
+                  {
+                    error:
+                      "full-message transfer cache is occupied; finish or wait for existing transfers",
+                    code: "transfer_capacity",
+                  },
+                  503,
+                );
+              const response = chunkResponse(newTransferId, encoded, 0);
+              if (encoded.length <= FULL_MESSAGE_CHUNK_CHARS)
+                deleteMessageTransfer(newTransferId);
+              return response;
             }
             if (request.method === "GET" && url.pathname === "/state")
               return json(snapshot(ctx));
@@ -3351,7 +3624,14 @@ export default function registerMobileRemote(pi: ExtensionAPI): void {
               }
               const run = actionTail
                 .catch(() => undefined)
-                .then(() => handleAction(ctx, action));
+                .then(async () => {
+                  invalidateSnapshot();
+                  try {
+                    return await handleAction(ctx, action);
+                  } finally {
+                    invalidateSnapshot();
+                  }
+                });
               actionTail = run.catch(() => undefined);
               try {
                 return json(await run);

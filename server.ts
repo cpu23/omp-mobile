@@ -2,7 +2,6 @@ import { createConnection, type Socket } from "node:net";
 import { promises as fs, type Stats } from "node:fs";
 import {
   dirname,
-  extname,
   isAbsolute,
   join,
   normalize,
@@ -12,8 +11,8 @@ import {
 } from "node:path";
 import { fileURLToPath } from "node:url";
 import { homedir } from "node:os";
-import { randomUUID, timingSafeEqual } from "node:crypto";
-import { Terminal as HeadlessTerminal } from "@xterm/headless";
+import { createHash, randomUUID, timingSafeEqual } from "node:crypto";
+import { gzipSync } from "node:zlib";
 import { validateAskAnswers } from "./ask-selection";
 import {
   API_VERSION,
@@ -45,6 +44,7 @@ import {
   type NotificationService,
   type PushSubscriptionInput,
 } from "./notifications";
+import { createWebAssets } from "./web-assets";
 
 const ROOT = dirname(fileURLToPath(import.meta.url));
 const HOME = process.env.HOME?.trim() || homedir();
@@ -68,8 +68,6 @@ const MAX_IPC = 32 * 1024 * 1024;
 const MAX_METADATA = 64 * 1024;
 const MAX_ENTRIES = 250;
 const MAX_DESKTOP_BODY = 8 * 1024 * 1024;
-const STREAM_IDLE_MS = 45_000;
-const STREAM_READY_TIMEOUT_MS = 3_500;
 const TERMINAL_WRITE_LIMIT = 16 * 1024;
 const ALLOWED_ORIGINS = new Set(
   (process.env.OMP_MOBILE_ORIGINS ?? "")
@@ -101,12 +99,13 @@ function desktopBaseUrl(): URL {
 }
 
 const DESKTOP = desktopBaseUrl();
-const DESKTOP_WS = `ws://${DESKTOP.host}/ws/term`;
 
 let mobileToken = "";
-let clientBundle: ArrayBuffer | undefined;
 let notificationService: NotificationService | undefined;
 let knownSlotIds: string[] = [];
+let webAssets:
+  | { build: string; response(request: Request): Promise<Response | undefined> }
+  | undefined;
 
 function json(data: unknown, status = 200, extra: HeadersInit = {}): Response {
   return new Response(JSON.stringify(data), {
@@ -451,11 +450,7 @@ async function socketAvailable(id: string): Promise<boolean> {
   }
 }
 
-/**
- * Raw `/state` read for list/status enrichment. Failures never throw: a
- * runtime without a live extension still shows up via the desktop list.
- */
-async function readExtensionState(
+async function readExtensionStatus(
   id: string,
   timeoutMs = 1200,
 ): Promise<Record<string, unknown> | undefined> {
@@ -464,7 +459,7 @@ async function readExtensionState(
     const response = await ipcRequest(
       join(IPC_ROOT, `${id}.sock`),
       "GET",
-      "/state",
+      "/status",
       undefined,
       timeoutMs,
     );
@@ -477,201 +472,8 @@ async function readExtensionState(
     return undefined;
   }
 }
-
-/* -------------------------------------------------------------------------- */
-/* Headless terminal mirror                                                   */
-/* -------------------------------------------------------------------------- */
-
-/**
- * The phone's terminal view is rendered by the same xterm core as the desktop
- * client (`@xterm/headless`, xterm 6): each attached runtime feeds its PTY
- * bytes into a headless Terminal, and snapshots read the visible viewport of
- * its active buffer. Styling, alt-screen handling, wide chars and scroll
- * regions therefore follow xterm's own parser instead of a private one.
- */
-
-
-/* -------------------------------------------------------------------------- */
-/* Desktop stream attachments                                                 */
-/* -------------------------------------------------------------------------- */
-
-type DesktopStream = {
-  id: string;
-  socket: WebSocket;
-  terminal: HeadlessTerminal;
-  ready: Promise<boolean>;
-  closed: boolean;
-  hello: boolean;
-  replayBytes: number;
-  receivedBytes: number;
-  /** Writes handed to the xterm parser that have not finished parsing yet. */
-  pendingWrites: number;
-  drained: Promise<void> | null;
-  resolveDrained: (() => void) | null;
-  closeTimer?: Timer;
-};
-
-const streams = new Map<string, DesktopStream>();
-
-function closeStream(stream: DesktopStream): void {
-  if (stream.closed) return;
-  stream.closed = true;
-  clearTimeout(stream.closeTimer);
-  try {
-    stream.socket.close();
-  } catch {
-    // already closed
-  }
-  stream.terminal.dispose();
-  stream.pendingWrites = 0;
-  const resolve = stream.resolveDrained;
-  stream.drained = null;
-  stream.resolveDrained = null;
-  resolve?.();
-  if (streams.get(stream.id) === stream) streams.delete(stream.id);
-}
-
-function touchStream(stream: DesktopStream): void {
-  clearTimeout(stream.closeTimer);
-  stream.closeTimer = setTimeout(() => closeStream(stream), STREAM_IDLE_MS);
-}
-
-/**
- * Snapshot reads must not race the parser: xterm's `write` callback fires
- * after the chunk has been parsed, so a snapshot waits until every queued
- * write has drained (in order) before reading the buffer.
- */
-function drainWrites(stream: DesktopStream): Promise<void> {
-  if (stream.closed || stream.pendingWrites === 0) return Promise.resolve();
-  if (!stream.drained) {
-    const { promise, resolve } = Promise.withResolvers<void>();
-    stream.drained = promise;
-    stream.resolveDrained = resolve;
-  }
-  return stream.drained;
-}
-
-function toBytes(data: unknown): Uint8Array | undefined {
-  if (data instanceof Uint8Array) return data;
-  if (data instanceof ArrayBuffer) return new Uint8Array(data);
-  return undefined;
-}
-
-/**
- * A read-mostly attachment to the desktop PTY: it keeps the omp process
- * started (a fresh runtime spawns on first attach), mirrors its bytes into a
- * headless xterm terminal, and can send input frames back. Closing the socket
- * only detaches; the runtime keeps running and the next request reattaches.
- */
-function attachStream(info: DesktopRuntimeInfo): DesktopStream {
-  const existing = streams.get(info.id);
-  if (existing && !existing.closed) {
-    touchStream(existing);
-    return existing;
-  }
-  const terminal = new HeadlessTerminal({
-    cols: info.cols,
-    rows: info.rows,
-    scrollback: 1000,
-    allowProposedApi: true,
-  });
-  const socket = new WebSocket(
-    `${DESKTOP_WS}?runtime=${encodeURIComponent(info.id)}`,
-  );
-  socket.binaryType = "arraybuffer";
-  const { promise: ready, resolve: resolveReady } =
-    Promise.withResolvers<boolean>();
-  let settled = false;
-  const stream: DesktopStream = {
-    id: info.id,
-    socket,
-    terminal,
-    ready,
-    closed: false,
-    hello: false,
-    replayBytes: 0,
-    receivedBytes: 0,
-    pendingWrites: 0,
-    drained: null,
-    resolveDrained: null,
-  };
-  const decoder = new TextDecoder();
-  const timeout = setTimeout(() => {
-    if (settled) return;
-    settled = true;
-    resolveReady(false);
-  }, STREAM_READY_TIMEOUT_MS);
-  const finishReady = (value: boolean): void => {
-    if (settled) return;
-    settled = true;
-    clearTimeout(timeout);
-    resolveReady(value);
-  };
-  socket.addEventListener("message", (event) => {
-    touchStream(stream);
-    const data = (event as MessageEvent).data;
-    if (typeof data === "string") {
-      let hello: unknown;
-      try {
-        hello = JSON.parse(data);
-      } catch {
-        return;
-      }
-      if (!hello || typeof hello !== "object") return;
-      const message = hello as Record<string, unknown>;
-      if (message.type !== "hello") return;
-      const runtime =
-        message.runtime && typeof message.runtime === "object"
-          ? (message.runtime as Record<string, unknown>)
-          : undefined;
-      const cols = typeof runtime?.cols === "number" ? runtime.cols : info.cols;
-      const rows = typeof runtime?.rows === "number" ? runtime.rows : info.rows;
-      terminal.resize(cols, rows);
-      stream.hello = true;
-      stream.replayBytes =
-        typeof message.replayBytes === "number" &&
-        Number.isFinite(message.replayBytes)
-          ? message.replayBytes
-          : 0;
-      if (stream.receivedBytes >= stream.replayBytes) finishReady(true);
-      return;
-    }
-    const bytes = toBytes(data);
-    if (!bytes) return;
-    stream.receivedBytes += bytes.byteLength;
-    stream.pendingWrites += 1;
-    terminal.write(decoder.decode(bytes, { stream: true }), () => {
-      if (stream.closed) return;
-      stream.pendingWrites -= 1;
-      if (stream.pendingWrites > 0) return;
-      const resolve = stream.resolveDrained;
-      stream.drained = null;
-      stream.resolveDrained = null;
-      resolve?.();
-    });
-    if (stream.hello && stream.receivedBytes >= stream.replayBytes)
-      finishReady(true);
-  });
-  socket.addEventListener("close", () => {
-    closeStream(stream);
-    finishReady(false);
-  });
-  socket.addEventListener("error", () => finishReady(false));
-  streams.set(info.id, stream);
-  touchStream(stream);
-  return stream;
-}
-
-async function ensureStream(
-  info: DesktopRuntimeInfo,
-): Promise<DesktopStream | undefined> {
-  const stream = attachStream(info);
-  const ready = await stream.ready;
-  if (!ready || stream.closed) {
-    closeStream(stream);
-    return undefined;
-  }
-  return stream;
+function isValidGeneration(value: unknown): value is string {
+  return typeof value === "string" && value.length > 0 && value.length <= 200;
 }
 
 async function findDesktopRuntime(
@@ -680,22 +482,6 @@ async function findDesktopRuntime(
   const runtimes = await listDesktopRuntimes();
   if (!runtimes) return "unavailable";
   return runtimes.find((runtime) => runtime.id === id);
-}
-
-/** Send a raw input frame to the desktop PTY that owns `id`. */
-async function sendRuntimeInput(id: string, data: string): Promise<boolean> {
-  const info = await findDesktopRuntime(id);
-  if (!info || info === "unavailable" || !info.alive) return false;
-  const stream = await ensureStream(info);
-  if (!stream) return false;
-  if (stream.socket.readyState !== WebSocket.OPEN) return false;
-  try {
-    stream.socket.send(JSON.stringify({ type: "input", data }));
-  } catch {
-    return false;
-  }
-  touchStream(stream);
-  return true;
 }
 
 async function waitForExtension(id: string, timeoutMs: number): Promise<void> {
@@ -711,25 +497,25 @@ async function waitForExtension(id: string, timeoutMs: number): Promise<void> {
 /* -------------------------------------------------------------------------- */
 
 async function runtimeSummary(info: DesktopRuntimeInfo): Promise<SlotSummary> {
-  const raw = await readExtensionState(info.id);
+  const status = await readExtensionStatus(info.id);
   const title =
-    typeof raw?.title === "string" && raw.title.trim()
-      ? raw.title.trim().slice(0, 200)
+    typeof status?.title === "string" && status.title.trim()
+      ? status.title.trim().slice(0, 200)
       : info.title;
   const cwd =
-    typeof raw?.cwd === "string" && raw.cwd.trim()
-      ? normalize(raw.cwd.trim()).slice(0, 2000)
+    typeof status?.cwd === "string" && status.cwd.trim()
+      ? normalize(status.cwd.trim()).slice(0, 2000)
       : info.cwd;
   const summary =
-    typeof raw?.summary === "string" && raw.summary.trim()
-      ? raw.summary.trim().slice(0, 500)
+    typeof status?.summary === "string" && status.summary.trim()
+      ? status.summary.trim().slice(0, 500)
       : undefined;
   const accent =
-    typeof raw?.accent === "string" && /^#[0-9a-f]{6}$/i.test(raw.accent)
-      ? raw.accent
+    typeof status?.accent === "string" && /^#[0-9a-f]{6}$/i.test(status.accent)
+      ? status.accent
       : undefined;
-  const status =
-    raw?.agentActive === true
+  const slotStatus =
+    status?.agentActive === true
       ? "running"
       : info.alive
         ? "connected"
@@ -740,8 +526,8 @@ async function runtimeSummary(info: DesktopRuntimeInfo): Promise<SlotSummary> {
     ...(summary ? { summary } : {}),
     ...(accent ? { accent } : {}),
     cwd,
-    status,
-    connected: raw !== undefined,
+    status: slotStatus,
+    connected: status !== undefined,
     sessionFile: info.sessionFile,
   };
 }
@@ -838,11 +624,13 @@ async function createSlot(request: Request): Promise<Response> {
       created.error ?? "desktop daemon unavailable",
     );
   const info = created.runtime;
-  // A fresh runtime spawns on first attach; the desktop UI does the same when
-  // a pane binds to it. Waiting for the extension socket makes the returned
-  // slot immediately actionable for prompt/model/terminal calls.
-  const stream = attachStream(info);
-  void stream.ready;
+  // Opening the viewport endpoint starts a freshly reserved runtime without
+  // attaching a second PTY reader or replaying terminal history.
+  await desktopRequest(
+    `/api/runtimes/${encodeURIComponent(info.id)}/screen`,
+    {},
+    4000,
+  );
   await waitForExtension(info.id, 2500);
   // Re-read the runtime so the response carries what the daemon learned while
   // the process booted (sniffed session file, title, live status).
@@ -869,8 +657,6 @@ async function deleteSlot(id: string): Promise<Response> {
       response.status === 404 ? "unknown runtime" : "desktop daemon rejected the stop",
     );
   }
-  const stream = streams.get(id);
-  if (stream) closeStream(stream);
   return json({ ok: true });
 }
 
@@ -893,38 +679,45 @@ async function terminalSnapshot(id: string): Promise<Response> {
     return errorResponse(503, "desktop daemon unavailable", {
       capabilities: { reconnect: true },
     });
-  if (!info)
-    return errorResponse(404, "unknown runtime");
-  if (!info.alive)
-    return errorResponse(503, "runtime is not running", {
-      capabilities: TERMINAL_UNAVAILABLE,
+  if (!info) return errorResponse(404, "unknown runtime");
+  const response = await desktopRequest(
+    `/api/runtimes/${encodeURIComponent(id)}/screen`,
+  );
+  if (!response)
+    return errorResponse(503, "desktop daemon unavailable", {
+      capabilities: { reconnect: true },
     });
-  const stream = await ensureStream(info);
-  if (!stream)
-    return errorResponse(503, "terminal stream unavailable", {
-      capabilities: TERMINAL_UNAVAILABLE,
-    });
-  await drainWrites(stream);
-  if (stream.closed)
-    return errorResponse(503, "terminal stream unavailable", {
-      capabilities: TERMINAL_UNAVAILABLE,
-    });
-  const raw = await readExtensionState(id);
-  // Visible viewport of whichever buffer is active (primary or alternate):
-  // the phone mirrors what a pane shows right now.
-  const buffer = stream.terminal.buffer.active;
-  const lines: string[] = [];
-  for (let row = 0; row < stream.terminal.rows; row += 1) {
-    const line = buffer.getLine(buffer.viewportY + row);
-    lines.push(line ? line.translateToString(false) : "");
-  }
+  if (!response.ok)
+    return errorResponse(
+      response.status >= 400 ? response.status : 502,
+      "terminal screen unavailable",
+      { capabilities: TERMINAL_UNAVAILABLE },
+    );
+  const screen = await readDesktopJson(response);
+  if (
+    !screen ||
+    typeof screen !== "object" ||
+    Array.isArray(screen) ||
+    typeof (screen as Record<string, unknown>).screen !== "string" ||
+    !Number.isSafeInteger((screen as Record<string, unknown>).cols) ||
+    !Number.isSafeInteger((screen as Record<string, unknown>).rows)
+  )
+    return errorResponse(502, "desktop daemon returned an invalid screen");
+  const status = await readExtensionStatus(id);
+  const extensionGeneration = status?.generation;
+  const canWrite = isValidGeneration(extensionGeneration);
+  const generation = canWrite ? extensionGeneration : `desktop:${id}`;
   const snapshot: TerminalSnapshot = {
     apiVersion: API_VERSION,
-    generation:
-      typeof raw?.generation === "string" ? raw.generation : `desktop:${id}`,
+    generation,
     paneId: id,
-    screen: lines.join("\n"),
-    capabilities: { read: true, write: true, resize: false, focus: false },
+    screen: (screen as Record<string, unknown>).screen as string,
+    capabilities: {
+      read: true,
+      write: canWrite,
+      resize: false,
+      focus: false,
+    },
   };
   return json(snapshot);
 }
@@ -966,43 +759,50 @@ async function terminalAction(id: string, request: Request): Promise<Response> {
     return errorResponse(503, "runtime is not running", {
       capabilities: { reconnect: true },
     });
-  const stream = await ensureStream(info);
-  if (!stream)
-    return errorResponse(503, "terminal stream unavailable", {
-      capabilities: TERMINAL_UNAVAILABLE,
-    });
-  const raw = await readExtensionState(id);
-  if (!raw)
+  const status = await readExtensionStatus(id);
+  if (!status || !isValidGeneration(status.generation))
     return errorResponse(503, "extension unavailable", {
       capabilities: { reconnect: true },
     });
-  if (
-    raw.generation !== undefined &&
-    String(raw.generation) !== body.generation
-  )
+  if (status.generation !== body.generation)
     return errorResponse(409, "session changed; refresh before writing", {
-      generation: raw.generation,
+      generation: status.generation,
     });
-  if (body.interactionId !== undefined) {
-    const interaction = normaliseRuntime(raw.runtime)?.interaction;
-    if (interaction?.id !== body.interactionId)
-      return errorResponse(
-        409,
-        "pending interaction changed; reopen the terminal controls before writing",
-      );
-  }
-  if (stream.closed || stream.socket.readyState !== WebSocket.OPEN)
-    return errorResponse(503, "terminal stream unavailable", {
-      capabilities: TERMINAL_UNAVAILABLE,
+  if (
+    body.interactionId !== undefined &&
+    (!status.pendingAction ||
+      typeof status.pendingAction !== "object" ||
+      Array.isArray(status.pendingAction) ||
+      (status.pendingAction as Record<string, unknown>).id !== body.interactionId)
+  )
+    return errorResponse(
+      409,
+      "pending interaction changed; reopen the terminal controls before writing",
+    );
+  const input = await desktopRequest(
+    `/api/runtimes/${encodeURIComponent(id)}/input`,
+    {
+      method: "POST",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify({ data: body.text }),
+    },
+  );
+  if (!input)
+    return errorResponse(503, "desktop daemon unavailable", {
+      capabilities: { reconnect: true },
     });
-  try {
-    stream.socket.send(JSON.stringify({ type: "input", data: body.text }));
-  } catch {
-    return errorResponse(503, "terminal write failed");
+  if (!input.ok) {
+    const result = await readDesktopJson(input);
+    const message =
+      result && typeof result === "object" && !Array.isArray(result) &&
+      typeof (result as Record<string, unknown>).error === "string"
+        ? (result as Record<string, unknown>).error as string
+        : "terminal write failed";
+    return errorResponse(input.status >= 400 ? input.status : 502, message);
   }
-  touchStream(stream);
   return json({ ok: true, generation: body.generation });
 }
+
 
 function activityText(value: unknown, max: number): string | undefined {
   if (typeof value !== "string") return undefined;
@@ -1667,6 +1467,8 @@ const MAX_FULL_MESSAGE_BYTES = 32 * 1024 * 1024;
 const FULL_MESSAGE_CHUNK_CHARS = 256 * 1024;
 const MAX_MESSAGE_TRANSFERS = 256;
 const MESSAGE_TRANSFER_TTL_MS = 5 * 60 * 1000;
+const MAX_MESSAGE_ID_BYTES = 8 * 1024;
+const MAX_MESSAGE_BATCH_QUERY_BYTES = 512 * 1024;
 type MessageTransfer = {
   slot: string;
   messageId: string;
@@ -1686,6 +1488,36 @@ function pruneMessageTransfers(now = Date.now()): void {
   for (const [transferId, transfer] of messageTransfers) {
     if (transfer.expiresAt <= now) messageTransfers.delete(transferId);
   }
+}
+function rememberMessageTransfer(
+  transferId: string,
+  slot: string,
+  messageId: string,
+  generation: string,
+): boolean {
+  const now = Date.now();
+  pruneMessageTransfers(now);
+  const existing = messageTransfers.get(transferId);
+  if (
+    existing &&
+    (existing.slot !== slot ||
+      existing.messageId !== messageId ||
+      existing.generation !== generation)
+  )
+    return false;
+  messageTransfers.delete(transferId);
+  messageTransfers.set(transferId, {
+    slot,
+    messageId,
+    generation,
+    expiresAt: now + MESSAGE_TRANSFER_TTL_MS,
+  });
+  while (messageTransfers.size > MAX_MESSAGE_TRANSFERS) {
+    const oldest = messageTransfers.keys().next().value;
+    if (oldest === undefined) break;
+    messageTransfers.delete(oldest);
+  }
+  return true;
 }
 const RASTER_IMAGE_MIME_TYPES: Record<string, true> = {
   "image/png": true,
@@ -1859,7 +1691,6 @@ export function validateInteractionAction(
 }
 
 function ipcJsonObject(response: IpcResponse): Record<string, unknown> | undefined {
-  if (response.status < 200 || response.status >= 300) return undefined;
   try {
     const value: unknown = JSON.parse(response.body);
     return value && typeof value === "object" && !Array.isArray(value)
@@ -1874,8 +1705,7 @@ async function historyResponse(
   slot: string,
   request: Request,
 ): Promise<Response> {
-  const url = new URL(request.url);
-  const params = url.searchParams;
+  const params = new URL(request.url).searchParams;
   if (
     [...params.keys()].some((key) => key !== "before" && key !== "limit") ||
     params.getAll("before").length > 1 ||
@@ -1883,7 +1713,10 @@ async function historyResponse(
   )
     return errorResponse(400, "history query is invalid");
   const before = params.get("before");
-  if (before !== null && (!before || before.length > 512))
+  if (
+    before !== null &&
+    (!before || Buffer.byteLength(before, "utf8") > MAX_MESSAGE_ID_BYTES)
+  )
     return errorResponse(400, "history before entry id is invalid");
   const rawLimit = params.get("limit");
   const limit = rawLimit === null ? 80 : Number(rawLimit);
@@ -1894,12 +1727,15 @@ async function historyResponse(
     limit > 80
   )
     return errorResponse(400, "history limit must be an integer from 1 to 80");
-  const current = await getSlotState(slot);
-  if (!current.state)
-    return errorResponse(503, current.error ?? "extension unavailable", {
+  const status = await readExtensionStatus(slot);
+  if (!status || !isValidGeneration(status.generation))
+    return errorResponse(503, "extension unavailable", {
       capabilities: { reconnect: true },
     });
-  const query = new URLSearchParams({ limit: String(limit) });
+  const query = new URLSearchParams({
+    limit: String(limit),
+    generation: status.generation,
+  });
   if (before !== null) query.set("before", before);
   try {
     const response = await ipcRequest(
@@ -1907,19 +1743,33 @@ async function historyResponse(
       "GET",
       `/history?${query}`,
     );
-    if (response.status === 409)
-      return errorResponse(409, "session changed; refresh history", {
-        generation: current.state.generation,
-      });
     const value = ipcJsonObject(response);
+    if (response.status === 409)
+      return errorResponse(
+        409,
+        "session changed; refresh history",
+        { generation: value?.generation ?? status.generation },
+      );
+    if (response.status < 200 || response.status >= 300)
+      return errorResponse(
+        response.status >= 400 && response.status <= 599 ? response.status : 502,
+        typeof value?.error === "string"
+          ? value.error
+          : response.body.slice(0, 300),
+      );
     if (!value)
       return errorResponse(
         response.status >= 400 && response.status <= 599 ? response.status : 502,
-        response.status >= 400 ? response.body.slice(0, 300) : "invalid extension history",
+        response.status >= 400
+          ? response.body.slice(0, 300)
+          : "invalid extension history",
       );
-    if (typeof value.generation !== "string" || value.generation !== current.state.generation)
+    if (
+      typeof value.generation !== "string" ||
+      value.generation !== status.generation
+    )
       return errorResponse(409, "session changed; refresh history", {
-        generation: current.state.generation,
+        generation: status.generation,
       });
     const history = normaliseHistory(value.history);
     if (
@@ -1937,10 +1787,179 @@ async function historyResponse(
     )
       return errorResponse(502, "extension returned invalid history");
     return json({
-      generation: current.state.generation,
+      generation: status.generation,
       messages: value.messages,
       history,
     });
+  } catch (error) {
+    return errorResponse(
+      503,
+      error instanceof Error ? error.message : "extension unavailable",
+      { capabilities: { reconnect: true } },
+    );
+  }
+}
+
+async function batchMessagesResponse(
+  slot: string,
+  request: Request,
+): Promise<Response> {
+  const params = new URL(request.url).searchParams;
+  const rawIds = params.get("ids");
+  const generation = params.get("generation");
+  if (
+    [...params.keys()].some((key) => key !== "ids" && key !== "generation") ||
+    params.getAll("ids").length !== 1 ||
+    params.getAll("generation").length !== 1 ||
+    typeof rawIds !== "string" ||
+    Buffer.byteLength(rawIds, "utf8") > MAX_MESSAGE_BATCH_QUERY_BYTES ||
+    typeof generation !== "string" ||
+    generation.length === 0 ||
+    generation.length > 200
+  )
+    return errorResponse(400, "batch message query is invalid");
+  let parsedIds: unknown;
+  try {
+    parsedIds = JSON.parse(rawIds);
+  } catch {
+    return errorResponse(400, "batch message ids must be JSON");
+  }
+  if (!Array.isArray(parsedIds) || parsedIds.length < 1 || parsedIds.length > 8)
+    return errorResponse(400, "batch message ids must contain 1 to 8 entries");
+  const ids: string[] = [];
+  const requested = new Set<string>();
+  for (const id of parsedIds) {
+    if (
+      typeof id !== "string" ||
+      id.length === 0 ||
+      Buffer.byteLength(id, "utf8") > MAX_MESSAGE_ID_BYTES ||
+      requested.has(id)
+    )
+      return errorResponse(400, "batch message ids must be unique nonempty entry ids");
+    ids.push(id);
+    requested.add(id);
+  }
+  const query = new URLSearchParams({
+    ids: JSON.stringify(ids),
+    generation,
+  });
+  try {
+    const response = await ipcRequest(
+      join(IPC_ROOT, `${slot}.sock`),
+      "GET",
+      `/messages?${query}`,
+    );
+    const value = ipcJsonObject(response);
+    if (response.status === 409)
+      return errorResponse(
+        409,
+        "session changed; refresh messages",
+        { generation: value?.generation ?? generation },
+      );
+    if (response.status < 200 || response.status >= 300)
+      return errorResponse(
+        response.status >= 400 && response.status <= 599 ? response.status : 502,
+        typeof value?.error === "string"
+          ? value.error
+          : response.body.slice(0, 300),
+        value?.code === "transfer_capacity" ||
+          value?.code === "message_too_large"
+          ? { code: value.code }
+          : {},
+      );
+    if (!value)
+      return errorResponse(
+        response.status >= 400 && response.status <= 599 ? response.status : 502,
+        response.status >= 400
+          ? response.body.slice(0, 300)
+          : "invalid extension batch",
+      );
+    if (typeof value.generation !== "string" || value.generation !== generation)
+      return errorResponse(409, "session changed; refresh messages", {
+        generation: value.generation,
+      });
+    if (
+      !Array.isArray(value.messages) ||
+      !Array.isArray(value.transfers) ||
+      value.messages.length + value.transfers.length !== ids.length
+    )
+      return errorResponse(502, "extension returned an incomplete message batch");
+    const returned = new Set<string>();
+    const messages: unknown[] = [];
+    for (const message of value.messages) {
+      if (!message || typeof message !== "object" || Array.isArray(message))
+        return errorResponse(502, "extension returned an invalid batch message");
+      const item = message as Record<string, unknown>;
+      if (
+        typeof item.entryId !== "string" ||
+        !requested.has(item.entryId) ||
+        returned.has(item.entryId) ||
+        !Array.isArray(item.parts)
+      )
+        return errorResponse(502, "extension returned an invalid batch message identity");
+      const encoded = JSON.stringify(message);
+      if (
+        Buffer.byteLength(encoded, "utf8") > MAX_FULL_MESSAGE_BYTES ||
+        encoded.length > FULL_MESSAGE_CHUNK_CHARS
+      )
+        return errorResponse(502, "extension returned an oversized unchunked message");
+      returned.add(item.entryId);
+      messages.push(message);
+    }
+    const transfers: Array<{
+      entryId: string;
+      transferId: string;
+      chunk: string;
+      nextOffset: number;
+      total: number;
+    }> = [];
+    const transferIds = new Set<string>();
+    for (const transfer of value.transfers) {
+      if (!transfer || typeof transfer !== "object" || Array.isArray(transfer))
+        return errorResponse(502, "extension returned invalid batch transfer metadata");
+      const item = transfer as Record<string, unknown>;
+      if (
+        typeof item.entryId !== "string" ||
+        !requested.has(item.entryId) ||
+        returned.has(item.entryId) ||
+        !isMessageTransferId(item.transferId) ||
+        transferIds.has(item.transferId) ||
+        typeof item.chunk !== "string" ||
+        item.chunk.length === 0 ||
+        item.chunk.length > FULL_MESSAGE_CHUNK_CHARS ||
+        !Number.isSafeInteger(item.nextOffset) ||
+        item.nextOffset !== item.chunk.length ||
+        typeof item.total !== "number" ||
+        !Number.isSafeInteger(item.total) ||
+        item.total <= item.nextOffset ||
+        item.total > MAX_FULL_MESSAGE_BYTES
+      )
+        return errorResponse(502, "extension returned invalid batch transfer metadata");
+      const lastCode = item.chunk.charCodeAt(item.chunk.length - 1);
+      if (lastCode >= 0xd800 && lastCode <= 0xdbff)
+        return errorResponse(502, "extension returned a split batch transfer chunk");
+      if (
+        !rememberMessageTransfer(
+          item.transferId,
+          slot,
+          item.entryId,
+          generation,
+        )
+      )
+        return errorResponse(502, "extension reused a message transferId");
+      transferIds.add(item.transferId);
+      returned.add(item.entryId);
+      transfers.push({
+        entryId: item.entryId,
+        transferId: item.transferId,
+        chunk: item.chunk,
+        nextOffset: item.nextOffset as number,
+        total: item.total as number,
+      });
+    }
+    if (returned.size !== requested.size)
+      return errorResponse(502, "extension omitted one or more batch messages");
+    return json({ generation, messages, transfers });
   } catch (error) {
     return errorResponse(
       503,
@@ -1965,7 +1984,10 @@ async function messageResponse(
   )
     return errorResponse(400, "message query is invalid");
   const id = params.get("id");
-  if (!id || id.length > 512)
+  if (
+    !id ||
+    Buffer.byteLength(id, "utf8") > MAX_MESSAGE_ID_BYTES
+  )
     return errorResponse(400, "message id is invalid");
   const rawOffset = params.get("offset");
   const offset =
@@ -1988,31 +2010,29 @@ async function messageResponse(
   )
     return errorResponse(400, "message transferId does not match the offset");
   const transferId = rawTransferId ?? "";
-  const current = await getSlotState(slot);
-  if (!current.state)
-    return errorResponse(503, current.error ?? "extension unavailable", {
-      capabilities: { reconnect: true },
-    });
+  let generation: string;
   if (offset !== undefined && offset > 0) {
     const now = Date.now();
     pruneMessageTransfers(now);
     const transfer = messageTransfers.get(transferId);
     if (!transfer)
-      return errorResponse(409, "message transfer expired; restart message load", {
-        generation: current.state.generation,
-      });
+      return errorResponse(409, "message transfer expired; restart message load");
     if (transfer.slot !== slot || transfer.messageId !== id)
       return errorResponse(409, "message transfer does not match this message");
-    if (transfer.generation !== current.state.generation)
-      return errorResponse(409, "session changed; restart message load", {
-        generation: current.state.generation,
-      });
+    generation = transfer.generation;
     transfer.expiresAt = now + MESSAGE_TRANSFER_TTL_MS;
     messageTransfers.delete(transferId);
     messageTransfers.set(transferId, transfer);
+  } else {
+    const status = await readExtensionStatus(slot);
+    if (!status || !isValidGeneration(status.generation))
+      return errorResponse(503, "extension unavailable", {
+        capabilities: { reconnect: true },
+      });
+    generation = status.generation;
   }
   try {
-    const query = new URLSearchParams({ id });
+    const query = new URLSearchParams({ id, generation });
     if (offset !== undefined) query.set("offset", String(offset));
     if (rawTransferId !== null) query.set("transferId", rawTransferId);
     const response = await ipcRequest(
@@ -2020,32 +2040,45 @@ async function messageResponse(
       "GET",
       `/message?${query}`,
     );
+    const value = ipcJsonObject(response);
     if (response.status === 404)
       return errorResponse(404, "message not found");
-    if (response.status === 409)
+    if (response.status === 409) {
+      if (rawTransferId !== null) messageTransfers.delete(rawTransferId);
       return errorResponse(409, "session changed; refresh message", {
-        generation: current.state.generation,
+        generation: value?.generation ?? generation,
       });
-    const value = ipcJsonObject(response);
+    }
+    if (response.status < 200 || response.status >= 300)
+      return errorResponse(
+        response.status >= 400 && response.status <= 599 ? response.status : 502,
+        typeof value?.error === "string"
+          ? value.error
+          : response.body.slice(0, 300),
+        value?.code === "transfer_capacity" ||
+          value?.code === "message_too_large"
+          ? { code: value.code }
+          : {},
+      );
     if (!value)
       return errorResponse(
         response.status >= 400 && response.status <= 599 ? response.status : 502,
-        response.status >= 400 ? response.body.slice(0, 300) : "invalid extension message",
+        response.status >= 400
+          ? response.body.slice(0, 300)
+          : "invalid extension message",
       );
-    if (typeof value.generation !== "string" || value.generation !== current.state.generation)
+    if (typeof value.generation !== "string" || value.generation !== generation)
       return errorResponse(409, "session changed; refresh message", {
-        generation: current.state.generation,
+        generation: value.generation,
       });
     if (typeof value.chunk === "string") {
-      if (offset === undefined)
-        return errorResponse(502, "extension returned a chunk without an offset request");
       const responseTransferId = value.transferId;
       if (
         !isMessageTransferId(responseTransferId) ||
-        (offset > 0 && responseTransferId !== transferId)
+        (offset !== undefined && offset > 0 && responseTransferId !== transferId)
       )
         return errorResponse(502, "extension returned an invalid message transferId");
-      const start = offset;
+      const start = offset ?? 0;
       const total = value.total;
       const nextOffset = value.nextOffset;
       if (
@@ -2060,32 +2093,21 @@ async function messageResponse(
         (nextOffset === null && start + value.chunk.length !== total)
       )
         return errorResponse(502, "extension returned invalid full-message chunk");
-      if (offset === 0) {
-        const now = Date.now();
-        pruneMessageTransfers(now);
-        const existing = messageTransfers.get(responseTransferId);
+      if (start === 0) {
         if (
-          existing &&
-          (existing.slot !== slot ||
-            existing.messageId !== id ||
-            existing.generation !== current.state.generation)
+          !rememberMessageTransfer(
+            responseTransferId,
+            slot,
+            id,
+            generation,
+          )
         )
           return errorResponse(502, "extension reused a message transferId");
+      } else if (nextOffset === null) {
         messageTransfers.delete(responseTransferId);
-        messageTransfers.set(responseTransferId, {
-          slot,
-          messageId: id,
-          generation: current.state.generation,
-          expiresAt: now + MESSAGE_TRANSFER_TTL_MS,
-        });
-        while (messageTransfers.size > MAX_MESSAGE_TRANSFERS) {
-          const oldest = messageTransfers.keys().next().value;
-          if (oldest === undefined) break;
-          messageTransfers.delete(oldest);
-        }
       }
       return json({
-        generation: current.state.generation,
+        generation,
         transferId: responseTransferId,
         chunk: value.chunk,
         nextOffset,
@@ -2098,7 +2120,8 @@ async function messageResponse(
       !value.message ||
       typeof value.message !== "object" ||
       Array.isArray(value.message) ||
-      (value.message as Record<string, unknown>).entryId !== id
+      (value.message as Record<string, unknown>).entryId !== id ||
+      !Array.isArray((value.message as Record<string, unknown>).parts)
     )
       return errorResponse(502, "extension returned invalid full message");
     const serialized = JSON.stringify(value.message);
@@ -2107,14 +2130,12 @@ async function messageResponse(
       return errorResponse(413, "full message exceeds the 32 MiB transport limit");
     if (serialized.length > FULL_MESSAGE_CHUNK_CHARS)
       return errorResponse(502, "extension did not chunk the full message");
-    return json({ generation: current.state.generation, message: value.message });
+    return json({ generation, message: value.message });
   } catch (error) {
     const message =
       error instanceof Error ? error.message : "extension unavailable";
     return errorResponse(
-      message.includes("response too large")
-        ? 413
-        : 503,
+      message.includes("response too large") ? 413 : 503,
       message.includes("response too large")
         ? "full message exceeds the 32 MiB transport limit"
         : message,
@@ -2304,7 +2325,15 @@ async function slotAction(slot: string, request: Request): Promise<Response> {
       // The extension staged the command in the editor of the PTY-owned omp
       // process; Enter goes to that same runtime's terminal, exactly like the
       // desktop client pressing it.
-      if (!(await sendRuntimeInput(slot, "\r")))
+      const input = await desktopRequest(
+        `/api/runtimes/${encodeURIComponent(slot)}/input`,
+        {
+          method: "POST",
+          headers: { "content-type": "application/json" },
+          body: JSON.stringify({ data: "\r" }),
+        },
+      );
+      if (!input?.ok)
         return errorResponse(
           503,
           "Command prepared but submission failed; inspect the desktop composer before retrying",
@@ -2457,90 +2486,31 @@ async function pinsResponse(request: Request): Promise<Response> {
   return json({ pins });
 }
 
-const MIME: Record<string, string> = {
-  ".html": "text/html; charset=utf-8",
-  ".js": "text/javascript; charset=utf-8",
-  ".css": "text/css; charset=utf-8",
-  ".svg": "image/svg+xml",
-  ".png": "image/png",
-  ".ico": "image/x-icon",
-  ".webmanifest": "application/manifest+json",
-  ".json": "application/json; charset=utf-8",
-  ".ttf": "font/ttf",
-  ".woff": "font/woff",
-  ".woff2": "font/woff2",
-};
-let katexFontsRoot: string | null | undefined;
-
-async function staticResponse(pathname: string): Promise<Response> {
-  const fontMatch =
-    /^\/vendor\/katex\/fonts\/([A-Za-z0-9_-]+\.(?:woff2?|ttf))$/.exec(pathname);
-  if (fontMatch) {
-    if (katexFontsRoot === undefined) {
-      try {
-        katexFontsRoot = join(
-          dirname(Bun.resolveSync("katex/package.json", ROOT)),
-          "dist",
-          "fonts",
-        );
-      } catch {
-        katexFontsRoot = null;
-      }
-    }
-    if (!katexFontsRoot) return errorResponse(404, "not found");
-    const filename = fontMatch[1];
-    const target = join(katexFontsRoot, filename);
-    try {
-      const stat = await fs.lstat(target);
-      if (!stat.isFile() || stat.size > 2 * 1024 * 1024)
-        return errorResponse(404, "not found");
-      return new Response(await fs.readFile(target), {
-        headers: {
-          "content-type": MIME[extname(filename)] ?? "application/octet-stream",
-          "cache-control": "public, max-age=31536000, immutable",
-        },
-      });
-    } catch {
-      return errorResponse(404, "not found");
-    }
-  }
-  if (pathname === "/client.js" && clientBundle)
-    return new Response(clientBundle, {
-      headers: { "content-type": MIME[".js"], "cache-control": "no-cache" },
-    });
-  const relativePath =
-    pathname === "/" ? "index.html" : decodeURIComponent(pathname.slice(1));
-  const publicRoot = resolve(ROOT, "public");
-  const target = resolve(publicRoot, relativePath);
-  if (!isWithinRoot(target, publicRoot)) return errorResponse(404, "not found");
-  try {
-    const stat = await fs.lstat(target);
-    if (!stat.isFile() || stat.size > 8 * 1024 * 1024)
-      return errorResponse(404, "not found");
-    return new Response(await fs.readFile(target), {
-      headers: {
-        "content-type": MIME[extname(target)] ?? "application/octet-stream",
-        "cache-control": "no-cache",
-      },
-    });
-  } catch {
-    return errorResponse(404, "not found");
-  }
-}
-
 async function notificationsApi(request: Request): Promise<Response> {
   const service = notificationService;
   if (!service) return errorResponse(503, "notifications unavailable");
-  const pathname = new URL(request.url).pathname;
+  const url = new URL(request.url);
+  const pathname = url.pathname;
   if (request.method === "GET" && pathname === "/api/notifications/config") {
+    if (url.searchParams.size > 0)
+      return errorResponse(400, "notification config query is invalid");
     const status = await service.status();
     return json({
       enabled: status.enabled,
       ...(status.publicKey ? { publicKey: status.publicKey } : {}),
     });
   }
-  if (request.method === "GET" && pathname === "/api/notifications")
-    return json(await service.status());
+  if (request.method === "GET" && pathname === "/api/notifications") {
+    const params = url.searchParams;
+    const activeSlot = params.get("slot");
+    if (
+      [...params.keys()].some((key) => key !== "slot") ||
+      params.getAll("slot").length > 1 ||
+      (activeSlot !== null && !isSlotId(activeSlot))
+    )
+      return errorResponse(400, "notification status query is invalid");
+    return json(await service.status(activeSlot ?? undefined));
+  }
   let body: Record<string, unknown>;
   try {
     body = parseJson(await readBody(request));
@@ -2585,13 +2555,32 @@ async function notificationsApi(request: Request): Promise<Response> {
   }
   if (request.method === "POST" && pathname === "/api/notifications/ack") {
     if (
+      Object.keys(body).some((key) => key !== "slot" && key !== "identities") ||
       typeof body.slot !== "string" ||
       !isSlotId(body.slot) ||
-      typeof body.identity !== "string"
+      !Array.isArray(body.identities) ||
+      body.identities.length > 256
     )
-      return errorResponse(400, "slot and identity are required");
+      return errorResponse(
+        400,
+        "acknowledgement requires a valid slot and at most 256 identities",
+      );
+    const identities: string[] = [];
+    const seen = new Set<string>();
+    for (const identity of body.identities) {
+      if (
+        typeof identity !== "string" ||
+        identity.length === 0 ||
+        Buffer.byteLength(identity, "utf8") > 512 ||
+        /[\u0000-\u001f\u007f-\u009f]/.test(identity) ||
+        seen.has(identity)
+      )
+        return errorResponse(400, "acknowledgement identities are invalid");
+      seen.add(identity);
+      identities.push(identity);
+    }
     try {
-      await service.ack(body.slot, body.identity);
+      await service.ack(body.slot, identities);
       return json({ ok: true });
     } catch (error) {
       return errorResponse(
@@ -2605,10 +2594,117 @@ async function notificationsApi(request: Request): Promise<Response> {
   return errorResponse(404, "not found");
 }
 
-function withCors(response: Response, request: Request): Response {
-  for (const [key, value] of Object.entries(corsHeaders(request)))
-    response.headers.set(key, value);
-  return response;
+const JSON_GZIP_THRESHOLD_BYTES = 16 * 1024;
+const MAX_COMPRESSED_JSON_CACHE_BYTES = 8 * 1024 * 1024;
+const MAX_COMPRESSED_JSON_CACHE_ENTRIES = 48;
+const compressedJsonCache = new Map<string, Uint8Array<ArrayBuffer>>();
+let compressedJsonCacheBytes = 0;
+
+function acceptsGzip(header: string | null): boolean {
+  if (!header) return false;
+  let gzipQuality: number | undefined;
+  let wildcardQuality: number | undefined;
+  for (const item of header.split(",")) {
+    const [encoding, ...parameters] = item.trim().split(";");
+    const quality = parameters.find((parameter) =>
+      /^q=/i.test(parameter.trim()),
+    );
+    const value = quality ? Number(quality.trim().slice(2)) : 1;
+    const parsed = Number.isFinite(value) ? Math.max(0, Math.min(1, value)) : 0;
+    if (encoding.trim().toLowerCase() === "gzip") gzipQuality = parsed;
+    else if (encoding.trim() === "*") wildcardQuality = parsed;
+  }
+  return (gzipQuality ?? wildcardQuality ?? 0) > 0;
+}
+
+function conditionalTagMatches(header: string | null, etag: string): boolean {
+  if (!header) return false;
+  const target = etag.replace(/^W\//, "");
+  return header.split(",").some((value) => {
+    const tag = value.trim();
+    return tag === "*" || tag.replace(/^W\//, "") === target;
+  });
+}
+
+function mergeVary(headers: Headers, values: readonly string[]): void {
+  const vary = new Set(
+    (headers.get("vary") ?? "")
+      .split(",")
+      .map((value) => value.trim())
+      .filter(Boolean),
+  );
+  for (const value of values) vary.add(value);
+  headers.set("vary", [...vary].join(", "));
+}
+
+export async function withCors(
+  response: Response,
+  request: Request,
+): Promise<Response> {
+  const headers = new Headers(response.headers);
+  for (const [key, value] of Object.entries(corsHeaders(request))) {
+    if (key.toLowerCase() === "vary")
+      mergeVary(headers, value.split(",").map((part) => part.trim()));
+    else headers.set(key, value);
+  }
+  if (
+    request.method !== "GET" ||
+    response.status !== 200 ||
+    !headers.get("content-type")?.toLowerCase().startsWith("application/json")
+  )
+    return new Response(response.body, {
+      status: response.status,
+      statusText: response.statusText,
+      headers,
+    });
+
+  const body = await response.text();
+  const gzip =
+    Buffer.byteLength(body, "utf8") >= JSON_GZIP_THRESHOLD_BYTES &&
+    acceptsGzip(request.headers.get("accept-encoding"));
+  const authorization = request.headers.get("authorization") ?? "";
+  const representationHash = createHash("sha256")
+    .update(authorization)
+    .update("\0")
+    .update(body)
+    .digest("base64url");
+  const etag = `W/"${representationHash}${gzip ? "-gzip" : ""}"`;
+  headers.set("cache-control", "private, no-cache");
+  headers.set("etag", etag);
+  mergeVary(headers, ["Authorization", "Accept-Encoding"]);
+  if (conditionalTagMatches(request.headers.get("if-none-match"), etag))
+    return new Response(null, { status: 304, headers });
+
+  if (!gzip) {
+    headers.delete("content-encoding");
+    headers.delete("content-length");
+    return new Response(body, { status: 200, headers });
+  }
+
+  let compressed = compressedJsonCache.get(representationHash);
+  if (compressed) {
+    compressedJsonCache.delete(representationHash);
+    compressedJsonCache.set(representationHash, compressed);
+  } else {
+    compressed = gzipSync(body);
+    if (compressed.byteLength <= MAX_COMPRESSED_JSON_CACHE_BYTES) {
+      while (
+        compressedJsonCache.size >= MAX_COMPRESSED_JSON_CACHE_ENTRIES ||
+        compressedJsonCacheBytes + compressed.byteLength >
+          MAX_COMPRESSED_JSON_CACHE_BYTES
+      ) {
+        const oldest = compressedJsonCache.entries().next().value;
+        if (!oldest) break;
+        compressedJsonCache.delete(oldest[0]);
+        compressedJsonCacheBytes -= oldest[1].byteLength;
+      }
+      compressedJsonCache.set(representationHash, compressed);
+      compressedJsonCacheBytes += compressed.byteLength;
+    }
+  }
+  headers.set("content-encoding", "gzip");
+  headers.set("content-length", String(compressed.byteLength));
+  return new Response(compressed, { status: 200, headers });
 }
 
 async function handle(request: Request): Promise<Response> {
@@ -2618,7 +2714,10 @@ async function handle(request: Request): Promise<Response> {
       return errorResponse(403, "origin not allowed");
     return new Response(null, { status: 204, headers: corsHeaders(request) });
   }
-  if (!url.pathname.startsWith("/api/")) return staticResponse(url.pathname);
+  if (!url.pathname.startsWith("/api/")) {
+    const asset = await webAssets?.response(request);
+    return asset ?? errorResponse(404, "not found");
+  }
   if (!originAllowed(request)) return errorResponse(403, "origin not allowed");
   if (
     (request.method === "POST" ||
@@ -2685,14 +2784,16 @@ async function handle(request: Request): Promise<Response> {
   if (deleteMatch && request.method === "DELETE" && isSlotId(deleteMatch[1]))
     return withCors(await deleteSlot(deleteMatch[1]), request);
   const contentMatch =
-    /^\/api\/slots\/([^/]+)\/(history|message)$/.exec(url.pathname);
+    /^\/api\/slots\/([^/]+)\/(history|messages|message)$/.exec(url.pathname);
   if (contentMatch && isSlotId(contentMatch[1])) {
     const response =
       request.method !== "GET"
         ? errorResponse(405, "method not allowed")
         : contentMatch[2] === "history"
           ? await historyResponse(contentMatch[1], request)
-          : await messageResponse(contentMatch[1], request);
+          : contentMatch[2] === "messages"
+            ? await batchMessagesResponse(contentMatch[1], request)
+            : await messageResponse(contentMatch[1], request);
     return withCors(response, request);
   }
   const stateMatch = /^\/api\/slots\/([^/]+)\/state$/.exec(url.pathname);
@@ -2744,21 +2845,6 @@ function corsHeaders(request: Request): Record<string, string> {
     : {};
 }
 
-async function buildClient(): Promise<void> {
-  try {
-    const result = await Bun.build({
-      entrypoints: [join(ROOT, "client.ts")],
-      target: "browser",
-      format: "esm",
-      minify: false,
-    });
-    if (result.success && result.outputs[0])
-      clientBundle = await result.outputs[0].arrayBuffer();
-    else console.error("omp-mobile: client bundle unavailable", result.logs);
-  } catch (error) {
-    console.error("omp-mobile: client bundle unavailable", error);
-  }
-}
 
 async function loadToken(): Promise<void> {
   const fromEnv = process.env.OMP_MOBILE_TOKEN !== undefined;
@@ -2793,7 +2879,7 @@ export async function start() {
   await loadToken();
   await fs.mkdir(IPC_ROOT, { recursive: true, mode: 0o700 });
   await fs.chmod(IPC_ROOT, 0o700).catch(() => undefined);
-  await buildClient();
+  webAssets ??= await createWebAssets(ROOT);
   notificationService?.stop();
   notificationService = createNotificationService({
     ipcRoot: IPC_ROOT,

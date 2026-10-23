@@ -1,12 +1,3 @@
-import { buildChart, planChart, worthCharting } from "@oh-my-pi/pi-tui/charts/chart-plan";
-import { renderChartSvg } from "@oh-my-pi/pi-tui/charts/chart-svg";
-import { analyzeTable } from "@oh-my-pi/pi-tui/charts/table-data";
-import katex from "katex";
-// Bun embeds this stylesheet as text; its local font URLs are rewritten below.
-// @ts-expect-error CSS is loaded with Bun's text import loader for the browser bundle.
-import katexCssText from "katex/dist/katex.min.css" with { type: "text" };
-import mermaid from "mermaid";
-
 export type AppendPlain = (parent: HTMLElement, text: string) => void;
 
 const MAX_SVG_CHARS = 1_000_000;
@@ -32,51 +23,6 @@ const CHART_THEME_ALIASES: Record<string, string> = {
 };
 let figureSerial = 0;
 let mermaidSerial = 0;
-const MERMAID_THEME_DEFAULT = {
-  primaryColor: "#20242b",
-  primaryTextColor: "#f0f2f5",
-  primaryBorderColor: "#707783",
-  lineColor: "#a7b0bd",
-  secondaryColor: "#292f38",
-  tertiaryColor: "#171a1f",
-  background: "#171a1f",
-  mainBkg: "#20242b",
-  nodeBorder: "#707783",
-  clusterBkg: "#20242b",
-  clusterBorder: "#707783",
-  titleColor: "#f0f2f5",
-  edgeLabelBackground: "#171a1f",
-  fontFamily: "system-ui, sans-serif",
-};
-
-function initializeMermaid(themeSource?: Element): void {
-  const theme = readThemeValues(themeSource);
-  mermaid.initialize({
-    startOnLoad: false,
-    securityLevel: "strict",
-    suppressErrorRendering: true,
-    theme: "base",
-    htmlLabels: false,
-    flowchart: { htmlLabels: false, curve: "linear" },
-    sequence: { useMaxWidth: true },
-    themeVariables: {
-      ...MERMAID_THEME_DEFAULT,
-      primaryColor: theme["--panel-soft"] ?? MERMAID_THEME_DEFAULT.primaryColor,
-      primaryTextColor: theme["--text"] ?? MERMAID_THEME_DEFAULT.primaryTextColor,
-      primaryBorderColor: theme["--line"] ?? MERMAID_THEME_DEFAULT.primaryBorderColor,
-      lineColor: theme["--muted"] ?? MERMAID_THEME_DEFAULT.lineColor,
-      secondaryColor: theme["--panel-soft"] ?? MERMAID_THEME_DEFAULT.secondaryColor,
-      tertiaryColor: theme["--bg"] ?? MERMAID_THEME_DEFAULT.tertiaryColor,
-      background: theme["--bg"] ?? MERMAID_THEME_DEFAULT.background,
-      mainBkg: theme["--panel-soft"] ?? MERMAID_THEME_DEFAULT.mainBkg,
-      nodeBorder: theme["--line"] ?? MERMAID_THEME_DEFAULT.nodeBorder,
-      clusterBkg: theme["--bg"] ?? MERMAID_THEME_DEFAULT.clusterBkg,
-      clusterBorder: theme["--line"] ?? MERMAID_THEME_DEFAULT.clusterBorder,
-      titleColor: theme["--text"] ?? MERMAID_THEME_DEFAULT.titleColor,
-      edgeLabelBackground: theme["--bg"] ?? MERMAID_THEME_DEFAULT.edgeLabelBackground,
-    },
-  });
-}
 
 const SVG_TAGS: Record<string, true> = {
   svg: true, g: true, path: true, rect: true, circle: true, ellipse: true, line: true,
@@ -416,9 +362,14 @@ async function renderMermaid(parent: HTMLElement, source: string): Promise<void>
   placeholder.textContent = "Rendering diagram…";
   content.append(placeholder);
   try {
-    initializeMermaid(parent.closest(".part-text") ?? parent);
-    const rendered = await mermaid.render(`omp-mobile-mermaid-${++mermaidSerial}`, source);
-    if (!appendSvgInto(content, rendered.svg, "Mermaid diagram")) throw new Error("Unsafe Mermaid SVG output");
+    // A fixed-specifier dynamic import keeps this engine out of the initial client chunk.
+    const { renderMermaidSvg } = await import("./rich-mermaid");
+    const rendered = await renderMermaidSvg(
+      `omp-mobile-mermaid-${++mermaidSerial}`,
+      source,
+      readThemeValues(parent.closest(".part-text") ?? parent),
+    );
+    if (!appendSvgInto(content, rendered, "Mermaid diagram")) throw new Error("Unsafe Mermaid SVG output");
   } catch {
     content.replaceChildren();
     const fallback = document.createElement("pre");
@@ -442,43 +393,18 @@ function appendSvgInto(parent: HTMLElement, markup: string, alt: string): boolea
   return true;
 }
 
-let katexStylesInstalled = false;
-
-function ensureKatexStyles(): void {
-  if (katexStylesInstalled || document.querySelector("style[data-omp-katex]")) {
-    katexStylesInstalled = true;
-    return;
-  }
-  const style = document.createElement("style");
-  style.dataset.ompKatex = "true";
-  style.textContent = katexCssText.replace(
-    /url\(\s*(["']?)fonts\/([A-Za-z0-9_.-]+\.(?:woff2?|ttf))\1\s*\)/g,
-    'url("/vendor/katex/fonts/$2")',
-  );
-  (document.head ?? document.documentElement).append(style);
-  katexStylesInstalled = true;
-}
-
-function appendMath(parent: HTMLElement, source: string, display: boolean): boolean {
-  if (!source.trim() || source.length > MAX_MATH_LENGTH) return false;
+function appendMath(parent: HTMLElement, source: string, display: boolean, original: string): HTMLElement | null {
+  if (!source.trim() || source.length > MAX_MATH_LENGTH) return null;
   const wrapper = document.createElement(display ? "div" : "span");
   wrapper.className = display ? "rich-math rich-math-display" : "rich-math";
-  try {
-    katex.render(source, wrapper, {
-      displayMode: display,
-      output: "htmlAndMathml",
-      throwOnError: true,
-      strict: "warn",
-      trust: false,
-      maxExpand: 1_000,
-      maxSize: 20,
-    });
-  } catch {
-    return false;
-  }
-  ensureKatexStyles();
   parent.append(wrapper);
-  return true;
+  // A fixed-specifier dynamic import keeps KaTeX and its stylesheet out of the initial client chunk.
+  void import("./rich-katex")
+    .then(({ renderKatex }) => {
+      if (!renderKatex(wrapper, source, display)) wrapper.replaceWith(document.createTextNode(original));
+    })
+    .catch(() => wrapper.replaceWith(document.createTextNode(original)));
+  return wrapper;
 }
 
 function parseImageAt(text: string, index: number): { end: number; alt: string; source: string } | null {
@@ -551,7 +477,7 @@ function appendInlineRich(parent: HTMLElement, text: string, appendPlain: Append
       const close = text.indexOf("\\)", index + 2);
       if (close >= 0 && !text.slice(index + 2, close).includes("\n")) {
         const holder = document.createElement("div");
-        if (appendMath(holder, text.slice(index + 2, close), false) && holder.firstChild) {
+        if (appendMath(holder, text.slice(index + 2, close), false, text.slice(index, close + 2)) && holder.firstChild) {
           replaceRange(index, close + 2, holder.firstChild);
         }
         index = close + 2;
@@ -562,7 +488,7 @@ function appendInlineRich(parent: HTMLElement, text: string, appendPlain: Append
       const close = findMathEnd(text, index, "$$");
       if (close >= 0) {
         const holder = document.createElement("div");
-        if (appendMath(holder, text.slice(index + 2, close), true) && holder.firstChild) {
+        if (appendMath(holder, text.slice(index + 2, close), true, text.slice(index, close + 2)) && holder.firstChild) {
           replaceRange(index, close + 2, holder.firstChild);
         }
         index = close + 2;
@@ -573,7 +499,7 @@ function appendInlineRich(parent: HTMLElement, text: string, appendPlain: Append
       const close = findMathEnd(text, index, "$");
       if (close >= 0 && /[\p{L}\\_^{}=<>+*/]/u.test(text.slice(index + 1, close))) {
         const holder = document.createElement("div");
-        if (appendMath(holder, text.slice(index + 1, close), false) && holder.firstChild) {
+        if (appendMath(holder, text.slice(index + 1, close), false, text.slice(index, close + 1)) && holder.firstChild) {
           replaceRange(index, close + 1, holder.firstChild);
         }
         index = close + 1;
@@ -632,7 +558,7 @@ function parseTable(line: string, delimiter: string): { headers: string[]; rows:
   return { headers, rows: [] };
 }
 
-function appendChart(parent: HTMLElement, table: { headers: string[]; rows: string[][] }, markdown: string): void {
+async function appendChart(parent: HTMLElement, table: { headers: string[]; rows: string[][] }, markdown: string): Promise<void> {
   if (
     table.headers.length < 2 ||
     table.headers.length > MAX_CHART_COLUMNS ||
@@ -643,16 +569,21 @@ function appendChart(parent: HTMLElement, table: { headers: string[]; rows: stri
   const textLength = table.headers.reduce((length, cell) => length + cell.length, 0) +
     table.rows.reduce((length, row) => length + row.reduce((rowLength, cell) => rowLength + cell.length, 0), 0);
   if (textLength > MAX_CHART_TEXT) return;
+  const { figure, content } = createSourceFigure(parent, "rich-chart-wrap", markdown);
+  figure.hidden = true;
   try {
-    const analysis = analyzeTable(table.headers, table.rows);
-    const plan = planChart(analysis);
-    if (!plan) return;
-    const spec = buildChart(analysis, plan);
-    if (!spec || !worthCharting(spec)) return;
+    // A fixed-specifier dynamic import keeps charting out of the initial client chunk.
+    const { renderTableChartSvg } = await import("./rich-chart");
+    const svg = renderTableChartSvg(table.headers, table.rows);
     const alt = `Chart based on table: ${table.headers.join(", ")}`;
-    appendSvg(parent, renderChartSvg(spec), markdown, "rich-chart-wrap", alt);
+    if (!svg || !appendSvgInto(content, svg, alt)) {
+      figure.remove();
+      return;
+    }
+    figure.hidden = false;
   } catch {
     // Complex or malformed tables remain available in their original Markdown form.
+    figure.remove();
   }
 }
 
@@ -676,7 +607,7 @@ function processTable(
   appendInlineRich(parent, markdown, appendPlain, imageBudget);
   parsed.rows = rows;
   const tableWrap = parent.lastElementChild;
-  if (tableWrap?.querySelector("table")) appendChart(parent, parsed, markdown);
+  if (tableWrap?.querySelector("table")) void appendChart(parent, parsed, markdown);
   return end;
 }
 
@@ -702,7 +633,7 @@ function findClosingFence(lines: string[], start: number, fence: string): number
 }
 
 function appendDisplayMath(parent: HTMLElement, source: string, original: string, appendPlain: AppendPlain): void {
-  if (!appendMath(parent, source, true)) appendPlain(parent, original);
+  if (!appendMath(parent, source, true, original)) appendPlain(parent, original);
 }
 
 /**
