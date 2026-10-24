@@ -12,6 +12,7 @@ const domGlobals = {
   DOMParser: browser.DOMParser,
   XMLSerializer: browser.XMLSerializer,
   NodeFilter: browser.NodeFilter,
+  MutationObserver: browser.MutationObserver,
   CSSStyleSheet: browser.CSSStyleSheet,
   getComputedStyle: browser.getComputedStyle.bind(browser),
 };
@@ -23,6 +24,26 @@ const originalGlobals = new Map(
 );
 for (const [name, value] of Object.entries(domGlobals))
   Object.defineProperty(globalThis, name, { configurable: true, value });
+
+// Module evaluation can finish before the lazy import's render continuation.
+// Wait for the actual DOM result, not a host-specific microtask ordering.
+function waitForRichElement(target: HTMLElement, selector: string): Promise<void> {
+  return new Promise((resolve, reject) => {
+    const observer = new MutationObserver(() => check());
+    const timeout = setTimeout(() => {
+      observer.disconnect();
+      reject(new Error(`Rich content did not render ${selector}`));
+    }, 2_000);
+    function check(): void {
+      if (!target.querySelector(selector)) return;
+      observer.disconnect();
+      clearTimeout(timeout);
+      resolve();
+    }
+    observer.observe(target, { childList: true, subtree: true });
+    check();
+  });
+}
 
 const appendPlain = (parent: HTMLElement, text: string): void => {
   const paragraph = document.createElement("p");
@@ -146,6 +167,7 @@ test("inline math uses bundled KaTeX HTML and MathML output", async () => {
   const target = document.createElement("div");
   appendRichContent(target, "The value is $\\frac{a_1}{b_2}$.", appendPlain);
   await import("./rich-katex");
+  await waitForRichElement(target, ".katex math");
   expect(target.querySelector(".katex")).not.toBeNull();
   expect(target.querySelector("math")).not.toBeNull();
   expect(document.querySelector("style[data-omp-katex]")?.textContent).toContain("/vendor/katex/fonts/");
@@ -182,6 +204,7 @@ test("inline math and raster images render inside Markdown table cells", async (
     parent.append(wrapper);
   });
   await Promise.all([import("./rich-katex"), import("./rich-chart")]);
+  await waitForRichElement(target, "td .katex math");
   expect(target.querySelector("td .katex")).not.toBeNull();
   expect(target.querySelector("td img.rich-image-view")?.getAttribute("src")).toBe(`data:image/gif;base64,${gif}`);
 });
@@ -210,6 +233,7 @@ test("numeric Markdown tables retain their table and get a safe chart figure", a
     parent.append(block);
   });
   await import("./rich-chart");
+  await waitForRichElement(target, ".rich-chart-wrap .rich-svg-view");
   const chart = target.querySelector<HTMLImageElement>(".rich-chart-wrap .rich-svg-view");
   expect(chart).not.toBeNull();
   expect(chart?.alt).toContain("Segment");
