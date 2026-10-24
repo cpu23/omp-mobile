@@ -20,11 +20,17 @@ try {
     await page.setContent('<div id="prompt" contenteditable="true">/m</div>');
     await page.locator("#prompt").focus();
     await page.keyboard.press("End");
-    const code = `const drafts = new Map(); let activeId = 'test', dismissedCommandDraft, dismissedMoveDraft, commandSelection;
+    const code = `const drafts = new Map(), draftStore = new Map(), slots = [];
+      let activeId = 'test', dismissedCommandDraft, dismissedMoveDraft, commandSelection;
       const requiredElement = () => document.querySelector('#prompt');
       const resizePrompt = () => {}, renderCommandMenu = () => {}, closeModal = () => {};
+      ${extract("storeDraft")}
       ${extract("focusPromptEnd")}
-      ${extract(name)}; ${name}(${JSON.stringify(argument)});`;
+      ${extract(name)}; ${name}(${JSON.stringify(argument)});
+      if (drafts.get(activeId) !== ${JSON.stringify(expected)} ||
+          draftStore.get('runtime:' + activeId) !== ${JSON.stringify(expected)}) {
+        throw new Error('Completion did not store its draft');
+      }`;
     await page.evaluate(code);
     await page.keyboard.type("X");
     const actual = await page.locator("#prompt").innerText();

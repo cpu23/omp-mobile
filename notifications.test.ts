@@ -1,5 +1,5 @@
 import { expect, test } from "bun:test";
-import { chmod, mkdir, mkdtemp, readFile, rename, rm, stat, writeFile } from "node:fs/promises";
+import { chmod, mkdir, mkdtemp, open, readFile, rename, rm, stat, writeFile } from "node:fs/promises";
 import { createServer } from "node:net";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
@@ -46,16 +46,24 @@ test("completion notifications survive transcripts larger than the IPC response 
       { identity: "finished-1", title: "Long conversation", completedAt: 2 },
       { identity: "finished-2", title: "Long conversation", completedAt: 3 },
     ]);
-    const beforeAck = await stat(join(root, "notifications.json"));
-    const ack = service.ack(slot, ["finished-1", "finished-2"]);
-    completion = { identity: "finished-3", completedAt: 4 };
-    await Promise.all([ack, service.pollOnce()]);
-    expect((await service.status(slot)).slots[0]?.unread).toEqual([
-      { identity: "finished-3", title: "Long conversation", completedAt: 4 },
-    ]);
-    expect((await stat(join(root, "notifications.json"))).ino).not.toBe(
-      beforeAck.ino,
-    );
+    // Keep the old inode allocated across both atomic writes. Otherwise the
+    // filesystem can reuse it for the second replacement, even when both rename.
+    const beforeAckFile = await open(join(root, "notifications.json"), "r");
+    try {
+      const beforeAck = await beforeAckFile.stat();
+      const beforeAckContent = await readFile(join(root, "notifications.json"), "utf8");
+      const ack = service.ack(slot, ["finished-1", "finished-2"]);
+      completion = { identity: "finished-3", completedAt: 4 };
+      await Promise.all([ack, service.pollOnce()]);
+      expect((await service.status(slot)).slots[0]?.unread).toEqual([
+        { identity: "finished-3", title: "Long conversation", completedAt: 4 },
+      ]);
+      expect((await stat(join(root, "notifications.json"))).ino).not.toBe(beforeAck.ino);
+      // Atomic replacement must not modify readers of the previous ledger.
+      expect(await beforeAckFile.readFile("utf8")).toBe(beforeAckContent);
+    } finally {
+      await beforeAckFile.close();
+    }
     const beforeNoop = await stat(join(root, "notifications.json"));
     await service.ack(slot, []);
     await service.ack(slot, ["not-present"]);
