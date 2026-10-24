@@ -16,7 +16,6 @@
   },
   "dependencies": {
     "@oh-my-pi/pi-tui": "18.12.1",
-    "@xterm/headless": "^6.0.0",
     "katex": "^0.16.22",
     "mermaid": "^11.12.0",
     "web-push": "^3.6.7"

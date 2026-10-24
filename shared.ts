@@ -85,14 +85,29 @@ export type CompletionMarker = {
   completedAt: number;
 };
 
+export type ExtensionStatus = {
+  generation: string;
+  accent: string | null;
+  agentActive: boolean;
+  cwd: string;
+  title?: string;
+  summary?: string;
+  completion?: CompletionMarker;
+  pendingAction?: {
+    id: string;
+    kind: "approval" | "ask" | "plan" | "dialog";
+    title: string;
+  };
+};
+
 /**
  * Live activity projected from the host's public extension surface: the
  * descriptive tool-call intent that drives OMP's "Working…" loader, the
  * session todo list, detached/blocking subagents, and async background jobs.
  *
  * Everything here is scoped to one runtime and one generation. The extension
- * rebuilds it from the current session branch and agent registry on each
- * request, so switching sessions can never show another runtime's activity.
+ * projects it from the current session branch and agent registry, sharing only
+ * a short bounded snapshot window, so switching sessions cannot leak activity.
  */
 export type ActivityTodoStatus =
   | "pending"

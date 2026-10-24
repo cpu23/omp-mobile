@@ -52,6 +52,12 @@ local; share only the Mobile gateway over HTTPS.
 
 ### Unreleased
 
+- Ship minified, gzip-compressed, cache-validated assets and WOFF2 fonts; load math, Mermaid and chart engines on demand.
+- Use compact conditional status/notification reads, bounded hydration batches and byte-budgeted client caches instead of repeated full transfers.
+- Keep long question cards touch-scrollable in portrait, landscape and reduced-height viewports without losing answers during polling.
+- Preserve unsent text drafts across reloads and session reconnects; keep latest-message pinning and older-history scroll anchors stable.
+- Reuse unchanged transcript/sidebar nodes and pause background polling while hidden.
+- Read terminal viewports from the paired Desktop daemon instead of running another terminal mirror; preserve notification credentials and pending delivery work across storage failures.
 - Keep Desktop and Mobile session indicators working across automatic continuations and background-job waits;
   publish completion only when the agent settles without pending continuation work.
 - Render rule/system-violation notices, provider failures, retry/fallback/compaction state, goals, custom messages,

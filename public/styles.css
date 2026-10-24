@@ -1,6 +1,6 @@
 @font-face {
   font-family: "OMP DejaVu Mono";
-  src: url("/fonts/DejaVuSansMono.ttf") format("truetype");
+  src: url("/fonts/DejaVuSansMono.woff2") format("woff2");
   font-display: swap;
 }
 
@@ -650,7 +650,7 @@ textarea:focus-visible {
   overscroll-behavior: contain;
   touch-action: pan-y pinch-zoom;
   padding: 4px clamp(16px, 4vw, 42px) calc(var(--composer-height, 150px) + 24px);
-  scroll-behavior: smooth;
+  scroll-behavior: auto;
   font-family: var(--mono);
 }
 
@@ -2815,6 +2815,7 @@ pre,
   display: none;
 }
 
+
 .runtime-card,
 .part-execution,
 .part-files,
@@ -3087,6 +3088,21 @@ pre,
   min-width: 0;
   max-width: min(100%, 380px);
   margin: 8px 0;
+}
+
+.part-image.is-loading {
+  align-content: center;
+  width: min(100%, 360px);
+  min-height: 180px;
+  padding: 12px;
+  border: 1px solid var(--line);
+  border-radius: 9px;
+  background: var(--panel-soft);
+}
+
+.part-image-loading-indicator {
+  color: var(--muted);
+  font-size: 12px;
 }
 
 .part-image-open,
@@ -3470,10 +3486,24 @@ pre,
   font: 11px/1.5 var(--mono);
 }
 
+.runtime-area.has-scrollable-ask {
+  flex: 0 1 auto;
+  min-height: 0;
+  max-height: min(
+    60dvh,
+    calc(100% - var(--composer-height, 150px) - env(safe-area-inset-bottom) - 32px)
+  );
+  overflow-y: auto;
+  -webkit-overflow-scrolling: touch;
+  overscroll-behavior: contain;
+  touch-action: pan-y pinch-zoom;
+}
+
 @media (max-width: 720px) {
   .runtime-area {
     padding: 8px 10px 2px;
   }
+
 
   .runtime-card,
   .part-execution,

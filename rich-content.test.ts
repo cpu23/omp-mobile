@@ -3,6 +3,9 @@ import { Window } from "happy-dom";
 import { appendRichContent, sanitizeSvgMarkup } from "./rich-content";
 
 const browser = new Window();
+browser.document.write("<!doctype html><html><head></head><body></body></html>");
+// happy-dom lacks compatMode; the shipped HTML uses a standards doctype.
+Object.defineProperty(browser.document, "compatMode", { value: "CSS1Compat" });
 const domGlobals = {
   window: browser,
   document: browser.document,
@@ -139,14 +142,15 @@ test("Markdown images render raster-only URLs and reject SVG or script schemes",
   expect(target.textContent).toContain("![script]");
 });
 
-test("inline math uses bundled KaTeX HTML and MathML output", () => {
+test("inline math uses bundled KaTeX HTML and MathML output", async () => {
   const target = document.createElement("div");
   appendRichContent(target, "The value is $\\frac{a_1}{b_2}$.", appendPlain);
+  await import("./rich-katex");
   expect(target.querySelector(".katex")).not.toBeNull();
   expect(target.querySelector("math")).not.toBeNull();
   expect(document.querySelector("style[data-omp-katex]")?.textContent).toContain("/vendor/katex/fonts/");
 });
-test("inline math and raster images render inside Markdown table cells", () => {
+test("inline math and raster images render inside Markdown table cells", async () => {
   const target = document.createElement("div");
   const gif = "R0lGODlhAQABAAD/ACwAAAAAAQABAAACADs=";
   const markdown = [
@@ -177,6 +181,7 @@ test("inline math and raster images render inside Markdown table cells", () => {
     wrapper.append(table);
     parent.append(wrapper);
   });
+  await Promise.all([import("./rich-katex"), import("./rich-chart")]);
   expect(target.querySelector("td .katex")).not.toBeNull();
   expect(target.querySelector("td img.rich-image-view")?.getAttribute("src")).toBe(`data:image/gif;base64,${gif}`);
 });
@@ -188,7 +193,7 @@ test("single-dollar currency ranges remain literal text", () => {
   expect(target.textContent).toBe(prices);
   expect(target.querySelector(".katex")).toBeNull();
 });
-test("numeric Markdown tables retain their table and get a safe chart figure", () => {
+test("numeric Markdown tables retain their table and get a safe chart figure", async () => {
   const target = document.createElement("div");
   const markdown = [
     "| Segment | Requests |",
@@ -198,12 +203,13 @@ test("numeric Markdown tables retain their table and get a safe chart figure", (
     "| Gamma | 3 |",
     "| Delta | 4 |",
   ].join("\n");
-  appendRichContent(target, markdown, (parent, text) => {
+  appendRichContent(target, `${markdown}\n\nAfter chart`, (parent, text) => {
     const block = document.createElement("div");
     if (text === markdown) block.append(document.createElement("table"));
     else block.textContent = text;
     parent.append(block);
   });
+  await import("./rich-chart");
   const chart = target.querySelector<HTMLImageElement>(".rich-chart-wrap .rich-svg-view");
   expect(chart).not.toBeNull();
   expect(chart?.alt).toContain("Segment");
@@ -217,4 +223,5 @@ test("numeric Markdown tables retain their table and get a safe chart figure", (
   expect(target.querySelector(".rich-source")?.textContent).toBe(markdown);
   expect(target.querySelector(".rich-source-toggle")).not.toBeNull();
   expect(target.querySelector("table")).not.toBeNull();
+  expect(chart?.closest(".rich-chart-wrap")?.nextElementSibling?.textContent).toContain("After chart");
 });

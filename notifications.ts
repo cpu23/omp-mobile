@@ -32,7 +32,8 @@ export type ActionNeededNotice = {
 };
 export type NotificationSlotStatus = {
   slot: NotificationSlot;
-  unread: CompletionNotice[];
+  unreadCount: number;
+  unread?: CompletionNotice[];
   latest?: CompletionNotice;
   actionNeeded?: ActionNeededNotice & { unread: boolean };
 };
@@ -49,11 +50,13 @@ type StoredSlot = {
   seen: string[];
   seenActions: string[];
   acknowledgedActions: string[];
+  seenAt?: Record<string, number>;
+  seenActionsAt?: Record<string, number>;
   unread: CompletionNotice[];
   actionNeeded?: ActionNeededNotice;
 };
 type StoredState = {
-  version: 1;
+  version: 1 | 2;
   subscriptions: PushSubscriptionInput[];
   slots: Record<string, StoredSlot>;
 };
@@ -87,16 +90,22 @@ export type NotificationService = {
   stop(): void;
   pollOnce(): Promise<void>;
   getPublicKey(): string | undefined;
-  status(): Promise<NotificationStatus>;
+  status(activeSlot?: NotificationSlot): Promise<NotificationStatus>;
   subscribe(subscription: PushSubscriptionInput): Promise<void>;
   unsubscribe(endpoint: string): Promise<void>;
-  ack(slot: NotificationSlot, identity: string): Promise<void>;
+  ack(slot: NotificationSlot, identities: readonly string[]): Promise<void>;
 };
 
 const MAX_ENDPOINT = 2048;
 const MAX_IDENTITY = 512;
 const MAX_TITLE = 200;
 const MAX_UNREAD = 128;
+const MAX_ACK_IDENTITIES = 256;
+const MAX_LEDGER_BYTES = 2 * 1024 * 1024;
+const MAX_LEGACY_STATE_BYTES = 32 * 1024 * 1024;
+const MAX_SUBSCRIPTION_BYTES = 1024 * 1024;
+const MAX_HISTORY_AGE_MS = 90 * 24 * 60 * 60 * 1000;
+const MAX_CONCURRENT_SLOT_POLLS = 8;
 const MAX_SEEN = 256;
 const MAX_TRACKED_SLOTS = 128;
 const DEFAULT_STATE_FILE = join(
@@ -116,7 +125,7 @@ function blankSlot(): StoredSlot {
 }
 function blankState(): StoredState {
   return {
-    version: 1,
+    version: 2,
     subscriptions: [],
     slots: {},
   };
@@ -148,27 +157,39 @@ function validVapidKeyPair(value: unknown): value is StoredVapidKeys {
 async function loadVapidKeys(
   path: string,
 ): Promise<StoredVapidKeys | undefined> {
+  let stat;
   try {
-    const stat = await fs.lstat(path);
-    if (!stat.isFile() || (stat.mode & 0o077) !== 0 || stat.size > 4096)
-      return undefined;
-    const value = JSON.parse(await fs.readFile(path, "utf8")) as unknown;
-    return validVapidKeyPair(value) ? value : undefined;
-  } catch {
-    return undefined;
+    stat = await fs.lstat(path);
+  } catch (error) {
+    if ((error as NodeJS.ErrnoException).code === "ENOENT") return undefined;
+    throw error;
   }
+  if (
+    !stat.isFile() ||
+    (stat.mode & 0o077) !== 0 ||
+    (stat.mode & 0o400) === 0 ||
+    stat.size > 4096
+  )
+    throw new Error("stored VAPID keys are unreadable or oversized");
+  const value = JSON.parse(await fs.readFile(path, "utf8")) as unknown;
+  if (!validVapidKeyPair(value))
+    throw new Error("stored VAPID keys are corrupt");
+  return value;
 }
-
+async function atomicWrite(path: string, content: string): Promise<void> {
+  await fs.mkdir(dirname(path), { recursive: true, mode: 0o700 });
+  const temporary = `${path}.${process.pid}.tmp`;
+  await fs.writeFile(temporary, content, { mode: 0o600 });
+  await fs.chmod(temporary, 0o600);
+  await fs.rename(temporary, path);
+}
 async function saveVapidKeys(
   path: string,
   keys: StoredVapidKeys,
 ): Promise<void> {
-  await fs.mkdir(dirname(path), { recursive: true, mode: 0o700 });
-  const temporary = `${path}.${process.pid}.tmp`;
-  await fs.writeFile(temporary, `${JSON.stringify(keys)}\n`, { mode: 0o600 });
-  await fs.chmod(temporary, 0o600);
-  await fs.rename(temporary, path);
+  await atomicWrite(path, `${JSON.stringify(keys)}\n`);
 }
+
 function validBase64Url(value: unknown): value is string {
   return (
     typeof value === "string" &&
@@ -345,113 +366,314 @@ function socketStatus(
   });
 }
 
-async function loadState(path: string): Promise<StoredState> {
+type LoadedState = {
+  state: StoredState;
+  legacy: boolean;
+  oversized: boolean;
+};
+
+async function loadState(path: string): Promise<LoadedState> {
+  let stat;
   try {
-    const stat = await fs.stat(path);
-    if (
-      !stat.isFile() ||
-      (stat.mode & 0o077) !== 0 ||
-      stat.size > 2 * 1024 * 1024
-    )
-      return blankState();
-    const value = JSON.parse(
-      await fs.readFile(path, "utf8"),
-    ) as Partial<StoredState>;
-    const result = blankState();
-    if (value.version !== 1 || !Array.isArray(value.subscriptions))
-      return result;
-    result.subscriptions = value.subscriptions
-      .filter(
-        (item) =>
-          item &&
-          typeof item.endpoint === "string" &&
-          item.keys &&
-          typeof item.keys === "object",
-      )
-      .slice(0, 64) as PushSubscriptionInput[];
-    for (const slot of Object.keys(value.slots ?? {}).slice(0, MAX_TRACKED_SLOTS)) {
-      if (!isSlotId(slot)) continue;
-      const stored = value.slots?.[slot] as Partial<StoredSlot> | undefined;
-      if (!stored || typeof stored !== "object") continue;
-      const pending = stored.actionNeeded;
-      let actionNeeded: ActionNeededNotice | undefined;
-      if (pending && typeof pending === "object") {
-        const candidate = pending as Record<string, unknown>;
-        if (
-          typeof candidate.identity === "string" &&
-          candidate.identity.length > 0 &&
-          candidate.identity.length <= MAX_IDENTITY &&
-          (candidate.kind === "approval" ||
-            candidate.kind === "ask" ||
-            candidate.kind === "plan" ||
-            candidate.kind === "dialog") &&
-          typeof candidate.title === "string" &&
-          candidate.title.length > 0 &&
-          candidate.title.length <= MAX_TITLE &&
-          typeof candidate.actionTitle === "string" &&
-          candidate.actionTitle.length > 0 &&
-          candidate.actionTitle.length <= MAX_TITLE &&
-          typeof candidate.createdAt === "number" &&
-          Number.isFinite(candidate.createdAt)
-        ) {
-          actionNeeded = {
-            identity: candidate.identity,
-            kind: candidate.kind,
-            title: candidate.title,
-            actionTitle: candidate.actionTitle,
-            createdAt: candidate.createdAt,
-          };
-        }
-      }
-      const acknowledgedActions = Array.isArray(stored.acknowledgedActions)
-        ? stored.acknowledgedActions
-            .filter(
-              (item) =>
-                typeof item === "string" && item.length <= MAX_IDENTITY,
-            )
-            .slice(-MAX_SEEN)
-        : [];
-      result.slots[slot] = {
-        initialized:
-          typeof stored.initialized === "boolean"
-            ? stored.initialized
-            : typeof stored.lastObserved === "string",
-        lastObserved:
-          typeof stored.lastObserved === "string"
-            ? stored.lastObserved.slice(0, MAX_IDENTITY)
-            : undefined,
-        seen: Array.isArray(stored.seen)
-          ? stored.seen
-              .filter((item) => typeof item === "string")
-              .slice(-MAX_SEEN)
-          : [],
-        seenActions: Array.isArray(stored.seenActions)
-          ? stored.seenActions
-              .filter(
-                (item) =>
-                  typeof item === "string" && item.length <= MAX_IDENTITY,
-              )
-              .slice(-MAX_SEEN)
-          : [],
-        acknowledgedActions: acknowledgedActions.slice(-MAX_SEEN),
-        unread: Array.isArray(stored.unread)
-          ? (stored.unread
-              .filter(
-                (item) =>
-                  item &&
-                  typeof item.identity === "string" &&
-                  typeof item.title === "string" &&
-                  Number.isFinite(item.completedAt),
-              )
-              .slice(-MAX_UNREAD) as CompletionNotice[])
-          : [],
-        ...(actionNeeded ? { actionNeeded } : {}),
+    stat = await fs.lstat(path);
+  } catch (error) {
+    if ((error as NodeJS.ErrnoException).code === "ENOENT")
+      return {
+        state: blankState(),
+        legacy: false,
+        oversized: false,
       };
-    }
-    return result;
-  } catch {
-    return blankState();
+    throw error;
   }
+  if (
+    !stat.isFile() ||
+    (stat.mode & 0o077) !== 0 ||
+    (stat.mode & 0o400) === 0
+  )
+    throw new Error("notification ledger is unreadable");
+  if (stat.size > MAX_LEGACY_STATE_BYTES)
+    throw new Error("notification ledger exceeds the legacy read limit");
+  const value = JSON.parse(await fs.readFile(path, "utf8")) as Partial<StoredState>;
+  if (
+    (value.version !== 1 && value.version !== 2) ||
+    !Array.isArray(value.subscriptions) ||
+    !value.slots ||
+    typeof value.slots !== "object" ||
+    Array.isArray(value.slots)
+  )
+    throw new Error("notification ledger is corrupt");
+  const result = blankState();
+  result.subscriptions = value.subscriptions
+    .filter(
+      (item) =>
+        item &&
+        typeof item.endpoint === "string" &&
+        item.keys &&
+        typeof item.keys === "object",
+    )
+    .slice(0, 64) as PushSubscriptionInput[];
+  const now = Date.now();
+  const loadIdentities = (items: unknown): string[] =>
+    Array.isArray(items)
+      ? items
+          .filter(
+            (item) => typeof item === "string" && item.length > 0 && item.length <= MAX_IDENTITY,
+          )
+          .slice(-MAX_SEEN)
+      : [];
+  const loadTimes = (
+    value: unknown,
+    identities: string[],
+  ): Record<string, number> => {
+    const source =
+      value && typeof value === "object" && !Array.isArray(value)
+        ? (value as Record<string, unknown>)
+        : {};
+    return Object.fromEntries(
+      identities.map((identity) => [
+        identity,
+        typeof source[identity] === "number" && Number.isFinite(source[identity])
+          ? source[identity]
+          : now,
+      ]),
+    );
+  };
+  for (const slot of Object.keys(value.slots)) {
+    if (!isSlotId(slot)) continue;
+    const stored = value.slots[slot] as Partial<StoredSlot> | undefined;
+    if (!stored || typeof stored !== "object") continue;
+    const pending = stored.actionNeeded;
+    let actionNeeded: ActionNeededNotice | undefined;
+    if (pending && typeof pending === "object") {
+      const candidate = pending as Record<string, unknown>;
+      if (
+        typeof candidate.identity === "string" &&
+        candidate.identity.length > 0 &&
+        candidate.identity.length <= MAX_IDENTITY &&
+        (candidate.kind === "approval" ||
+          candidate.kind === "ask" ||
+          candidate.kind === "plan" ||
+          candidate.kind === "dialog") &&
+        typeof candidate.title === "string" &&
+        candidate.title.length > 0 &&
+        candidate.title.length <= MAX_TITLE &&
+        typeof candidate.actionTitle === "string" &&
+        candidate.actionTitle.length > 0 &&
+        candidate.actionTitle.length <= MAX_TITLE &&
+        typeof candidate.createdAt === "number" &&
+        Number.isFinite(candidate.createdAt)
+      ) {
+        actionNeeded = {
+          identity: candidate.identity,
+          kind: candidate.kind,
+          title: candidate.title,
+          actionTitle: candidate.actionTitle,
+          createdAt: candidate.createdAt,
+        };
+      }
+    }
+    const seen = loadIdentities(stored.seen);
+    const seenActions = loadIdentities(stored.seenActions);
+    const acknowledgedActions = loadIdentities(stored.acknowledgedActions);
+    const unread = Array.isArray(stored.unread)
+      ? stored.unread
+          .filter(
+            (item) =>
+              item &&
+              typeof item.identity === "string" &&
+              item.identity.length > 0 &&
+              item.identity.length <= MAX_IDENTITY &&
+              typeof item.title === "string" &&
+              item.title.length > 0 &&
+              item.title.length <= MAX_TITLE &&
+              Number.isFinite(item.completedAt),
+          )
+          .slice(-MAX_UNREAD) as CompletionNotice[]
+      : [];
+    result.slots[slot] = {
+      initialized:
+        typeof stored.initialized === "boolean"
+          ? stored.initialized
+          : typeof stored.lastObserved === "string",
+      lastObserved:
+        typeof stored.lastObserved === "string"
+          ? stored.lastObserved.slice(0, MAX_IDENTITY)
+          : undefined,
+      seen,
+      seenActions,
+      acknowledgedActions,
+      seenAt: loadTimes(stored.seenAt, seen),
+      seenActionsAt: loadTimes(stored.seenActionsAt, seenActions),
+      unread,
+      ...(actionNeeded ? { actionNeeded } : {}),
+    };
+  }
+  return {
+    state: result,
+    legacy: value.version === 1,
+    oversized: stat.size > MAX_LEDGER_BYTES,
+  };
+}
+
+async function loadSubscriptions(
+  path: string,
+): Promise<PushSubscriptionInput[] | undefined> {
+  let stat;
+  try {
+    stat = await fs.lstat(path);
+  } catch (error) {
+    if ((error as NodeJS.ErrnoException).code === "ENOENT") return undefined;
+    throw error;
+  }
+  if (
+    !stat.isFile() ||
+    (stat.mode & 0o077) !== 0 ||
+    (stat.mode & 0o400) === 0 ||
+    stat.size > MAX_SUBSCRIPTION_BYTES
+  )
+    throw new Error("push subscription store is unreadable or oversized");
+  const value = JSON.parse(await fs.readFile(path, "utf8")) as {
+    version?: unknown;
+    subscriptions?: unknown;
+  };
+  if (value.version !== 1 || !Array.isArray(value.subscriptions))
+    throw new Error("push subscription store is corrupt");
+  return value.subscriptions
+    .filter(
+      (item) =>
+        item &&
+        typeof item.endpoint === "string" &&
+        item.keys &&
+        typeof item.keys === "object",
+    )
+    .slice(0, 64) as PushSubscriptionInput[];
+}
+
+function pruneHistory(state: StoredState, now: number): boolean {
+  const cutoff = now - MAX_HISTORY_AGE_MS;
+  let changed = false;
+  for (const entry of Object.values(state.slots)) {
+    const unreadIds = new Set(entry.unread.map((item) => item.identity));
+    const keepSeen = new Set([
+      ...unreadIds,
+      ...(entry.lastObserved ? [entry.lastObserved] : []),
+    ]);
+    const seen = entry.seen.filter(
+      (identity) =>
+        keepSeen.has(identity) ||
+        (entry.seenAt?.[identity] ?? now) >= cutoff,
+    );
+    const seenActions = entry.seenActions.filter(
+      (identity) =>
+        identity === entry.actionNeeded?.identity ||
+        (entry.seenActionsAt?.[identity] ?? now) >= cutoff,
+    );
+    const actionSet = new Set(seenActions);
+    const acknowledgedActions = entry.acknowledgedActions.filter((identity) =>
+      identity === entry.actionNeeded?.identity
+        ? actionSet.has(identity)
+        : (entry.seenActionsAt?.[identity] ?? now) >= cutoff,
+    );
+    const seenChanged = seen.length !== entry.seen.length;
+    const seenActionsChanged = seenActions.length !== entry.seenActions.length;
+    const acknowledgedActionsChanged =
+      acknowledgedActions.length !== entry.acknowledgedActions.length;
+    if (seenChanged) {
+      entry.seen = seen;
+      entry.seenAt = Object.fromEntries(
+        seen.map((identity) => [identity, entry.seenAt?.[identity] ?? now]),
+      );
+    }
+    if (seenActionsChanged) {
+      entry.seenActions = seenActions;
+      entry.seenActionsAt = Object.fromEntries(
+        seenActions.map((identity) => [
+          identity,
+          entry.seenActionsAt?.[identity] ?? now,
+        ]),
+      );
+    }
+    if (acknowledgedActionsChanged)
+      entry.acknowledgedActions = acknowledgedActions;
+    if (seenChanged || seenActionsChanged || acknowledgedActionsChanged)
+      changed = true;
+  }
+  return changed;
+}
+
+class NotificationLedgerCapacityError extends Error {
+  constructor() {
+    super(
+      `notification ledger exceeds ${MAX_LEDGER_BYTES} bytes with unacknowledged notices retained`,
+    );
+    this.name = "NotificationLedgerCapacityError";
+  }
+}
+
+function serializeBoundedLedger(state: StoredState): string {
+  pruneHistory(state, Date.now());
+  const ledger = () =>
+    JSON.stringify({ version: 2, subscriptions: [], slots: state.slots });
+  let snapshot = ledger();
+  if (Buffer.byteLength(snapshot) + 1 <= MAX_LEDGER_BYTES) return snapshot;
+
+  // Drop old duplicate-suppression identities first; unread notices and the
+  // currently pending action are never candidates for pruning.
+  const candidates: Array<{
+    entry: StoredSlot;
+    field: "seen" | "seenActions";
+    identity: string;
+    at: number;
+  }> = [];
+  for (const entry of Object.values(state.slots)) {
+    const unreadIds = new Set(entry.unread.map((item) => item.identity));
+    for (const identity of entry.seen) {
+      if (unreadIds.has(identity) || identity === entry.lastObserved) continue;
+      candidates.push({
+        entry,
+        field: "seen",
+        identity,
+        at: entry.seenAt?.[identity] ?? 0,
+      });
+    }
+    for (const identity of entry.seenActions) {
+      if (identity === entry.actionNeeded?.identity) continue;
+      candidates.push({
+        entry,
+        field: "seenActions",
+        identity,
+        at: entry.seenActionsAt?.[identity] ?? 0,
+      });
+    }
+  }
+  candidates.sort((left, right) => left.at - right.at);
+  let removedSinceCheck = 0;
+  for (const candidate of candidates) {
+    const list = candidate.entry[candidate.field];
+    const index = list.indexOf(candidate.identity);
+    if (index < 0) continue;
+    list.splice(index, 1);
+    if (candidate.field === "seen") {
+      if (candidate.entry.seenAt)
+        delete candidate.entry.seenAt[candidate.identity];
+    } else {
+      if (candidate.entry.seenActionsAt)
+        delete candidate.entry.seenActionsAt[candidate.identity];
+      candidate.entry.acknowledgedActions =
+        candidate.entry.acknowledgedActions.filter(
+          (identity) => identity !== candidate.identity,
+        );
+    }
+    removedSinceCheck += 1;
+    if (removedSinceCheck >= 1024) {
+      snapshot = ledger();
+      if (Buffer.byteLength(snapshot) + 1 <= MAX_LEDGER_BYTES) return snapshot;
+      removedSinceCheck = 0;
+    }
+  }
+  snapshot = ledger();
+  if (Buffer.byteLength(snapshot) + 1 <= MAX_LEDGER_BYTES) return snapshot;
+  throw new NotificationLedgerCapacityError();
 }
 
 export function createNotificationService(
@@ -475,8 +697,12 @@ export function createNotificationService(
     options.vapidSubject ??
     process.env.OMP_MOBILE_VAPID_SUBJECT ??
     "mailto:omp-mobile@localhost";
+  const subscriptionsFile = `${stateFile}.subscriptions`;
   let state = blankState();
   let loaded = false;
+  let subscriptions: PushSubscriptionInput[] = [];
+  let deliverySubscriptions: PushSubscriptionInput[] = [];
+  let loading: Promise<void> | undefined;
   let running = false;
   let timer: ReturnType<typeof setInterval> | undefined;
   let push: WebPush | undefined;
@@ -484,73 +710,141 @@ export function createNotificationService(
   let pollTail: Promise<void> = Promise.resolve();
   let polling = false;
   let saveTail: Promise<void> = Promise.resolve();
+  let subscriptionSaveTail: Promise<void> = Promise.resolve();
   /** Ids from the most recent successful discovery; drives status(). */
   const activeSlots = new Set<string>();
+  let ledgerDirty = false;
+  let ledgerWriteRevision = 0;
+  let subscriptionsDirty = false;
+  let subscriptionWriteRevision = 0;
+  const pendingDeliveries: Array<{
+    slot: string;
+    notice: CompletionNotice | ActionNeededNotice;
+  }> = [];
 
-  const save = () => {
-    const snapshot = JSON.stringify(state);
-    saveTail = saveTail
-      .then(async () => {
-        await fs.mkdir(dirname(stateFile), { recursive: true, mode: 0o700 });
-        const temporary = `${stateFile}.${process.pid}.tmp`;
-        await fs.writeFile(temporary, `${snapshot}\n`, { mode: 0o600 });
-        await fs.chmod(temporary, 0o600);
-        await fs.rename(temporary, stateFile);
-      })
-      .catch(() => undefined);
-    return saveTail;
+  const queueWrite = (
+    path: string,
+    content: string,
+    tail: Promise<void>,
+  ): Promise<void> => {
+    const write = tail.catch(() => undefined).then(() =>
+      atomicWrite(path, content),
+    );
+    if (path === stateFile) saveTail = write;
+    else subscriptionSaveTail = write;
+    return write;
   };
-  const ensureLoaded = async () => {
-    if (loaded) return;
-    state = await loadState(stateFile);
-    const subscriptions: PushSubscriptionInput[] = [];
-    for (const candidate of state.subscriptions) {
-      try {
-        const endpoint = await validatePushEndpoint(candidate.endpoint);
-        subscriptions.push(safeSubscription({ ...candidate, endpoint }));
-      } catch {
-        // Drop malformed or newly-private destinations from the owner-only store.
+  const save = () => {
+    ledgerDirty = true;
+    const revision = ++ledgerWriteRevision;
+    const snapshot = `${serializeBoundedLedger(state)}\n`;
+    return queueWrite(stateFile, snapshot, saveTail).then(() => {
+      if (ledgerWriteRevision === revision) ledgerDirty = false;
+    });
+  };
+  const saveSubscriptions = () => {
+    subscriptionsDirty = true;
+    const revision = ++subscriptionWriteRevision;
+    const snapshot = `${JSON.stringify({ version: 1, subscriptions })}\n`;
+    if (Buffer.byteLength(snapshot) > MAX_SUBSCRIPTION_BYTES)
+      throw new Error("push subscription store exceeds its byte limit");
+    return queueWrite(subscriptionsFile, snapshot, subscriptionSaveTail).then(() => {
+      if (subscriptionWriteRevision === revision) subscriptionsDirty = false;
+    });
+  };
+  const ensureLoaded = () => {
+    if (loaded) return Promise.resolve();
+    if (loading) return loading;
+    loading = (async () => {
+      const stored = await loadState(stateFile);
+      const separateSubscriptions = await loadSubscriptions(subscriptionsFile);
+      state = stored.state;
+      const sourceSubscriptions =
+        separateSubscriptions ?? stored.state.subscriptions;
+      const durableSubscriptions: PushSubscriptionInput[] = [];
+      for (const candidate of sourceSubscriptions) {
+        try {
+          durableSubscriptions.push(safeSubscription(candidate));
+        } catch {
+          // Malformed credentials are not safe to retain or deliver.
+        }
       }
-    }
-    state.subscriptions = subscriptions;
-    loaded = true;
-    await save();
+      subscriptions = durableSubscriptions;
+
+      // Persist credentials before cutting over the legacy combined file. If this
+      // write fails, the original store remains byte-for-byte available for retry.
+      if (
+        !separateSubscriptions &&
+        (stored.legacy || stored.state.subscriptions.length > 0)
+      )
+        await saveSubscriptions();
+      const validSubscriptions: PushSubscriptionInput[] = [];
+      for (const candidate of durableSubscriptions) {
+        try {
+          const endpoint = await validatePushEndpoint(candidate.endpoint);
+          validSubscriptions.push(safeSubscription({ ...candidate, endpoint }));
+        } catch {
+          // Delivery uses only destinations that still pass the network policy.
+        }
+      }
+      deliverySubscriptions = validSubscriptions;
+      if (
+        stored.legacy ||
+        stored.oversized ||
+        stored.state.subscriptions.length > 0
+      ) {
+        try {
+          await save();
+        } catch (error) {
+          console.error(
+            "Notification ledger migration could not be persisted; preserving loaded state",
+            error,
+          );
+        }
+      }
+      loaded = true;
+    })().finally(() => {
+      loading = undefined;
+    });
+    return loading;
   };
   const ensurePush = async () => {
     if (push || pushLoad) return pushLoad;
     pushLoad = (async () => {
+      let imported: Record<string, unknown>;
       try {
-        const imported = await (
+        imported = await (
           new Function("specifier", "return import(specifier)") as (
             specifier: string,
           ) => Promise<Record<string, unknown>>
         )("web-push");
-        const candidate = (imported.default ?? imported) as unknown as WebPush;
-        if (!hasVapidOverride) {
-          const stored = await loadVapidKeys(vapidFile);
-          if (stored) {
-            publicKey = stored.publicKey;
-            privateKey = stored.privateKey;
-          } else {
-            const generated = candidate.generateVAPIDKeys();
-            const keys: StoredVapidKeys = {
-              version: 1,
-              publicKey: generated.publicKey,
-              privateKey: generated.privateKey,
-            };
-            if (!validVapidKeyPair(keys))
-              throw new Error("web-push generated invalid VAPID keys");
-            await saveVapidKeys(vapidFile, keys);
-            publicKey = keys.publicKey;
-            privateKey = keys.privateKey;
-          }
-        }
-        if (!publicKey || !privateKey) return;
-        candidate.setVapidDetails(subject, publicKey, privateKey);
-        push = candidate;
       } catch {
         push = undefined;
+        return;
       }
+      const candidate = (imported.default ?? imported) as unknown as WebPush;
+      if (!hasVapidOverride) {
+        const stored = await loadVapidKeys(vapidFile);
+        if (stored) {
+          publicKey = stored.publicKey;
+          privateKey = stored.privateKey;
+        } else {
+          const generated = candidate.generateVAPIDKeys();
+          const keys: StoredVapidKeys = {
+            version: 1,
+            publicKey: generated.publicKey,
+            privateKey: generated.privateKey,
+          };
+          if (!validVapidKeyPair(keys))
+            throw new Error("web-push generated invalid VAPID keys");
+          await saveVapidKeys(vapidFile, keys);
+          publicKey = keys.publicKey;
+          privateKey = keys.privateKey;
+        }
+      }
+      if (!publicKey || !privateKey) return;
+      candidate.setVapidDetails(subject, publicKey, privateKey);
+      push = candidate;
     })();
     await pushLoad;
     return pushLoad;
@@ -560,7 +854,7 @@ export function createNotificationService(
     notice: CompletionNotice | ActionNeededNotice,
   ) => {
     await ensurePush();
-    if (!push || !state.subscriptions.length) return;
+    if (!push || !deliverySubscriptions.length) return;
     const payload =
       "completedAt" in notice
         ? JSON.stringify({
@@ -581,7 +875,7 @@ export function createNotificationService(
           });
     const expired: string[] = [];
     await Promise.all(
-      state.subscriptions.map(async (subscription) => {
+      deliverySubscriptions.map(async (subscription) => {
         try {
           await push?.sendNotification(subscription, payload, { TTL: 86400 });
         } catch (error) {
@@ -595,10 +889,13 @@ export function createNotificationService(
       }),
     );
     if (expired.length) {
-      state.subscriptions = state.subscriptions.filter(
+      subscriptions = subscriptions.filter(
         (item) => !expired.includes(item.endpoint),
       );
-      await save();
+      deliverySubscriptions = deliverySubscriptions.filter(
+        (item) => !expired.includes(item.endpoint),
+      );
+      subscriptionsDirty = true;
     }
   };
   /**
@@ -655,109 +952,160 @@ export function createNotificationService(
     }
     return changed;
   };
+  const pollSlot = async (
+    slot: string,
+    pendingPushes: Array<{
+      slot: string;
+      notice: CompletionNotice | ActionNeededNotice;
+    }>,
+    recordChanged: () => void,
+  ) => {
+    const raw = await socketStatus(
+      join(options.ipcRoot, `${slot}.sock`),
+      options.token,
+    );
+    if (!raw) return;
+    const entry = (state.slots[slot] ??= blankSlot());
+    const completion =
+      raw.completion && typeof raw.completion === "object"
+        ? (raw.completion as Record<string, unknown>)
+        : undefined;
+    const identity = asString(completion?.identity, MAX_IDENTITY);
+    const title = asString(raw.title, MAX_TITLE) ?? slot;
+    const now = Date.now();
+    let changed = false;
+    let completionNotice: CompletionNotice | undefined;
+    if (!entry.initialized) {
+      entry.initialized = true;
+      changed = true;
+      if (identity) {
+        entry.lastObserved = identity;
+        if (!entry.seen.includes(identity)) {
+          entry.seen.push(identity);
+          (entry.seenAt ??= {})[identity] = now;
+        }
+      }
+    } else if (identity && entry.lastObserved !== identity) {
+      entry.lastObserved = identity;
+      changed = true;
+      if (!entry.seen.includes(identity)) {
+        entry.seen.push(identity);
+        (entry.seenAt ??= {})[identity] = now;
+        if (entry.seen.length > MAX_SEEN) {
+          const removed = entry.seen.splice(0, entry.seen.length - MAX_SEEN);
+          for (const item of removed) delete entry.seenAt[item];
+        }
+        const completedAt =
+          typeof completion?.completedAt === "number" &&
+          Number.isFinite(completion.completedAt)
+            ? completion.completedAt
+            : now;
+        completionNotice = { identity, title, completedAt };
+        entry.unread.push(completionNotice);
+        if (entry.unread.length > MAX_UNREAD)
+          entry.unread = entry.unread.slice(-MAX_UNREAD);
+      }
+    }
+
+    const pending =
+      raw.pendingAction &&
+      typeof raw.pendingAction === "object" &&
+      !Array.isArray(raw.pendingAction)
+        ? (raw.pendingAction as Record<string, unknown>)
+        : undefined;
+    const pendingIdentity = asString(pending?.id, MAX_IDENTITY);
+    const pendingKind = pending?.kind;
+    const pendingTitle = asString(pending?.title, MAX_TITLE);
+    let actionPushNotice: ActionNeededNotice | undefined;
+    if (
+      pendingIdentity &&
+      (pendingKind === "approval" ||
+        pendingKind === "ask" ||
+        pendingKind === "plan" ||
+        pendingKind === "dialog") &&
+      pendingTitle
+    ) {
+      const prior = entry.actionNeeded;
+      const actionNotice: ActionNeededNotice = {
+        identity: pendingIdentity,
+        kind: pendingKind,
+        title,
+        actionTitle: pendingTitle,
+        createdAt:
+          prior?.identity === pendingIdentity ? prior.createdAt : now,
+      };
+      if (prior?.identity !== pendingIdentity) {
+        entry.actionNeeded = actionNotice;
+        if (!entry.seenActions.includes(pendingIdentity)) {
+          entry.seenActions.push(pendingIdentity);
+          (entry.seenActionsAt ??= {})[pendingIdentity] = now;
+          if (entry.seenActions.length > MAX_SEEN) {
+            const removed = entry.seenActions.splice(
+              0,
+              entry.seenActions.length - MAX_SEEN,
+            );
+            for (const item of removed) {
+              delete entry.seenActionsAt[item];
+              entry.acknowledgedActions =
+                entry.acknowledgedActions.filter((identity) => identity !== item);
+            }
+          }
+          actionPushNotice = actionNotice;
+        }
+        changed = true;
+      } else if (
+        prior.title !== actionNotice.title ||
+        prior.actionTitle !== actionNotice.actionTitle ||
+        prior.kind !== actionNotice.kind
+      ) {
+        entry.actionNeeded = actionNotice;
+        changed = true;
+      }
+    } else if (entry.actionNeeded) {
+      delete entry.actionNeeded;
+      changed = true;
+    }
+    if (changed) recordChanged();
+    if (completionNotice)
+      pendingPushes.push({ slot, notice: completionNotice });
+    if (actionPushNotice)
+      pendingPushes.push({ slot, notice: actionPushNotice });
+  };
   const pollOnce = async () => {
     await ensureLoaded();
     if (polling) return pollTail;
     polling = true;
     pollTail = (async () => {
       const active = await discoverSlots();
-      if (!active) return;
-      activeSlots.clear();
-      for (const slot of active) activeSlots.add(slot);
-      for (const slot of active) {
-        const raw = await socketStatus(
-          join(options.ipcRoot, `${slot}.sock`),
-          options.token,
-        );
-        if (!raw) continue;
-        const entry = (state.slots[slot] ??= blankSlot());
-        const completion =
-          raw.completion && typeof raw.completion === "object"
-            ? (raw.completion as Record<string, unknown>)
-            : undefined;
-        const identity = asString(completion?.identity, MAX_IDENTITY);
-        const title = asString(raw.title, MAX_TITLE) ?? slot;
-        let changed = false;
-        let completionNotice: CompletionNotice | undefined;
-        if (!entry.initialized) {
-          entry.initialized = true;
-          changed = true;
-          if (identity) {
-            entry.lastObserved = identity;
-            if (!entry.seen.includes(identity)) entry.seen.push(identity);
-          }
-        } else if (identity && entry.lastObserved !== identity) {
-          entry.lastObserved = identity;
-          changed = true;
-          if (!entry.seen.includes(identity)) {
-            entry.seen.push(identity);
-            if (entry.seen.length > MAX_SEEN)
-              entry.seen = entry.seen.slice(-MAX_SEEN);
-            const completedAt =
-              typeof completion?.completedAt === "number" &&
-              Number.isFinite(completion.completedAt)
-                ? completion.completedAt
-                : Date.now();
-            completionNotice = { identity, title, completedAt };
-            entry.unread.push(completionNotice);
-            if (entry.unread.length > MAX_UNREAD)
-              entry.unread = entry.unread.slice(-MAX_UNREAD);
-          }
-        }
-
-        const pending =
-          raw.pendingAction &&
-          typeof raw.pendingAction === "object" &&
-          !Array.isArray(raw.pendingAction)
-            ? (raw.pendingAction as Record<string, unknown>)
-            : undefined;
-        const pendingIdentity = asString(pending?.id, MAX_IDENTITY);
-        const pendingKind = pending?.kind;
-        const pendingTitle = asString(pending?.title, MAX_TITLE);
-        let actionPushNotice: ActionNeededNotice | undefined;
-        if (
-          pendingIdentity &&
-          (pendingKind === "approval" ||
-            pendingKind === "ask" ||
-            pendingKind === "plan" ||
-            pendingKind === "dialog") &&
-          pendingTitle
-        ) {
-          const prior = entry.actionNeeded;
-          const actionNotice: ActionNeededNotice = {
-            identity: pendingIdentity,
-            kind: pendingKind,
-            title,
-            actionTitle: pendingTitle,
-            createdAt:
-              prior?.identity === pendingIdentity ? prior.createdAt : Date.now(),
-          };
-          if (prior?.identity !== pendingIdentity) {
-            entry.actionNeeded = actionNotice;
-            if (!entry.seenActions.includes(pendingIdentity)) {
-              entry.seenActions.push(pendingIdentity);
-              if (entry.seenActions.length > MAX_SEEN)
-                entry.seenActions = entry.seenActions.slice(-MAX_SEEN);
-              actionPushNotice = actionNotice;
+      let stateChanged = false;
+      const pendingPushes = pendingDeliveries;
+      if (active) {
+        activeSlots.clear();
+        for (const slot of active) activeSlots.add(slot);
+        let nextSlot = 0;
+        const workers = Array.from(
+          { length: Math.min(MAX_CONCURRENT_SLOT_POLLS, active.length) },
+          async () => {
+            while (nextSlot < active.length) {
+              const index = nextSlot++;
+              await pollSlot(active[index], pendingPushes, () => {
+                stateChanged = true;
+              });
             }
-            changed = true;
-          } else if (
-            prior.title !== actionNotice.title ||
-            prior.actionTitle !== actionNotice.actionTitle ||
-            prior.kind !== actionNotice.kind
-          ) {
-            entry.actionNeeded = actionNotice;
-            changed = true;
-          }
-        } else if (entry.actionNeeded) {
-          delete entry.actionNeeded;
-          changed = true;
-        }
-        if (changed) await save();
-        if (completionNotice) await send(slot, completionNotice);
-        if (actionPushNotice) await send(slot, actionPushNotice);
+          },
+        );
+        await Promise.all(workers);
+        if (pruneSlots(active)) stateChanged = true;
+        if (pruneHistory(state, Date.now())) stateChanged = true;
       }
-      if (pruneSlots(active)) await save();
+      if (stateChanged) ledgerDirty = true;
+      while (ledgerDirty) await save();
+      while (pendingDeliveries.length) {
+        const pending = pendingDeliveries[0];
+        await send(pending.slot, pending.notice);
+        pendingDeliveries.shift();
+      }
+      while (subscriptionsDirty) await saveSubscriptions();
     })().finally(() => {
       polling = false;
     });
@@ -767,10 +1115,16 @@ export function createNotificationService(
     start() {
       if (running) return;
       running = true;
-      void ensurePush();
-      void pollOnce();
+      void ensurePush().catch((error) =>
+        console.error("Mobile notification initialization failed", error),
+      );
+      void pollOnce().catch((error) =>
+        console.error("Mobile notification background poll failed", error),
+      );
       timer = setInterval(() => {
-        void pollOnce();
+        void pollOnce().catch((error) =>
+          console.error("Mobile notification background poll failed", error),
+        );
       }, interval);
     },
     stop() {
@@ -780,25 +1134,31 @@ export function createNotificationService(
     },
     pollOnce,
     getPublicKey: () => (publicKey && privateKey ? publicKey : undefined),
-    async status() {
+    async status(activeSlot) {
       await ensureLoaded();
       await ensurePush();
+      if (activeSlot !== undefined && !isSlotId(activeSlot))
+        throw new Error("notification slot is invalid");
       const seen = new Set<string>();
       const slots: NotificationSlotStatus[] = [];
       const collect = (slot: string) => {
         const item = state.slots[slot] ?? blankSlot();
         seen.add(slot);
+        const actionUnread =
+          item.actionNeeded !== undefined &&
+          !item.acknowledgedActions.includes(item.actionNeeded.identity);
         slots.push({
           slot,
-          unread: [...item.unread],
-          latest: item.unread[item.unread.length - 1],
+          unreadCount: item.unread.length + Number(actionUnread),
+          ...(slot === activeSlot ? { unread: [...item.unread] } : {}),
+          ...(item.unread.length
+            ? { latest: { ...item.unread[item.unread.length - 1] } }
+            : {}),
           ...(item.actionNeeded
             ? {
                 actionNeeded: {
                   ...item.actionNeeded,
-                  unread: !item.acknowledgedActions.includes(
-                    item.actionNeeded.identity,
-                  ),
+                  unread: actionUnread,
                 },
               }
             : {}),
@@ -818,13 +1178,7 @@ export function createNotificationService(
         enabled: Boolean(push),
         ...(push && publicKey ? { publicKey } : {}),
         slots,
-        totalUnread: slots.reduce(
-          (total, item) =>
-            total +
-            item.unread.length +
-            (item.actionNeeded?.unread ? 1 : 0),
-          0,
-        ),
+        totalUnread: slots.reduce((total, item) => total + item.unreadCount, 0),
       };
     },
     async subscribe(subscription) {
@@ -834,32 +1188,51 @@ export function createNotificationService(
         throw new Error("web push is not configured");
       const endpoint = await validatePushEndpoint(subscription.endpoint);
       const safe = safeSubscription({ ...subscription, endpoint });
-      state.subscriptions = state.subscriptions.filter(
+      subscriptions = subscriptions.filter(
         (item) => item.endpoint !== endpoint,
       );
-      state.subscriptions.push(safe);
-      if (state.subscriptions.length > 64)
-        state.subscriptions = state.subscriptions.slice(-64);
-      await save();
+      subscriptions.push(safe);
+      deliverySubscriptions = deliverySubscriptions.filter(
+        (item) => item.endpoint !== endpoint,
+      );
+      deliverySubscriptions.push(safe);
+      if (subscriptions.length > 64)
+        subscriptions = subscriptions.slice(-64);
+      if (deliverySubscriptions.length > 64)
+        deliverySubscriptions = deliverySubscriptions.slice(-64);
+      await saveSubscriptions();
     },
     async unsubscribe(endpoint) {
       await ensureLoaded();
       if (typeof endpoint !== "string" || endpoint.length > MAX_ENDPOINT)
         throw new Error("push endpoint is invalid");
-      state.subscriptions = state.subscriptions.filter(
+      subscriptions = subscriptions.filter(
         (item) => item.endpoint !== endpoint,
       );
-      await save();
+      deliverySubscriptions = deliverySubscriptions.filter(
+        (item) => item.endpoint !== endpoint,
+      );
+      await saveSubscriptions();
     },
-    async ack(slot, identity) {
+    async ack(slot, identities) {
       await ensureLoaded();
-      if (!isSlotId(slot) || !asString(identity, MAX_IDENTITY))
-        throw new Error("notification identity is invalid");
+      if (
+        !isSlotId(slot) ||
+        !Array.isArray(identities) ||
+        identities.length > MAX_ACK_IDENTITIES ||
+        identities.some((identity) => !asString(identity, MAX_IDENTITY)) ||
+        new Set(identities).size !== identities.length
+      )
+        throw new Error("notification acknowledgement is invalid");
       const entry = state.slots[slot];
-      if (entry) {
-        entry.unread = entry.unread.filter(
-          (item) => item.identity !== identity,
-        );
+      if (!entry) return;
+      const identitySet = new Set(identities);
+      const unread = entry.unread.filter(
+        (item) => !identitySet.has(item.identity),
+      );
+      let changed = unread.length !== entry.unread.length;
+      if (changed) entry.unread = unread;
+      for (const identity of identities) {
         if (
           entry.actionNeeded?.identity === identity &&
           !entry.acknowledgedActions.includes(identity)
@@ -868,9 +1241,10 @@ export function createNotificationService(
           if (entry.acknowledgedActions.length > MAX_SEEN)
             entry.acknowledgedActions =
               entry.acknowledgedActions.slice(-MAX_SEEN);
+          changed = true;
         }
       }
-      await save();
+      if (changed) await save();
     },
   };
 }

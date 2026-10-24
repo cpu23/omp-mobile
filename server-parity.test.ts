@@ -1,8 +1,10 @@
 import { expect, test } from "bun:test";
+import { gunzipSync } from "node:zlib";
 import {
   normaliseState,
   validateInteractionAction,
   validatePromptImages,
+  withCors,
 } from "./server";
 
 const PNG_BASE64 =
@@ -206,4 +208,60 @@ test("prompt image attachments validate raster signatures and aggregate base64 s
   expect(validatePromptImages(Array.from({ length: 9 }, () => valid))).toMatchObject({
     error: expect.stringContaining("1-8"),
   });
+});
+
+test("authenticated JSON validators are semantic, private, and gzip-aware", async () => {
+  const body = JSON.stringify({ generation: "g-1", value: "x".repeat(20_000) });
+  const headers = {
+    authorization: "Bearer test-token-one",
+    "accept-encoding": "gzip",
+    origin: "https://mobile.example",
+  };
+  const request = new Request("http://localhost/api/slots/rt-test/state", {
+    headers,
+  });
+  const response = await withCors(
+    new Response(body, {
+      headers: { "content-type": "application/json; charset=utf-8" },
+    }),
+    request,
+  );
+  expect(response.headers.get("cache-control")).toBe("private, no-cache");
+  expect(response.headers.get("content-encoding")).toBe("gzip");
+  expect(response.headers.get("vary")).toContain("Authorization");
+  expect(response.headers.get("vary")).toContain("Accept-Encoding");
+  expect(response.headers.get("vary")).toContain("Origin");
+  expect(
+    gunzipSync(Buffer.from(await response.arrayBuffer())).toString("utf8"),
+  ).toBe(body);
+  const etag = response.headers.get("etag");
+  expect(etag).toBeTruthy();
+
+  const revalidated = await withCors(
+    new Response(body, {
+      headers: { "content-type": "application/json; charset=utf-8" },
+    }),
+    new Request("http://localhost/api/slots/rt-test/state", {
+      headers: { ...headers, "if-none-match": etag! },
+    }),
+  );
+  expect(revalidated.status).toBe(304);
+
+  const changedState = await withCors(
+    new Response(JSON.stringify({ generation: "g-1", value: "y".repeat(20_000) }), {
+      headers: { "content-type": "application/json; charset=utf-8" },
+    }),
+    request,
+  );
+  expect(changedState.headers.get("etag")).not.toBe(etag);
+
+  const otherIdentity = await withCors(
+    new Response(body, {
+      headers: { "content-type": "application/json; charset=utf-8" },
+    }),
+    new Request("http://localhost/api/slots/rt-test/state", {
+      headers: { ...headers, authorization: "Bearer test-token-two" },
+    }),
+  );
+  expect(otherIdentity.headers.get("etag")).not.toBe(etag);
 });
