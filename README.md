@@ -69,6 +69,9 @@ The browser check requires Chromium; it does not require the OMP Desktop daemon 
 
 ### Unreleased
 
+- Match [OMP's colorful Markdown roles](https://github.com/can1357/oh-my-pi/commit/289af866fde50a395a89d64818766ea4c7982ef7):
+  magenta H1/bold/italic, yellow H2/table headers, blue H3–H6 and green inline code.
+  Mobile uses its own dark-surface palette; fenced-code highlighting and numeric accents stay unchanged.
 - Ship minified, gzip-compressed, cache-validated assets and WOFF2 fonts; load math, Mermaid and chart engines on demand.
 - Use compact conditional status/notification reads, bounded hydration batches and byte-budgeted client caches instead of repeated full transfers.
 - Keep long question cards touch-scrollable in portrait, landscape and reduced-height viewports without losing answers during polling.
