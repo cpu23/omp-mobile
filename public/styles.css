@@ -31,6 +31,11 @@
   --success: #00ff88;
   --warn: #ffb347;
   --danger: #ff4757;
+  /* OMP colorful Markdown roles, kept distinct from UI/session accents. */
+  --md-magenta: #d787ff;
+  --md-yellow: #e5c07b;
+  --md-blue: #61afef;
+  --md-green: #98c379;
   --effort-accent: #00b4ff;
   --session-accent: #808080;
   --shadow: 0 16px 44px rgba(0, 0, 0, 0.35);
@@ -766,19 +771,19 @@ textarea:focus-visible {
 .md-h[data-level="1"],
 .part-text h1 {
   font-size: 15px;
-  color: var(--md-heading, var(--accent, #00b4ff));
+  color: var(--md-magenta);
 }
 
 .md-h[data-level="2"],
 .part-text h2 {
   font-size: 14px;
-  color: var(--md-heading, var(--accent, #00b4ff));
+  color: var(--md-yellow);
 }
 
 .md-h[data-level="3"],
 .part-text h3 {
   font-size: 13px;
-  color: var(--md-heading, var(--accent, #00b4ff));
+  color: var(--md-blue);
 }
 
 .md-h[data-level="4"],
@@ -788,7 +793,7 @@ textarea:focus-visible {
 .part-text h5,
 .part-text h6 {
   font-size: 13px;
-  color: var(--md-heading, var(--accent, #00b4ff));
+  color: var(--md-blue);
 }
 
 /* Markdown Lists */
@@ -852,7 +857,7 @@ textarea:focus-visible {
 .part-text .md-code,
 .message-body code {
   font: 12px var(--mono);
-  color: var(--md-code, var(--success, #00ff88));
+  color: var(--md-green);
   background: var(--panel-soft);
   border: 1px solid var(--line);
   border-radius: 4px;
@@ -968,7 +973,7 @@ pre,
 .part-text th,
 .part-text .md-table th {
   background: var(--panel-soft);
-  color: var(--md-heading, var(--accent, #00b4ff));
+  color: var(--md-yellow);
   font-weight: 600;
 }
 
@@ -983,9 +988,13 @@ pre,
   background: var(--panel-soft);
 }
 
-/* Mobile preference: accent-colored emphasis and numeric prose, not bold white. */
+/* Match OMP's colorful Markdown while retaining semantic weight and italics. */
 .part-text strong,
-.part-text b,
+.part-text b {
+  font-weight: 700;
+  color: var(--md-magenta);
+}
+
 .part-text .md-number {
   font-weight: 400;
   color: var(--accent, #00b4ff);
@@ -994,6 +1003,7 @@ pre,
 .part-text em,
 .part-text i {
   font-style: italic;
+  color: var(--md-magenta);
 }
 
 .part-text del,
