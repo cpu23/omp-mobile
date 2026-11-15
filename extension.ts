@@ -291,6 +291,18 @@ const FIXED_EFFORTS = ["inherit", "off"] as const;
 type OmpModel = NonNullable<ExtensionContext["model"]>;
 type ThinkingLevel = Parameters<ExtensionAPI["setThinkingLevel"]>[0];
 
+export function mobileFastMode(
+  serviceTiers: Parameters<typeof resolveModelServiceTier>[0],
+  model: OmpModel | undefined,
+): boolean {
+  if (!model) return false;
+  const serviceTier = resolveModelServiceTier(serviceTiers, model);
+  return (
+    realizesPriorityServiceTier(serviceTier, model) ||
+    (serviceTier === "ultrafast" && shouldSendServiceTier(serviceTier, model))
+  );
+}
+
 function asString(value: unknown): string | undefined {
   return typeof value === "string" && value.length > 0 ? value : undefined;
 }
@@ -2845,19 +2857,13 @@ export default function registerMobileRemote(pi: ExtensionAPI): void {
     if (interaction) runtime.interaction = interaction;
     const theme = themeSnapshot(ctx);
     const editor = editorGuard(ctx);
-    const serviceTier = model
-      ? resolveModelServiceTier(pi.getServiceTiers?.(), model)
-      : undefined;
     const state: MobileState = {
       apiVersion: 1,
       generation,
       accent: sessionAccent(ctx),
       model: currentModel,
       models: modelsForSnapshot(ctx.models.list()),
-      fastMode: !!model && (
-        realizesPriorityServiceTier(serviceTier, model) ||
-        (serviceTier === "ultrafast" && shouldSendServiceTier(serviceTier, model))
-      ),
+      fastMode: mobileFastMode(pi.getServiceTiers?.(), model),
       effort: pi.getThinkingLevel?.() ?? null,
       efforts: effortsForModel(model),
       context: (() => {

@@ -53,31 +53,60 @@ try {
       await layoutPage.setViewportSize({ width, height: 720 });
       const code = `(() => {
         ${extract("formatModelLabel")}
+        ${extract("sendButtonIconMarkup")}
         const button = document.querySelector("#model-open");
-        if (!(button instanceof HTMLButtonElement)) throw new Error("model button missing");
-        button.textContent = formatModelLabel("anthropic/claude-opus-4.1-20250805", true);
-        button.title = "Model · Fast mode";
-        const text = button.firstChild;
-        const index = text.textContent.indexOf("⚡");
-        const range = document.createRange();
-        range.setStart(text, index); range.setEnd(text, index + 1);
-        const marker = range.getBoundingClientRect();
-        const bounds = button.getBoundingClientRect();
-        return { markerVisible: marker.left >= bounds.left && marker.right <= bounds.right,
-          scrollWidth: button.scrollWidth, clientWidth: button.clientWidth,
-          title: button.title, label: button.textContent };
+        const sendButton = document.querySelector("#send");
+        if (!(button instanceof HTMLButtonElement) || !(sendButton instanceof HTMLButtonElement))
+          throw new Error("composer controls missing");
+        const model = "anthropic/claude-opus-4.1-20250805";
+        const renderModel = (fastMode) => {
+          button.textContent = formatModelLabel(model, fastMode);
+          button.title = fastMode ? "Model · Fast mode" : "Model";
+        };
+        const markerVisible = () => {
+          const text = button.firstChild;
+          const index = text.textContent.indexOf("⚡");
+          if (index < 0) return false;
+          const range = document.createRange();
+          range.setStart(text, index); range.setEnd(text, index + 1);
+          const marker = range.getBoundingClientRect();
+          const bounds = button.getBoundingClientRect();
+          return marker.left >= bounds.left && marker.right <= bounds.right;
+        };
+        renderModel(true);
+        const enabled = { markerVisible: markerVisible(), title: button.title,
+          label: button.textContent, scrollWidth: button.scrollWidth,
+          clientWidth: button.clientWidth };
+        renderModel(false);
+        const disabled = { hasMarker: button.textContent.includes("⚡"), title: button.title,
+          label: button.textContent };
+        renderModel(true);
+        const reenabled = button.textContent.includes("⚡") && button.title === "Model · Fast mode";
+        sendButton.innerHTML = sendButtonIconMarkup(true);
+        const forceSendPath = sendButton.querySelector("path")?.getAttribute("d");
+        sendButton.innerHTML = sendButtonIconMarkup(false);
+        const normalSendPath = sendButton.querySelector("path")?.getAttribute("d");
+        return { enabled, disabled, reenabled, forceSendPath, normalSendPath };
       })()`;
       const result = await layoutPage.evaluate<{
-        markerVisible: boolean;
-        scrollWidth: number;
-        clientWidth: number;
-        title: string;
-        label: string;
+        enabled: { markerVisible: boolean; title: string; label: string; scrollWidth: number; clientWidth: number };
+        disabled: { hasMarker: boolean; title: string; label: string };
+        reenabled: boolean;
+        forceSendPath: string | null;
+        normalSendPath: string | null;
       }>(code);
-      assert.equal(result.markerVisible, true, `fast-mode marker must remain visible at ${width}px`);
-      assert.equal(result.title, "Model · Fast mode");
-      if (width <= 375) assert.ok(result.scrollWidth > result.clientWidth, "long model name must exercise ellipsis");
-      console.log(`PASS fast-mode marker at ${width}px: ${result.label}`);
+      assert.equal(result.enabled.markerVisible, true, `fast-mode marker must remain visible at ${width}px`);
+      assert.equal(result.enabled.title, "Model · Fast mode");
+      assert.ok(result.enabled.label.includes("⚡"));
+      assert.equal(result.disabled.hasMarker, false, "polling fast-mode off must remove the marker");
+      assert.equal(result.disabled.title, "Model");
+      assert.equal(result.reenabled, true, "polling fast-mode on again must restore the marker");
+      if (width <= 375) assert.ok(result.enabled.scrollWidth > result.enabled.clientWidth, "long model name must exercise ellipsis");
+      assert.ok(result.forceSendPath?.includes("M8 14V4"), "force-send icon must use upward arrows");
+      assert.ok(result.forceSendPath?.includes("M8 18v2m8-16v2"), "force-send arrows must retain trailing marks");
+      assert.ok(!result.forceSendPath?.includes("m13 2-8 12"), "force-send icon must not use a bolt");
+      assert.ok(result.normalSendPath?.includes("M12 19V5"), "ordinary send icon must remain a single arrow");
+      console.log(`PASS fast-mode polling and composer icons at ${width}px: ${result.enabled.label}`);
     }
   } finally { await layoutPage.close(); }
 } finally { await browser.close(); }

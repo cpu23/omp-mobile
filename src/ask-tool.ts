@@ -1,8 +1,8 @@
-import {
-  askToolRenderer,
-  type AgentToolResult,
-  type AskToolDetails,
-  type ExtensionAPI,
+import { askToolRenderer } from "@oh-my-pi/pi-tui/tools/ask";
+import type {
+  AgentToolResult,
+  AskToolDetails,
+  ExtensionAPI,
 } from "@oh-my-pi/pi-coding-agent";
 import type { MobileAskAnswer } from "./parity-types";
 import type { InteractionBridge } from "./interactions";

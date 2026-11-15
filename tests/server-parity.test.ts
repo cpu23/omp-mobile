@@ -10,6 +10,19 @@ import {
 const PNG_BASE64 =
   "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mP8/x8AAwMCAO+/pZ8AAAAASUVORK5CYII=";
 
+test("normalises fast-mode state as a strict boolean", () => {
+  expect(
+    normaliseState({ generation: "fast-enabled", fastMode: true })?.fastMode,
+  ).toBe(true);
+  expect(
+    normaliseState({ generation: "fast-disabled", fastMode: false })?.fastMode,
+  ).toBe(false);
+  expect(normaliseState({ generation: "legacy" })?.fastMode).toBe(false);
+  expect(
+    normaliseState({ generation: "malformed", fastMode: "true" })?.fastMode,
+  ).toBe(false);
+});
+
 test("state normalisation bounds snapshots and rejects malformed history and notices", () => {
   const messages = Array.from({ length: 90 }, (_, index) => ({
     role: "assistant",
