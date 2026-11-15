@@ -6062,7 +6062,7 @@ function renderActive(): void {
   const sendButton = requiredElement<HTMLButtonElement>("#send");
   const forceReady =
     hasPendingMessages && active && !prompt.innerText.trim();
-  const sendMarkup = `<svg width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="${forceReady ? "m13 2-8 12h6l-1 8 9-13h-6l1-7" : "M12 19V5m-6 6 6-6 6 6"}"/></svg>`;
+  const sendMarkup = `<svg width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="${forceReady ? "M8 14V4m-4 4 4-4 4 4m4 12V10m-4 4 4-4 4 4M8 18v2m8-16v2" : "M12 19V5m-6 6 6-6 6 6"}"/></svg>`;
   if (sendButton.innerHTML !== sendMarkup) sendButton.innerHTML = sendMarkup;
   setAttributeIfChanged(
     sendButton,
@@ -6157,8 +6157,11 @@ function renderActive(): void {
   const modelBtn = requiredElement<HTMLButtonElement>("#model-open");
   setTextIfChanged(
     modelBtn,
-    state?.model ? normalizeModel(state.model) : "Model",
+    state?.model
+      ? `${normalizeModel(state.model)}${state.fastMode ? " ⚡" : ""}`
+      : "Model",
   );
+  setAttributeIfChanged(modelBtn, "title", state?.fastMode ? "Model · Fast mode" : "Model");
   const modelDisabled = pendingInteraction || !capability("model");
   if (modelBtn.disabled !== modelDisabled) modelBtn.disabled = modelDisabled;
 

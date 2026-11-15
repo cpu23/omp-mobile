@@ -8,6 +8,11 @@ import {
 } from "node:fs";
 import { join } from "node:path";
 import type { ExtensionAPI, ExtensionContext } from "@oh-my-pi/pi-coding-agent";
+import {
+  resolveModelServiceTier,
+  realizesPriorityServiceTier,
+  shouldSendServiceTier,
+} from "@oh-my-pi/pi-ai";
 import { getSessionAccentHex, type SessionAccentInputs } from "./session-accent";
 import {
   isRoutineNotice,
@@ -103,6 +108,7 @@ type MobileState = {
   accent: string | null;
   model: MobileModel | null;
   models: MobileModel[];
+  fastMode: boolean;
   effort: ThinkingLevel | null;
   efforts: ThinkingLevel[];
   context: { tokens: number; contextWindow: number; percent: number } | null;
@@ -2839,12 +2845,19 @@ export default function registerMobileRemote(pi: ExtensionAPI): void {
     if (interaction) runtime.interaction = interaction;
     const theme = themeSnapshot(ctx);
     const editor = editorGuard(ctx);
+    const serviceTier = model
+      ? resolveModelServiceTier(pi.getServiceTiers?.(), model)
+      : undefined;
     const state: MobileState = {
       apiVersion: 1,
       generation,
       accent: sessionAccent(ctx),
       model: currentModel,
       models: modelsForSnapshot(ctx.models.list()),
+      fastMode: !!model && (
+        realizesPriorityServiceTier(serviceTier, model) ||
+        (serviceTier === "ultrafast" && shouldSendServiceTier(serviceTier, model))
+      ),
       effort: pi.getThinkingLevel?.() ?? null,
       efforts: effortsForModel(model),
       context: (() => {

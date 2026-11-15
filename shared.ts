@@ -200,6 +200,7 @@ export type SlotState = {
   cwd?: string;
   model: unknown;
   models: unknown[];
+  fastMode?: boolean;
   effort: unknown;
   efforts: unknown[];
   context: unknown;

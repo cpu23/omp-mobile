@@ -69,6 +69,7 @@ The browser check requires Chromium; it does not require the OMP Desktop daemon 
 
 ### Unreleased
 
+- Use trailed arrows for force-sending queued messages; show a lightning bolt beside the model name when its active service tier enables fast mode.
 - Ship minified, gzip-compressed, cache-validated assets and WOFF2 fonts; load math, Mermaid and chart engines on demand.
 - Use compact conditional status/notification reads, bounded hydration batches and byte-budgeted client caches instead of repeated full transfers.
 - Keep long question cards touch-scrollable in portrait, landscape and reduced-height viewports without losing answers during polling.

@@ -1376,6 +1376,7 @@ export function normaliseState(raw: Record<string, unknown>): SlotState | undefi
     ...(typeof raw.cwd === "string" ? { cwd: raw.cwd.slice(0, 2000) } : {}),
     model: raw.model ?? null,
     models: Array.isArray(raw.models) ? raw.models.slice(0, 200) : [],
+    fastMode: raw.fastMode === true,
     effort: raw.effort ?? null,
     efforts: Array.isArray(raw.efforts) ? raw.efforts.slice(0, 100) : [],
     context: raw.context ?? null,
