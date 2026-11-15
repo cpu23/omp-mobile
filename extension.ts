@@ -8,7 +8,7 @@ import {
 } from "node:fs";
 import { join } from "node:path";
 import type { ExtensionAPI, ExtensionContext } from "@oh-my-pi/pi-coding-agent";
-import { getSessionAccentHex, type SessionAccentInputs } from "./session-accent";
+import { getSessionAccentHex, type SessionAccentInputs } from "./src/session-accent";
 import {
   isRoutineNotice,
   type MobileHistory,
@@ -20,9 +20,9 @@ import {
   type MobileRuntime,
   type MobileAskDisplay,
   type MobileAskSubmissionAnswer,
-} from "./parity-types";
-import { createInteractionBridge } from "./interactions";
-import { registerMobileAskTool } from "./ask-tool";
+} from "./src/parity-types";
+import { createInteractionBridge } from "./src/interactions";
+import { registerMobileAskTool } from "./src/ask-tool";
 
 /**
  * In-process OMP mobile bridge.

@@ -1,12 +1,12 @@
 import { describe, expect, it } from "bun:test";
-import type { MobileAskQuestion } from "./parity-types";
+import type { MobileAskQuestion } from "../src/parity-types";
 import {
   askAnswerFromDraft,
   canSubmitAskAnswer,
   createAskAnswerDraft,
   selectAskOption,
   selectAskOther,
-} from "./ask-selection";
+} from "../src/ask-selection";
 
 const single: MobileAskQuestion = {
   id: "choice",

@@ -256,7 +256,7 @@ All API routes require the bearer token; mutations additionally require `Origin`
 
 ## Environment variables
 
-Gateway (`server.ts`):
+Gateway (`src/server.ts`):
 
 | Variable | Default | Meaning |
 | --- | --- | --- |

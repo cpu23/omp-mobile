@@ -8,8 +8,8 @@ import {
   splitMoveCandidate,
   type MoveCompletion,
   type MoveListing,
-} from "./move-completion";
-import type { DirectoryListing } from "./shared";
+} from "../src/move-completion";
+import type { DirectoryListing } from "../src/shared";
 
 /**
  * `/move` completion resolves a draft against one session cwd and hands the

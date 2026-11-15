@@ -3,7 +3,7 @@ import { chmod, mkdir, mkdtemp, open, readFile, rename, rm, stat, writeFile } fr
 import { createServer } from "node:net";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
-import { createNotificationService } from "./notifications";
+import { createNotificationService } from "../src/notifications";
 
 test("completion notifications survive transcripts larger than the IPC response cap", async () => {
   const root = await mkdtemp(join(tmpdir(), "omp-notification-test-"));

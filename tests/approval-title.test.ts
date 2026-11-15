@@ -1,7 +1,7 @@
 import { expect, test } from "bun:test";
 import type { ExtensionAPI, ExtensionContext } from "@oh-my-pi/pi-coding-agent";
-import { createInteractionBridge } from "./interactions";
-import { normaliseState } from "./server";
+import { createInteractionBridge } from "../src/interactions";
+import { normaliseState } from "../src/server";
 
 test("long tool names keep pending approvals visible through the gateway", () => {
   const handlers = new Map<string, (event: unknown, ctx: ExtensionContext) => void>();

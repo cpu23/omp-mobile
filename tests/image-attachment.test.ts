@@ -2,7 +2,7 @@ import { expect, test } from "bun:test";
 import { runInNewContext } from "node:vm";
 
 // Exercise the real client function without booting the app or opening sockets.
-const client = await Bun.file(new URL("./client.ts", import.meta.url)).text();
+const client = await Bun.file(new URL("../src/client.ts", import.meta.url)).text();
 const start = client.indexOf("async function addImageFiles(");
 const end = client.indexOf("async function refreshTerminalControls(", start);
 const implementation = new Bun.Transpiler({ loader: "ts" }).transformSync(client.slice(start, end));

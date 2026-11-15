@@ -134,7 +134,7 @@ export async function createWebAssets(root: string): Promise<WebAssets> {
   }
 
   const result = await Bun.build({
-    entrypoints: [join(projectRoot, "client.ts")],
+    entrypoints: [join(projectRoot, "src/client.ts")],
     target: "browser",
     format: "esm",
     splitting: true,

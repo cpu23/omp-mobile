@@ -1,10 +1,10 @@
 import { expect, test } from "bun:test";
-import { transcript } from "./extension";
+import { transcript } from "../extension";
 import {
   isRoutineNotice,
   normalizeTranscriptParts,
   type MobilePart,
-} from "./parity-types";
+} from "../src/parity-types";
 
 test("compact text advertises recoverable full content without dropping its tail", () => {
   const text = `Beginning\n${"x".repeat(300_000)}\nFull output sentinel`;

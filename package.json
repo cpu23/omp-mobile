@@ -8,11 +8,11 @@
   },
   "scripts": {
     "setup": "bun run scripts/setup.ts",
-    "start": "bun run server.ts",
-    "build": "bun build server.ts --target bun --outdir dist",
+    "start": "bun run src/server.ts",
+    "build": "bun build src/server.ts --target bun --outdir dist",
     "check": "bunx tsc --noEmit -p tsconfig.json",
     "test": "bun test",
-    "dev": "bun --watch run server.ts"
+    "dev": "bun --watch run src/server.ts"
   },
   "dependencies": {
     "@oh-my-pi/pi-tui": "18.12.1",

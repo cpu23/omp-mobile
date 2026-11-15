@@ -3,8 +3,8 @@ import type { ExtensionContext } from "@oh-my-pi/pi-coding-agent";
 import {
   getSessionAccentHex,
   type SessionAccentInputs,
-} from "./session-accent";
-import { sessionAccent } from "./extension";
+} from "../src/session-accent";
+import { sessionAccent } from "../extension";
 
 /**
  * `session-accent.ts` mirrors the host CLI's `getSessionAccentHex` (omp
