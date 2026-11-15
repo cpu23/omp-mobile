@@ -6,9 +6,9 @@ Send prompts, read replies and switch sessions from your phone. OMP Mobile uses 
 sessions as [OMP Desktop](https://github.com/cpu23/omp-desktop); add it to your home screen.
 
 <p>
-  <img src="docs/screenshots/chat.png" alt="Mobile session transcript and composer" width="260">
-  <img src="docs/screenshots/todos.png" alt="Mobile session with the expanded to-do drawer: active task in the session accent, pending tasks in neutral text" width="260">
-  <img src="docs/screenshots/settings.png" alt="Mobile sidebar settings and shared session limit" width="260">
+  <img src="docs/screenshots/chat-luna.png" alt="Mobile session transcript and composer" width="260">
+  <img src="docs/screenshots/todos-luna.png" alt="Mobile session with the expanded to-do drawer: active task in the session accent, pending tasks in neutral text" width="260">
+  <img src="docs/screenshots/sessions.png" alt="Mobile sidebar with live and recent sessions" width="260">
 </p>
 
 ## Requirements
@@ -47,6 +47,18 @@ tailscale serve --bg 4173
 
 Open Tailscale's HTTPS URL, enter the token and use **Add to Home Screen** in your browser. Keep Desktop port 4180
 local; share only the Mobile gateway over HTTPS.
+
+## Repository layout
+
+- `src/` — gateway, browser client and shared implementation modules.
+- `tests/` — unit and integration tests.
+- `public/` — static PWA assets and fonts.
+- `scripts/` — setup and standalone browser checks.
+- `docs/` — guide, release notes and screenshots.
+- `extension.ts` — public OMP extension entry point; kept at the root for Desktop's default extension path.
+
+Run development commands from the repository root. `bun run build` writes `dist/server.js`;
+run it from this checkout with `bun dist/server.js` (it still needs `src/`, `public/` and installed dependencies).
 
 ## Checks
 
@@ -102,8 +114,11 @@ The browser check requires Chromium; it does not require the OMP Desktop daemon 
   stream as compact expandable rows, retaining rich output and error styling. Keep actionable dialogs prominent.
 - Hide title changes, provider pins, bookmarks, mode changes and duplicate compaction-start notices; show unread
   session completion as a small sidebar dot rather than a numbered badge.
+- Organize implementation modules under `src/` and tests under `tests/`; preserve Desktop's root extension entry point.
 
 See [UI coverage and host limits](docs/guide.md#transcript-and-interaction-coverage) before upgrading live sessions.
+
+**v0.1.2 — Source release; no native binaries or app-store packages.** [GitHub release](https://github.com/cpu23/omp-mobile/releases/tag/v0.1.2) · [Release notes](docs/release-v0.1.2.md).
 
 **v0.1.1 — Source release; no native binaries or app-store packages.** [GitHub release](https://github.com/cpu23/omp-mobile/releases/tag/v0.1.1) · [Release notes](docs/release-v0.1.1.md).
 

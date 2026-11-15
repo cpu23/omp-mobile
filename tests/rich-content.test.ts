@@ -1,6 +1,6 @@
 import { afterAll, expect, test } from "bun:test";
 import { Window } from "happy-dom";
-import { appendRichContent, sanitizeSvgMarkup } from "./rich-content";
+import { appendRichContent, sanitizeSvgMarkup } from "../src/rich-content";
 
 const browser = new Window();
 browser.document.write("<!doctype html><html><head></head><body></body></html>");
@@ -166,7 +166,7 @@ test("Markdown images render raster-only URLs and reject SVG or script schemes",
 test("inline math uses bundled KaTeX HTML and MathML output", async () => {
   const target = document.createElement("div");
   appendRichContent(target, "The value is $\\frac{a_1}{b_2}$.", appendPlain);
-  await import("./rich-katex");
+  await import("../src/rich-katex");
   await waitForRichElement(target, ".katex math");
   expect(target.querySelector(".katex")).not.toBeNull();
   expect(target.querySelector("math")).not.toBeNull();
@@ -203,7 +203,7 @@ test("inline math and raster images render inside Markdown table cells", async (
     wrapper.append(table);
     parent.append(wrapper);
   });
-  await Promise.all([import("./rich-katex"), import("./rich-chart")]);
+  await Promise.all([import("../src/rich-katex"), import("../src/rich-chart")]);
   await waitForRichElement(target, "td .katex math");
   expect(target.querySelector("td .katex")).not.toBeNull();
   expect(target.querySelector("td img.rich-image-view")?.getAttribute("src")).toBe(`data:image/gif;base64,${gif}`);
@@ -232,7 +232,7 @@ test("numeric Markdown tables retain their table and get a safe chart figure", a
     else block.textContent = text;
     parent.append(block);
   });
-  await import("./rich-chart");
+  await import("../src/rich-chart");
   await waitForRichElement(target, ".rich-chart-wrap .rich-svg-view");
   const chart = target.querySelector<HTMLImageElement>(".rich-chart-wrap .rich-svg-view");
   expect(chart).not.toBeNull();

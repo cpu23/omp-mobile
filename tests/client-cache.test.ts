@@ -1,5 +1,5 @@
 import { expect, test } from "bun:test";
-import { ByteLruMap, TextDraftStore, type TextStorage } from "./client-cache";
+import { ByteLruMap, TextDraftStore, type TextStorage } from "../src/client-cache";
 
 test("byte LRU refreshes reads and evicts to its byte and entry budgets", () => {
   const cache = new ByteLruMap<string, string>(6, (value) => value.length, 2);

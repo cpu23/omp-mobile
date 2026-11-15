@@ -5,7 +5,7 @@ import {
   validateInteractionAction,
   validatePromptImages,
   withCors,
-} from "./server";
+} from "../src/server";
 
 const PNG_BASE64 =
   "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mP8/x8AAwMCAO+/pZ8AAAAASUVORK5CYII=";

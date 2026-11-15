@@ -2512,6 +2512,9 @@ function normalizeModel(model: ClientModel | string | null): string {
     "Model unavailable"
   );
 }
+function formatModelLabel(model: string, fastMode: boolean | undefined): string {
+  return fastMode ? `⚡ ${model}` : model;
+}
 function isSignatureKey(key: string): boolean {
   if (!key) return false;
   const lower = key.toLowerCase();
@@ -6158,7 +6161,7 @@ function renderActive(): void {
   setTextIfChanged(
     modelBtn,
     state?.model
-      ? `${normalizeModel(state.model)}${state.fastMode ? " ⚡" : ""}`
+      ? formatModelLabel(normalizeModel(state.model), state.fastMode)
       : "Model",
   );
   setAttributeIfChanged(modelBtn, "title", state?.fastMode ? "Model · Fast mode" : "Model");

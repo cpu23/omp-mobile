@@ -1,8 +1,8 @@
 import { describe, expect, it } from "bun:test";
 import type { ExtensionAPI, ExtensionContext } from "@oh-my-pi/pi-coding-agent";
-import type { MobileInteractionAction } from "./parity-types";
-import { normaliseState, validateInteractionAction } from "./server";
-import { createInteractionBridge } from "./interactions";
+import type { MobileInteractionAction } from "../src/parity-types";
+import { normaliseState, validateInteractionAction } from "../src/server";
+import { createInteractionBridge } from "../src/interactions";
 
 type Handler = (event: unknown, ctx: ExtensionContext) => void;
 

@@ -4,9 +4,9 @@ import type {
   ExtensionAPI,
   ExtensionContext,
 } from "@oh-my-pi/pi-coding-agent";
-import type { InteractionBridge, MobileAskWaitResult } from "./interactions";
-import type { MobileAskAnswer } from "./parity-types";
-import { registerMobileAskTool } from "./ask-tool";
+import type { InteractionBridge, MobileAskWaitResult } from "../src/interactions";
+import type { MobileAskAnswer } from "../src/parity-types";
+import { registerMobileAskTool } from "../src/ask-tool";
 
 type Question = {
   id: string;
