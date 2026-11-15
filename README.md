@@ -6,8 +6,8 @@ Send prompts, read replies and switch sessions from your phone. OMP Mobile uses 
 sessions as [OMP Desktop](https://github.com/cpu23/omp-desktop); add it to your home screen.
 
 <p>
-  <img src="docs/screenshots/chat.png" alt="Mobile session transcript and composer" width="260">
-  <img src="docs/screenshots/todos.png" alt="Mobile session with the expanded to-do drawer: active task in the session accent, pending tasks in neutral text" width="260">
+  <img src="docs/screenshots/chat-luna.png" alt="Mobile session transcript and composer" width="260">
+  <img src="docs/screenshots/todos-luna.png" alt="Mobile session with the expanded to-do drawer: active task in the session accent, pending tasks in neutral text" width="260">
   <img src="docs/screenshots/sessions.png" alt="Mobile sidebar with live and recent sessions" width="260">
 </p>
 

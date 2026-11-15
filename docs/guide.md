@@ -3,7 +3,7 @@
 For the short install steps, see the [README](../README.md). This guide covers the gateway, desktop-daemon integration,
 security, configuration and operational details.
 
-Screenshots: [session and composer](screenshots/chat.png) · [to-do drawer](screenshots/todos.png) · [sessions sidebar](screenshots/sessions.png).
+Screenshots: [session and composer](screenshots/chat-luna.png) · [to-do drawer](screenshots/todos-luna.png) · [sessions sidebar](screenshots/sessions.png).
 Captured with GPT-6 Luna in disposable sessions at 1290 × 2796 pixels (430 × 932 CSS pixels, 3× scale). The full-screen to-do capture shows an active task and two pending tasks; the sidebar shows live and recent sessions with settings closed.
 
 ## Requirements and service relationship
