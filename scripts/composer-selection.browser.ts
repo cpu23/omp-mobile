@@ -51,7 +51,8 @@ try {
     await layoutPage.setContent(layoutHtml);
     for (const width of [320, 375, 768]) {
       await layoutPage.setViewportSize({ width, height: 720 });
-      const code = `${extract("formatModelLabel")}
+      const code = `(() => {
+        ${extract("formatModelLabel")}
         const button = document.querySelector("#model-open");
         if (!(button instanceof HTMLButtonElement)) throw new Error("model button missing");
         button.textContent = formatModelLabel("anthropic/claude-opus-4.1-20250805", true);
@@ -62,10 +63,17 @@ try {
         range.setStart(text, index); range.setEnd(text, index + 1);
         const marker = range.getBoundingClientRect();
         const bounds = button.getBoundingClientRect();
-        ({ markerVisible: marker.left >= bounds.left && marker.right <= bounds.right,
-           scrollWidth: button.scrollWidth, clientWidth: button.clientWidth,
-           title: button.title, label: button.textContent })`;
-      const result = await layoutPage.evaluate(code);
+        return { markerVisible: marker.left >= bounds.left && marker.right <= bounds.right,
+          scrollWidth: button.scrollWidth, clientWidth: button.clientWidth,
+          title: button.title, label: button.textContent };
+      })()`;
+      const result = await layoutPage.evaluate<{
+        markerVisible: boolean;
+        scrollWidth: number;
+        clientWidth: number;
+        title: string;
+        label: string;
+      }>(code);
       assert.equal(result.markerVisible, true, `fast-mode marker must remain visible at ${width}px`);
       assert.equal(result.title, "Model · Fast mode");
       if (width <= 375) assert.ok(result.scrollWidth > result.clientWidth, "long model name must exercise ellipsis");
