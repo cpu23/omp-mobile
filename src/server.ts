@@ -46,7 +46,7 @@ import {
 } from "./notifications";
 import { createWebAssets } from "./web-assets";
 
-const ROOT = dirname(fileURLToPath(import.meta.url));
+const ROOT = resolve(dirname(fileURLToPath(import.meta.url)), "..");
 const HOME = process.env.HOME?.trim() || homedir();
 const WORKSPACE_ROOT = resolve(process.env.OMP_MOBILE_ROOT ?? HOME);
 const IPC_ROOT = resolve(

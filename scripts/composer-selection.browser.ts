@@ -2,7 +2,7 @@
 // Real Chromium is required: happy-dom does not reproduce innerText's caret reset.
 import { chromium } from "playwright";
 import { strict as assert } from "node:assert";
-const source = await Bun.file(new URL("../client.ts", import.meta.url)).text();
+const source = await Bun.file(new URL("../src/client.ts", import.meta.url)).text();
 const transpiler = new Bun.Transpiler({ loader: "ts" });
 const extract = (name: string) => {
   const start = source.indexOf(`function ${name}(`);

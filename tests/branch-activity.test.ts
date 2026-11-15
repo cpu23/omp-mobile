@@ -1,5 +1,5 @@
 import { describe, expect, test } from "bun:test";
-import { collectBranchActivity } from "./extension";
+import { collectBranchActivity } from "../extension";
 
 /**
  * `collectBranchActivity` reads the latest todo snapshot and task results from

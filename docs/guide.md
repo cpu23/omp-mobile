@@ -256,7 +256,7 @@ All API routes require the bearer token; mutations additionally require `Origin`
 
 ## Environment variables
 
-Gateway (`server.ts`):
+Gateway (`src/server.ts`):
 
 | Variable | Default | Meaning |
 | --- | --- | --- |
@@ -269,7 +269,7 @@ Gateway (`server.ts`):
 | `OMP_DESKTOP_SESSIONS_DIR` | `~/.omp/agent/sessions` | Allowed resume-path root; saved-session listing comes from the daemon. |
 | `OMP_MOBILE_ORIGINS` | unset | Comma-separated additional allowed origins. |
 
-Notifications (`notifications.ts`):
+Notifications (`src/notifications.ts`):
 
 | Variable | Default | Meaning |
 | --- | --- | --- |

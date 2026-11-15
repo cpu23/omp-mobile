@@ -1,5 +1,5 @@
 import { expect, test } from "bun:test";
-import { normaliseState } from "./server";
+import { normaliseState } from "../src/server";
 
 test("gateway preserves the bridge's complete executable review and title", () => {
   const body = "Detailed plan\n".repeat(2000) + "FINAL SAFETY CONDITION";

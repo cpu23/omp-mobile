@@ -1,6 +1,6 @@
 import { expect, test } from "bun:test";
-import type { MobileMessage, MobileRuntime } from "./parity-types";
-import { integrateRuntimeEvents } from "./runtime-events";
+import type { MobileMessage, MobileRuntime } from "../src/parity-types";
+import { integrateRuntimeEvents } from "../src/runtime-events";
 
 function toolPart(message: MobileMessage) {
   const part = message.parts[0];

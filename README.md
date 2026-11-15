@@ -48,6 +48,18 @@ tailscale serve --bg 4173
 Open Tailscale's HTTPS URL, enter the token and use **Add to Home Screen** in your browser. Keep Desktop port 4180
 local; share only the Mobile gateway over HTTPS.
 
+## Repository layout
+
+- `src/` — gateway, browser client and shared implementation modules.
+- `tests/` — unit and integration tests.
+- `public/` — static PWA assets and fonts.
+- `scripts/` — setup and standalone browser checks.
+- `docs/` — guide, release notes and screenshots.
+- `extension.ts` — public OMP extension entry point; kept at the root for Desktop's default extension path.
+
+Run development commands from the repository root. `bun run build` writes `dist/server.js`;
+run it from this checkout with `bun dist/server.js` (it still needs `src/`, `public/` and installed dependencies).
+
 ## Checks
 
 GitHub Actions runs the type-check, complete unit-test suite and server build on Linux and macOS using Bun 1.3.14.
@@ -69,7 +81,7 @@ The browser check requires Chromium; it does not require the OMP Desktop daemon 
 
 ### Unreleased
 
-No changes yet.
+- Organize implementation modules under `src/` and tests under `tests/`; preserve Desktop's root extension entry point.
 
 See [UI coverage and host limits](docs/guide.md#transcript-and-interaction-coverage) before upgrading live sessions.
 
