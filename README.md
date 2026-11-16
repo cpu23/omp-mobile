@@ -81,7 +81,7 @@ The browser check requires Chromium; it does not require the OMP Desktop daemon 
 
 ### Unreleased
 
-- Use trailed arrows for force-sending queued messages; show a lightning bolt beside the model name when its active service tier enables fast mode.
+- Use trailed arrows for force-sending queued messages; show a lightning bolt beside the model name only when fast-mode status is known to be active. On the supported SDK, Anthropic's session fallback/re-arm state and Fireworks' separate provider tier are not exposed by the public tier map, so their effective status is **unknown**, not off: no bolt is shown and the model tooltip says “Fast-mode status unavailable.” The same applies when the host tier capability is absent. This is a display limitation, not a change to provider requests or `/fast` behavior. Snapshots preserve unknown as `fastMode: null`; missing or malformed values also normalize to unknown. Older clients may omit the unknown tooltip but do not show an active bolt for null.
 - Ship minified, gzip-compressed, cache-validated assets and WOFF2 fonts; load math, Mermaid and chart engines on demand.
 - Use compact conditional status/notification reads, bounded hydration batches and byte-budgeted client caches instead of repeated full transfers.
 - Keep long question cards touch-scrollable in portrait, landscape and reduced-height viewports without losing answers during polling.

@@ -200,7 +200,8 @@ export type SlotState = {
   cwd?: string;
   model: unknown;
   models: unknown[];
-  fastMode?: boolean;
+  /** null/absent means effective status is unavailable, not disabled. */
+  fastMode?: boolean | null;
   effort: unknown;
   efforts: unknown[];
   context: unknown;

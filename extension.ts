@@ -108,7 +108,7 @@ type MobileState = {
   accent: string | null;
   model: MobileModel | null;
   models: MobileModel[];
-  fastMode: boolean;
+  fastMode: boolean | null;
   effort: ThinkingLevel | null;
   efforts: ThinkingLevel[];
   context: { tokens: number; contextWindow: number; percent: number } | null;
@@ -294,8 +294,13 @@ type ThinkingLevel = Parameters<ExtensionAPI["setThinkingLevel"]>[0];
 export function mobileFastMode(
   serviceTiers: Parameters<typeof resolveModelServiceTier>[0],
   model: OmpModel | undefined,
-): boolean {
+): boolean | null {
   if (!model) return false;
+  // The public tier map cannot expose Fireworks' separate provider setting or
+  // Anthropic's per-session fallback/re-arm state. Do not present configured
+  // intent (or a last-request observation) as the effective host status.
+  if (model.provider === "fireworks" || model.provider === "anthropic") return null;
+  if (serviceTiers === undefined) return null;
   const serviceTier = resolveModelServiceTier(serviceTiers, model);
   return (
     realizesPriorityServiceTier(serviceTier, model) ||

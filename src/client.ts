@@ -2512,8 +2512,13 @@ function normalizeModel(model: ClientModel | string | null): string {
     "Model unavailable"
   );
 }
-function formatModelLabel(model: string, fastMode: boolean | undefined): string {
-  return fastMode ? `⚡ ${model}` : model;
+function formatModelLabel(model: string, fastMode: boolean | null | undefined): string {
+  return fastMode === true ? `⚡ ${model}` : model;
+}
+
+function formatModelTitle(fastMode: boolean | null | undefined): string {
+  if (fastMode === true) return "Model · Fast mode";
+  return fastMode === false ? "Model" : "Model · Fast-mode status unavailable";
 }
 function sendButtonIconMarkup(forceReady: boolean): string {
   const path = forceReady
@@ -6170,7 +6175,7 @@ function renderActive(): void {
       ? formatModelLabel(normalizeModel(state.model), state.fastMode)
       : "Model",
   );
-  setAttributeIfChanged(modelBtn, "title", state?.fastMode ? "Model · Fast mode" : "Model");
+  setAttributeIfChanged(modelBtn, "title", formatModelTitle(state?.fastMode));
   const modelDisabled = pendingInteraction || !capability("model");
   if (modelBtn.disabled !== modelDisabled) modelBtn.disabled = modelDisabled;
 
