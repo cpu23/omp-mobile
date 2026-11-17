@@ -8,6 +8,11 @@ import {
 } from "node:fs";
 import { join } from "node:path";
 import type { ExtensionAPI, ExtensionContext } from "@oh-my-pi/pi-coding-agent";
+import {
+  resolveModelServiceTier,
+  realizesPriorityServiceTier,
+  shouldSendServiceTier,
+} from "@oh-my-pi/pi-ai";
 import { getSessionAccentHex, type SessionAccentInputs } from "./src/session-accent";
 import {
   isRoutineNotice,
@@ -103,6 +108,7 @@ type MobileState = {
   accent: string | null;
   model: MobileModel | null;
   models: MobileModel[];
+  fastMode: boolean | null;
   effort: ThinkingLevel | null;
   efforts: ThinkingLevel[];
   context: { tokens: number; contextWindow: number; percent: number } | null;
@@ -284,6 +290,23 @@ const MAX_STRING_BYTES = 8 * 1024;
 const FIXED_EFFORTS = ["inherit", "off"] as const;
 type OmpModel = NonNullable<ExtensionContext["model"]>;
 type ThinkingLevel = Parameters<ExtensionAPI["setThinkingLevel"]>[0];
+
+export function mobileFastMode(
+  serviceTiers: Parameters<typeof resolveModelServiceTier>[0],
+  model: OmpModel | undefined,
+): boolean | null {
+  if (!model) return false;
+  // The public tier map cannot expose Fireworks' separate provider setting or
+  // Anthropic's per-session fallback/re-arm state. Do not present configured
+  // intent (or a last-request observation) as the effective host status.
+  if (model.provider === "fireworks" || model.provider === "anthropic") return null;
+  if (serviceTiers === undefined) return null;
+  const serviceTier = resolveModelServiceTier(serviceTiers, model);
+  return (
+    realizesPriorityServiceTier(serviceTier, model) ||
+    (serviceTier === "ultrafast" && shouldSendServiceTier(serviceTier, model))
+  );
+}
 
 function asString(value: unknown): string | undefined {
   return typeof value === "string" && value.length > 0 ? value : undefined;
@@ -2845,6 +2868,7 @@ export default function registerMobileRemote(pi: ExtensionAPI): void {
       accent: sessionAccent(ctx),
       model: currentModel,
       models: modelsForSnapshot(ctx.models.list()),
+      fastMode: mobileFastMode(pi.getServiceTiers?.(), model),
       effort: pi.getThinkingLevel?.() ?? null,
       efforts: effortsForModel(model),
       context: (() => {

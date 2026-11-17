@@ -5,6 +5,7 @@
     "": {
       "name": "omp-mobile",
       "dependencies": {
+        "@oh-my-pi/pi-ai": "18.12.1",
         "@oh-my-pi/pi-tui": "18.12.1",
         "katex": "^0.16.22",
         "mermaid": "^11.12.0",
